@@ -1,0 +1,123 @@
+# CondensedContext
+<!-- CCF/1 -->
+@legend c=confidence; lvl=compression-level; fid=fidelity; imp=importance; vol=volatility; cost=expansion-cost; lv=last-verified; st=freshness; aliases from @path.
+@fresh id=FRESH-001 lv=4d97d30 head=4d97d30 gen=2026-07-19 st=partial verify=TECH,MODEL,HIST,SIM,PHY,LIB,TYPES,BRIDGE,APP,PHVIEW,VIEW3,WAVE,CSS,ROAD,CC,CCF
+@path CC=CondensedContext.md
+@path CCF=CondensedContext.CCF1
+@path ROAD=docs/roadmap.md
+@path README=README.md
+@path APP=src/App.tsx
+@path SCH=src/SchematicViewport.tsx
+@path VIEW3=src/Viewport.tsx
+@path PHVIEW=src/PhysicalViewport.tsx
+@path WAVE=src/WaveformView.tsx
+@path TYPES=src/types.ts
+@path BRIDGE=src/backend.ts
+@path MODEL=src-tauri/src/model.rs
+@path HIST=src-tauri/src/history.rs
+@path LIB=src-tauri/src/lib.rs
+@path DRC=src-tauri/src/validation.rs
+@path SIM=src-tauri/src/simulation.rs
+@path PHY=src-tauri/src/physical_layout.rs
+@path TECH=src-tauri/src/technology.rs
+@path PLUG=src-tauri/src/plugins.rs
+@path CSS=src/styles.css
+@focus id=ACTIVE-001 c=H :: M3.6 Rust IR folds large MOS arrays into near-square row banks and renders placement-independent preview; next=3.6.2 topology-aware complementary-network ordering and hierarchical floorplanning.
+@handoff id=HANDOFF-001 c=H :: state=M3.6 preview uses aspect-ratio-scored folded PMOS/NMOS banks rather than one unbounded strip; schematic zoom=2..4096,F/Home fit,Shift-arrow fast pan; 3D zoom range widened+top fit retained; nested M3.7 hierarchy remains active; next=topology-aware ordering+hierarchical floorplanning; val=cargo-test:52,npm-build:pass,tauri-build:pass
+@fact id=PRODUCT-001 c=H :: OpenChippy=education-first desktop VLSI studio; Rust owns authoritative models/services; React/Three.js own interaction and visualization.
+@constraint id=CONSTRAINT-001 c=H :: preserve user changes; source of truth=code; avoid later-milestone expansion without user scope.
+@dec id=ARCH-OWNERSHIP-001 c=H :: serializable project/history/simulation/DRC remain UI-independent Rust; Tauri commands are thin adapters; view state is ephemeral frontend state.
+@dec id=PROJECT-LIFECYCLE-001 c=H :: New/Open reset history boundary; Rust workspace owns path,saved snapshot,dirty,undo,redo; circuit rename is persisted+undoable.
+@dec id=SCHEMATIC-001 c=H :: CMOS transistors primary; wires persist terminal refs plus optional free endpoint+ordered waypoints; junction=node; output=in; net_label=node.
+@dec id=NAV-001 c=H :: schematic wheel/trackpad pans; pinch or modifier-wheel zooms; empty drag/arrows pan; Shift-click multi-select; 3D uses MapControls.
+@dec id=DRC-001 c=H :: Rust graph DRC has stable codes; equal-name labels join nets; dangling wire is warning; checks floating,shorted rails,duplicates,disconnected,missing power.
+@dec id=LAYOUT-001 c=H :: 3D targets Magic/PDK-style inferred cell layout in abstract technology units; schematic junctions are not physical vias.
+@dec id=ROUTER-001 c=H :: Rust preview reserves a size-aware central signal channel; each net has unique Y track; top available metal carries horizontal trunks; process permitting,power/PMOS/NMOS long drops use distinct lower directional layers; transitions add intermediate landing metals+adjacent vias; tracks do not traverse device banks/rails; max-layer bound and NAND cross-net overlap tests enforced.
+@dec id=ROUTER-PITCH-001 c=H :: channel track pitch=landing 0.28+clearance 0.04=0.32; via=0.24; pin landing height=0.28; transistor X/Y pitch unchanged; regression requires compact pitch and same-layer isolation.
+@dec id=CAMERA-001 c=H :: orthographic top view fits post-generation physical bounds; normalized frustum+zoom keeps center stable; Top view resets.
+@dec id=SIM-MODEL-001 c=H :: NMOS conducts iff gate HIGH; PMOS iff gate LOW; outputs={HIGH,LOW,FLOATING,CONTENDED,UNKNOWN}; unknown gates conservatively propagate uncertainty without degrading driven rails.
+@dec id=SIM-SETTLE-001 c=H :: switch_state treats provisional FLOATING gate as open so upstream combinational hierarchy can settle without UNKNOWN poisoning of rail-connected groups; explicit UNKNOWN/CONTENDED gates remain SwitchState::Unknown and propagate uncertainty.
+@dec id=SIM-API-001 c=H :: backend returns net/output/transistor/wire states; frontend never reimplements solver; palette HIGH=green LOW=blue FLOATING=gray CONTENDED=red UNKNOWN=amber.
+@dec id=TRUTH-001 c=H :: truth tables enumerate inputs in component order via production solver, preserve five states+convergence, cap at 8 inputs, and rows can drive live visualization.
+@dec id=WAVE-001 c=H :: waveform time unit=integer ns; CLK/CLOCK inputs toggle at half-period; others form binary sequence at change interval; sample only event boundaries.
+@dec id=WAVE-BOUNDS-001 c=H :: duration<=1,000,000ns; transitions<=10,000; duration affects time mapping not SVG size; lanes fixed at 52px.
+@dec id=M3-PLAN-001 c=H :: M3 slices isolate technology schema,file I/O,device geometry,threshold/resistance behavior,then capacitance/delay; every slice preserves prior truth tables or adds monotonicity tests.
+@dec id=M3-TECHFILE-001 c=H :: technology YAML format=1 uses technology header plus nmos/pmos blocks; max_metal_layers is required in YAML,min=2,EDU=5; older embedded JSON defaults=5; concise vt/ron/reference aliases accepted; unknown/missing/nonphysical fields rejected; validated snapshot embedded in Project.
+@dec id=M3-GEOMETRY-001 c=H :: Component has optional deviceGeometry W/L; new MOS use active-tech reference values; missing old data resolves to polarity-specific reference; Ron=RonNom*(L/Lref)*(Wref/W), Cgate=CgatePerW*W*(L/Lref), Cdiff=CdiffPerW*W; Rust is authoritative.
+@dec id=M3-TIMING-001 c=H :: net load sums connected MOS gate and drain/source diffusion capacitance; resolved high/low uses corresponding active path R; delay_ns=0.69*Rohm*Cff*1e-6; waveform output transitions retain fractional ns while static truth tables remain operating-point results.
+@dec id=M3-DRIVE-001 c=H :: static solver maps HIGH=technology VDD,LOW=0; NMOS selected HIGH conducts only VDD>Vtn, PMOS selected LOW conducts only VDD>|Vtp|; unknown gates remain unknown; active weighted graph reports shortest high/low drive path resistance by summing device Ron.
+@dec id=M3-PHYS-001 c=H :: M3.6 physical synthesis uses Rust layout IR independent of schematic coordinates; normalize topology,share diffusion,place rows,route layers,check rules+connectivity,then derive identical 2D/GDS and 3D geometry.
+@dec id=M3-PHYS-IR-001 c=H :: physical IR v1 contains technology/source identity,sorted MOS devices with W/L+gate/drain/source net IDs,canonical nets with roles+terminals,and sorted external pins; schematic positions,rotations,wire routes absent; Tauri generate_physical_ir is read-only.
+@dec id=M3-PHYS-PREVIEW-001 c=H :: Rust compact_preview emits generic base/process-bounded metal+via layer strings with fixed rows/rails+connectivity anchors; M1 carries power/device drops,signals cycle across M2..configured max,and transitions receive landing metal+via stacks; PHVIEW builds matching layer styles/toggles dynamically; router remains provisional.
+@dec id=M3-PHYS-FOLD-001 c=H :: compact_preview scores candidate column counts by aspect-ratio error,folds each polarity into multiple banks,expands rails/well/substrate to footprint,and staggers row drops; 128-MOS regression requires aspect<1.5; topology/hierarchy-aware macro floorplanning remains next.
+@dec id=M3-NAV-SCALE-001 c=H :: schematic zoom width=2..4096,F/Home fits placed components+wire geometry,Shift-arrows accelerate pan; 3D orthographic controls zoom=.00001..200 and Top view/Fit restores IR bounds.
+@dec id=SCHEMATIC-OPEN-FIT-001 c=H :: app increments fitRevision only on initial create,New,and Open; schematic fits component+free-wire geometry on revision/mount; ordinary edit/history/simulation workspace replacements preserve camera.
+@dec id=WAVE-SCROLL-001 c=H :: waveform root/canvas are height-constrained+overflow-hidden; settings owns vertical scroll; lane grid uses flex-height zero base,explicit vertical scrollbar+independent horizontal time scroll,sticky labels remain synchronized.
+@dec id=WAVE-CURSOR-001 c=H :: pointer click/drag maps SVG X to fractional ns; vertical cursor spans all lanes; header reports cursor time; sticky label shows five-state cursor value; horizontal scroll maps left plot boundary to edgeTime; each label owns sticky 1/0/X badge positioned at HIGH/LOW/mid Y for value where trace meets block.
+@dec id=M11-SIGNAL-VIZ-001 c=H :: after physical connectivity equivalence,3D shapes retain stable simulation-net identity and can toggle process colors vs HIGH/LOW/FLOATING/CONTENDED/UNKNOWN state; active MOS channels+rail paths highlight; net isolation+waveform cursor update materials without layout regeneration.
+@dec id=M4-PHYS-DRC-001 c=H :: versioned process YAML owns units+grid,width,spacing,via/contact size+pitch+enclosure,poly/diffusion,well,metal-area/notch/EOL,tap/rail/pin-access rules; headless Rust checks canonical physical shapes; diagnostics carry stable rule ID,severity,shape IDs,measured/required/layer; 3D overlays select+frame violations; step toward signoff-ready generation,foundry correlation remains M9.
+@dec id=M4-MULTIPASS-001 c=H :: run 2-3 deterministic physical candidates:topology/diffusion-sharing,minimum-legal-area folded,and when warranted pin/congestion-balanced; reject DRC/connectivity failures; score area+unused channel,overflow/pin access,wirelength,vias,diffusion utilization; aspect penalty only outside practical bounds and squareness=tiebreaker; expose score rationale in 3D.
+@dec id=M4-WAVE-BUS-001 c=H :: persisted user groups define name+ordered MSB..LSB scalar members+binary/hex radix+collapsed state; sticky label and stable intervals show aggregate cursor/time value; value changes draw crossed-X bus boundaries; simultaneous member events resolve before aggregation; UNKNOWN/CONTENDED/unresolved FLOATING propagate X digits; expand restores scalar lanes without resimulation.
+@dec id=M5-TIMING-PHYS-001 c=H :: add physical wire/layer/via capacitance,fanout,switching+critical-path costs to M4 candidates; score order=legal/connectivity,configured timing target,area/congestion/wire/vias,then aspect; critical path may justify larger/less-square winner while noncritical repeats choose smallest well-routed result.
+@dec id=M3-PHYS-NAV-001 c=H :: 3D mode hides top floating view/simulation controls; PHVIEW left sidebar owns view navigation,top-fit reset,IR summary,layer toggles,interaction help.
+@dec id=M3-HIER-001 c=H :: Project stores shared BlockDefinition source+promoted input/output/power/ground pins; definitions may contain block instances to arbitrary acyclic depth; recursive deterministic UUID expansion flattens at simulation/truth/waveform/DRC/physical boundaries; each promoted boundary becomes a junction; graph validation rejects missing deps+direct/indirect cycles; export/save writes all adjacent chippyblocks dependencies; open validates merged graph; descend/edit canvas deferred M4.
+@constraint id=M3-NONGOALS-001 c=H :: no SPICE compatibility,continuous nonlinear MOS equations,extracted interconnect parasitics,or signoff claims in M3.
+@node id=MODEL-NODE c=H lvl=L2 fid=lossless imp=H vol=M cost=M files=MODEL,HIST deps=TECH-NODE usedby=DRC-NODE,SIM-NODE,APP-NODE,PHY-NODE :: versioned project schema,components with MOS W/L or block-definition refs,shared reusable definitions+promoted pins,deterministic hierarchy flattening,derived device characteristics,terminal wires/free waypoints,transforms,persistence history.
+@node id=DRC-NODE c=H lvl=L2 fid=lossless imp=H vol=L cost=M files=DRC,LIB deps=MODEL-NODE usedby=APP-NODE :: connectivity graph and Milestone 1 design-rule diagnostics.
+@node id=SIM-NODE c=H lvl=L2 fid=lossless imp=H vol=H cost=H files=SIM,LIB,TYPES,BRIDGE deps=MODEL-NODE,TECH-NODE usedby=APP-NODE,WAVE-NODE :: threshold/supply-aware five-state solver, weighted drive paths, net MOS load capacitance, 0.69RC fractional-ns waveform events, static truth tables, educational details.
+@node id=TECH-NODE c=H lvl=L2 fid=lossless imp=H vol=H cost=M files=TECH,MODEL,HIST,LIB,TYPES,BRIDGE,APP,CSS deps=none usedby=SIM-NODE :: format-v1 educational CMOS technology, strict YAML loading, embedded project snapshot, built-in fallback, undoable load/reset, inspector summary, field diagnostics.
+@node id=PHY-NODE c=H lvl=L2 fid=lossless imp=H vol=H cost=H files=PHY,LIB,TYPES,BRIDGE,APP,PHVIEW,CSS deps=MODEL-NODE,TECH-NODE usedby=APP-NODE :: physical synthesis boundary; normalized nets/MOS/pins,compact preview,directional M1 drops/M2 signal trunks+own-net vias,same-layer isolation regression,generic renderer/sidebar; topology ordering,sharing,scalable routing/rules pending.
+@node id=APP-NODE c=H lvl=L2 fid=lossy imp=H vol=H cost=H files=APP,SCH,VIEW3,CSS,TYPES,BRIDGE deps=MODEL-NODE,DRC-NODE,SIM-NODE usedby=none :: desktop editor shell, schematic interaction, 3D inferred layout, DRC/simulation/truth-table UX.
+@node id=WAVE-NODE c=H lvl=L2 fid=lossless imp=M vol=M cost=M files=WAVE,CSS deps=SIM-NODE usedby=APP-NODE :: timing sidebar, fixed-lane step plot, shared time axis, five-state traces.
+@node id=PLUGIN-NODE c=M lvl=L2 fid=lossy imp=L vol=L cost=L files=PLUG,LIB deps=none usedby=none :: in-process plugin skeleton; dynamic trust/loading deferred.
+@rel from=APP-NODE to=SIM-NODE kind=uses
+@rel from=SIM-NODE to=MODEL-NODE kind=depends
+@rel from=DRC-NODE to=MODEL-NODE kind=depends
+@rel from=WAVE-NODE to=SIM-NODE kind=depends
+@page id=PAGE-SIM load=SIM-NODE,MODEL-NODE,APP-NODE,WAVE-NODE trigger=simulation,truth-table,waveform,milestone-2
+@page id=PAGE-EDITOR load=APP-NODE,MODEL-NODE,DRC-NODE trigger=schematic,wires,components,drc,layout
+@page id=PAGE-3D load=APP-NODE,ROUTER-001,LAYOUT-001,CAMERA-001 trigger=3d,metal,routing,camera,pdk
+@file id=FILE-ROAD c=H path=ROAD role=milestones+acceptance criteria
+@file id=FILE-MODEL c=H path=MODEL role=project schema+editing operations
+@file id=FILE-SIM c=H path=SIM role=switch solver+truth table+waveform backend
+@file id=FILE-TECH c=H path=TECH role=technology schema+defaults+validation
+@file id=FILE-PHY c=H path=PHY role=physical-layout IR+normalization+synthesis pipeline
+@file id=FILE-PHVIEW c=H path=PHVIEW role=generic Rust-shape 3D renderer+physical navigation sidebar
+@file id=FILE-APP c=H path=APP role=desktop orchestration+view modes
+@file id=FILE-WAVE c=H path=WAVE role=waveform controls+rendering
+@validation id=VAL-RUST c=H cmd=cd-src-tauri-cargo-test :: 52 tests passed with Rust 1.97.1; includes 128-MOS near-square folding,recursive nested flattening,indirect-cycle rejection,cascaded reusable NAND settle,adjacent chippyblocks round-trip+dedup,hierarchy DRC,and physical/technology regressions.
+@validation id=VAL-WEB c=H cmd=npm-run-build :: TypeScript+Vite production build passed on uncommitted M3.6.1 tree; Three bundle advisory remains.
+@validation id=VAL-TAURI c=H cmd=npx-tauri-build :: release build passed on uncommitted compact-placement/navigation tree; executable=src-tauri/target/release/openchippy.
+@coverage id=COVERAGE-001 c=H files=all-authored docs=roadmap+context pct=high :: generated dependencies/lockfiles not semantically indexed.
+@chg date=2026-07-19 tags=milestone-3.1,milestone-3.2,milestone-3.3,milestone-3.4,milestone-3.5,milestone-3.6,milestone-3.7 files=TECH,MODEL,HIST,SIM,LIB,TYPES,BRIDGE,APP,WAVE,CSS,ROAD,CC,CCF commit=uncommitted remote=not-confirmed :: educational technology/R/C timing stack plus compact physical synthesis and reusable hierarchy plans.
+@chg date=2026-07-19 tags=milestone-3.6.1,physical-ir files=PHY,LIB,TYPES,BRIDGE,APP,CSS,CC,CCF commit=uncommitted remote=not-confirmed :: deterministic placement-independent connectivity IR and visible 3D normalization status.
+@chg date=2026-07-19 tags=milestone-3.6,compact-preview,3d-sidebar files=PHY,PHVIEW,APP,TYPES,CSS,CC,CCF commit=uncommitted remote=not-confirmed :: replaced schematic-derived app renderer with Rust physical shapes and sidebar-owned layout controls.
+@chg date=2026-07-19 tags=milestone-3.6,router,metal2 files=PHY,PHVIEW,TYPES,CC,CCF commit=uncommitted remote=not-confirmed :: conflict-aware two-metal preview routing and endpoint via12 restored with NAND coverage.
+@chg date=2026-07-19 tags=milestone-3.6,router-isolation files=PHY,CC,CCF commit=uncommitted remote=not-confirmed :: directional M1 device drops and clearance-spaced M2 signal trunks prevent same-layer NAND shorts; overlap regression added.
+@chg date=2026-07-19 tags=milestone-3.2,milestone-3.6,process-layers files=TECH,PHY,TYPES,BRIDGE,APP,PHVIEW,ROAD,CC,CCF commit=uncommitted remote=not-confirmed :: explicit YAML metal ceiling,EDU five-layer default,bounded multilayer routing,and dynamic layer visualization.
+@chg date=2026-07-19 tags=milestone-3.7,hierarchy,readme files=MODEL,SIM,DRC,LIB,TYPES,BRIDGE,APP,SCH,CSS,ROAD,README,CC,CCF commit=uncommitted remote=not-confirmed :: shared reusable definitions,promoted pins,compact instances,portable export,deterministic analysis/physical flattening,hierarchy diagnostics,and current capability docs.
+@chg date=2026-07-19 tags=milestone-3.7,block-dialog,navigation files=APP,CSS,CC,CCF commit=uncommitted remote=not-confirmed :: replaced unreliable window prompt with in-app named block dialog+inline errors and removed top-bar transistor placement.
+@chg date=2026-07-19 tags=milestone-3.7,block-symbol,pin-labels files=SCH,CSS,CC,CCF commit=uncommitted remote=not-confirmed :: reusable macro pins labeled by role edge:input-left,output-right,VDD-top,GND-bottom.
+@chg date=2026-07-19 tags=milestone-3.7,block-library,persistence files=LIB,BRIDGE,APP,README,ROAD,CC,CCF commit=uncommitted remote=not-confirmed :: automatic sibling chippyblocks save/export/discovery with invalid-file errors and ID/name dedup.
+@chg date=2026-07-19 tags=milestone-3.7,hierarchy-simulation,drc files=SIM,DRC,README,ROAD,CC,CCF commit=uncommitted remote=not-confirmed :: provisional floating gates no longer poison cascaded blocks; explicit unknown remains conservative; parent DRC flags unconnected promoted pins.
+@chg date=2026-07-19 tags=milestone-3.7,nested-blocks,hierarchy files=MODEL,DRC,LIB,README,ROAD,CC,CCF commit=uncommitted remote=not-confirmed :: arbitrary-depth composite capture/update+recursive flattening,nested interface DRC,dependency-safe library export/load,and direct/indirect cycle rejection.
+@chg date=2026-07-19 tags=milestone-3.6,milestone-3.8,compact-placement,navigation files=PHY,SCH,PHVIEW,APP,README,ROAD,CC,CCF commit=uncommitted remote=not-confirmed :: aspect-ratio-aware folded MOS banks plus much wider schematic/3D zoom,fit,and accelerated pan.
+@chg date=2026-07-19 tags=roadmap,milestone-11.1,signal-visualization files=ROAD,CC,CCF commit=uncommitted remote=not-confirmed :: mapped simulation-aware physical path highlighting after routed connectivity equivalence.
+@chg date=2026-07-19 tags=roadmap,milestone-4.1,physical-drc,signoff files=ROAD,CC,CCF commit=uncommitted remote=not-confirmed :: mapped process-owned physical rule decks,headless geometry DRC,and selectable 3D violation overlays as a step toward signoff-ready generation.
+@chg date=2026-07-19 tags=milestone-3.6,router,collision-isolation files=PHY,README,ROAD,CC,CCF commit=uncommitted remote=not-confirmed :: reserved central signal channel,unique track coordinates,separated drop/trunk layer roles,and corrected transition stacks to prevent cross-net wire collisions.
+@chg date=2026-07-19 tags=milestone-3.6,router,channel-compaction files=PHY,ROAD,CC,CCF commit=uncommitted remote=not-confirmed :: reduced via-only routing pitch from 0.42 to landing-derived 0.32 while preserving transistor spacing+overlap clearance.
+@chg date=2026-07-19 tags=roadmap,milestone-4.2,milestone-5.1,multi-pass-routing files=ROAD,CC,CCF commit=uncommitted remote=not-confirmed :: mapped deterministic 2-3 candidate placement/routing with legal area-first scoring,bounded aspect tiebreaker,and later timing-aware selection.
+@chg date=2026-07-19 tags=roadmap,milestone-4.3,waveform-buses files=ROAD,CC,CCF commit=uncommitted remote=not-confirmed :: mapped persisted grouped traces with bit ordering,binary/hex radix,cursor+interval values,crossed change edges,expand/collapse,and X propagation.
+@chg date=2026-07-19 tags=editor,open-fit,waveform-scroll files=APP,SCH,CSS,CC,CCF commit=uncommitted remote=not-confirmed :: auto-fit created/opened schematics without edit-time camera resets and constrain waveform workspace so arbitrarily growing signal lanes remain vertically reachable.
+@chg date=2026-07-19 tags=waveform,cursor,signal-values files=WAVE,CSS,CC,CCF commit=uncommitted remote=not-confirmed :: click/drag fractional-ns cursor with vertical trace line,header time,and per-label five-state values.
+@chg date=2026-07-19 tags=waveform,sticky-edge-values files=WAVE,CSS,CC,CCF commit=uncommitted remote=not-confirmed :: corrected static markers into sticky 1/0/X badges resolved at leftmost visible waveform time where each trace meets its signal block.
+@chg date=2026-07-19 tags=milestone-2 files=SIM,LIB,APP,SCH,VIEW3,WAVE,TYPES,BRIDGE,CSS,ROAD,CC commit=4d97d30 remote=origin/alpha-v1 :: switch solver, visualization, truth tables, diagnostics, timed waveforms, and bounded long-duration rendering.
+@chg date=2026-07-19 tags=milestone-0,1 files=MODEL,HIST,DRC,APP,SCH,VIEW3,CSS,ROAD,CC commit=98d5984 remote=origin/alpha-v1 :: desktop foundation, project lifecycle, CMOS schematic editing, DRC, inferred 3D cell layout, and two-metal crossing avoidance.
+@chg date=2026-07-19 tags=initial files=ROAD commit=949319f remote=origin/main :: initial repository and product roadmap.
+@archived id=ARCHIVE-001 c=H :: pre-M2 granular change transcript compacted into milestone commits 98d5984 and 4d97d30; source+git history remain authoritative.
+@open id=OPEN-M3 c=H :: 3.1-3.5+3.6 normalization/compact preview+3.7 nested hierarchy implemented; next recognize complementary PUN/PDN+diffusion order then scalable routing/rules; descend/edit definition canvas and portable version resolution move to M4.
+@open id=OPEN-NETS c=M :: explicit persisted net identity and per-segment editing remain future graph work.
+@open id=OPEN-LAYOUT c=M :: physical layout still inferred frontend state; M4.1 owns process DRC+3D violations; M4.2 owns multi-candidate compaction; M5.1 adds timing-aware selection; editable paint/scalable signoff routing remain future; foundry-qualified DRC/LVS correlation remains M9.
+@open id=OPEN-EDITOR c=M :: group movement and direct wire-to-wire branching remain.
+@open id=OPEN-BUNDLE c=H :: Three.js chunk exceeds Vite 500kB advisory; optimize when profiling supports it.
+@stat id=STATS-001 ratio=154-lines-to-43-root-lines avgcost=M update=2026-07-19 :: sidecar introduced after root crossed ~150-line compaction guidance and accumulated 23 history rows.
