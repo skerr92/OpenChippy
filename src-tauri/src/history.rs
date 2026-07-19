@@ -60,6 +60,7 @@ impl ProjectHistory {
 #[cfg(test)]
 mod tests {
     use super::ProjectHistory;
+    use crate::technology::Technology;
 
     #[test]
     fn update_can_be_undone_and_redone() {
@@ -86,5 +87,62 @@ mod tests {
         history.reset(Default::default());
         assert!(!history.can_undo());
         assert!(!history.can_redo());
+    }
+
+    #[test]
+    fn technology_changes_can_be_undone_and_redone() {
+        let mut history = ProjectHistory::default();
+        let mut technology = Technology::default();
+        technology.name = "Alternate technology".into();
+        history.update(|project| project.set_technology(technology));
+
+        assert_eq!(history.current().technology.name, "Alternate technology");
+        assert_eq!(history.undo().unwrap().technology, Technology::default());
+        assert_eq!(
+            history.redo().unwrap().technology.name,
+            "Alternate technology"
+        );
+    }
+
+    #[test]
+    fn device_geometry_changes_can_be_undone_and_redone() {
+        let mut history = ProjectHistory::default();
+        let mut transistor_id = None;
+        history.update(|project| {
+            transistor_id = Some(project.add_component("nmos", 0.0, 0.0).unwrap())
+        });
+        let transistor_id = transistor_id.unwrap();
+        history.update(|project| {
+            project
+                .set_device_geometry(transistor_id, 2.5, 0.7)
+                .unwrap()
+        });
+
+        assert_eq!(
+            history
+                .current()
+                .device_characteristics(transistor_id)
+                .unwrap()
+                .width_um,
+            2.5
+        );
+        assert_eq!(
+            history
+                .undo()
+                .unwrap()
+                .device_characteristics(transistor_id)
+                .unwrap()
+                .width_um,
+            1.0
+        );
+        assert_eq!(
+            history
+                .redo()
+                .unwrap()
+                .device_characteristics(transistor_id)
+                .unwrap()
+                .width_um,
+            2.5
+        );
     }
 }

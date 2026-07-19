@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { LogicState, Project, SimulationResult, TruthTableResult, ValidationReport, WaveformConfig, WaveformResult, WorkspaceState } from "./types";
+import type { DeviceCharacteristics, LogicState, PhysicalLayoutIr, Project, SimulationResult, TruthTableResult, ValidationReport, WaveformConfig, WaveformResult, WorkspaceState } from "./types";
 
 const browserFallback = (): WorkspaceState => ({
   project: {
@@ -7,6 +7,29 @@ const browserFallback = (): WorkspaceState => ({
     name: "Untitled chip",
     components: [],
     wires: [],
+    blockDefinitions: [],
+    technology: {
+      format_version: 1,
+      name: "OpenChippy EDU CMOS",
+      supply_voltage: 1.8,
+      max_metal_layers: 5,
+      nmos: {
+        threshold_voltage: .45,
+        nominal_on_resistance_ohms: 12000,
+        reference_width_um: 1,
+        reference_length_um: 1,
+        gate_capacitance_ff_per_um: 2,
+        diffusion_capacitance_ff_per_um: 1,
+      },
+      pmos: {
+        threshold_voltage: -.45,
+        nominal_on_resistance_ohms: 22000,
+        reference_width_um: 1,
+        reference_length_um: 1,
+        gate_capacitance_ff_per_um: 2.2,
+        diffusion_capacitance_ff_per_um: 1.2,
+      },
+    },
   },
   path: null,
   dirty: false,
@@ -93,12 +116,40 @@ export async function renameComponent(id: string, name: string): Promise<Workspa
   return invoke("rename_component", { id, name });
 }
 
+export async function setDeviceGeometry(id: string, widthUm: number, lengthUm: number): Promise<WorkspaceState> {
+  return invoke("set_device_geometry", { id, widthUm, lengthUm });
+}
+
+export async function deviceCharacteristics(id: string): Promise<DeviceCharacteristics> {
+  return invoke("device_characteristics", { id });
+}
+
 export async function renameProject(name: string): Promise<WorkspaceState> {
   return invoke("rename_project", { name });
 }
 
 export async function validateProject(): Promise<ValidationReport> {
   return invoke("validate_project");
+}
+
+export async function generatePhysicalIr(): Promise<PhysicalLayoutIr> {
+  return invoke("generate_physical_ir");
+}
+
+export async function captureBlock(name: string): Promise<WorkspaceState> {
+  return invoke("capture_block", { name });
+}
+
+export async function placeBlock(definitionId: string, x: number, y: number): Promise<WorkspaceState> {
+  return invoke("place_block", { definitionId, x, y });
+}
+
+export async function updateBlockFromCurrent(definitionId: string): Promise<WorkspaceState> {
+  return invoke("update_block_from_current", { definitionId });
+}
+
+export async function exportBlock(definitionId: string): Promise<string> {
+  return invoke("export_block", { definitionId });
 }
 
 export async function simulateProject(inputs: Record<string, LogicState>): Promise<SimulationResult> {
@@ -127,4 +178,12 @@ export async function saveProject(path: string | null): Promise<WorkspaceState> 
 
 export async function loadProject(path: string): Promise<WorkspaceState> {
   return invoke("load_project", { path });
+}
+
+export async function loadTechnology(path: string): Promise<WorkspaceState> {
+  return invoke("load_technology", { path });
+}
+
+export async function resetTechnology(): Promise<WorkspaceState> {
+  return invoke("reset_technology");
 }

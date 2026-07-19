@@ -1,4 +1,6 @@
+use crate::technology::Technology;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 pub const CURRENT_FORMAT_VERSION: u32 = 1;
@@ -19,6 +21,27 @@ pub struct Component {
     pub name: String,
     pub position: Position,
     pub rotation: f64,
+    #[serde(default)]
+    pub device_geometry: Option<DeviceGeometry>,
+    #[serde(default)]
+    pub block_definition_id: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceGeometry {
+    pub width_um: f64,
+    pub length_um: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceCharacteristics {
+    pub width_um: f64,
+    pub length_um: f64,
+    pub effective_on_resistance_ohms: f64,
+    pub gate_capacitance_ff: f64,
+    pub diffusion_capacitance_ff: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -42,6 +65,34 @@ pub struct Wire {
     pub route_x: Option<f64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockPinRole {
+    Input,
+    Output,
+    Power,
+    Ground,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockPin {
+    pub name: String,
+    pub role: BlockPinRole,
+    pub component_id: Uuid,
+    pub terminal: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockDefinition {
+    pub id: Uuid,
+    pub name: String,
+    pub components: Vec<Component>,
+    pub wires: Vec<Wire>,
+    pub pins: Vec<BlockPin>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Project {
@@ -50,6 +101,10 @@ pub struct Project {
     pub components: Vec<Component>,
     #[serde(default)]
     pub wires: Vec<Wire>,
+    #[serde(default)]
+    pub technology: Technology,
+    #[serde(default)]
+    pub block_definitions: Vec<BlockDefinition>,
 }
 
 fn terminal_offset(kind: &str, terminal: &str) -> (f64, f64) {
@@ -83,6 +138,17 @@ fn point_on_segment(point: (f64, f64), start: (f64, f64), end: (f64, f64)) -> bo
     }
 }
 
+fn derived_uuid(instance: Uuid, source: Uuid, discriminator: u8) -> Uuid {
+    let mut bytes = *source.as_bytes();
+    for (index, byte) in instance.as_bytes().iter().enumerate() {
+        bytes[index] ^= byte;
+    }
+    bytes[0] ^= discriminator;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
 impl Default for Project {
     fn default() -> Self {
         Self {
@@ -90,11 +156,21 @@ impl Default for Project {
             name: "Untitled chip".into(),
             components: Vec::new(),
             wires: Vec::new(),
+            technology: Technology::default(),
+            block_definitions: Vec::new(),
         }
     }
 }
 
 impl Project {
+    pub fn set_technology(&mut self, technology: Technology) {
+        self.technology = technology;
+    }
+
+    pub fn reset_technology(&mut self) {
+        self.technology = Technology::default();
+    }
+
     pub fn rename(&mut self, name: String) -> Result<(), String> {
         let name = name.trim();
         if name.is_empty() {
@@ -116,6 +192,8 @@ impl Project {
                 z: 0.0,
             },
             rotation: 0.0,
+            device_geometry: None,
+            block_definition_id: None,
         });
     }
 
@@ -147,12 +225,25 @@ impl Project {
             .count()
             + 1;
         let id = Uuid::new_v4();
+        let device_geometry = match kind {
+            "nmos" => Some(DeviceGeometry {
+                width_um: self.technology.nmos.reference_width_um,
+                length_um: self.technology.nmos.reference_length_um,
+            }),
+            "pmos" => Some(DeviceGeometry {
+                width_um: self.technology.pmos.reference_width_um,
+                length_um: self.technology.pmos.reference_length_um,
+            }),
+            _ => None,
+        };
         self.components.push(Component {
             id,
             kind: kind.into(),
             name: format!("{prefix}{number}"),
             position: Position { x, y, z: 0.0 },
             rotation: 0.0,
+            device_geometry,
+            block_definition_id: None,
         });
         if kind == "junction" {
             self.attach_junction_to_wire(id, x, y);
@@ -265,6 +356,62 @@ impl Project {
         Ok(())
     }
 
+    pub fn set_device_geometry(
+        &mut self,
+        id: Uuid,
+        width_um: f64,
+        length_um: f64,
+    ) -> Result<(), String> {
+        if !width_um.is_finite() || width_um <= 0.0 {
+            return Err("transistor width must be a finite positive value".into());
+        }
+        if !length_um.is_finite() || length_um <= 0.0 {
+            return Err("transistor length must be a finite positive value".into());
+        }
+        let component = self
+            .components
+            .iter_mut()
+            .find(|component| component.id == id)
+            .ok_or_else(|| "component not found".to_string())?;
+        if component.kind != "nmos" && component.kind != "pmos" {
+            return Err("device geometry is only available for NMOS and PMOS transistors".into());
+        }
+        component.device_geometry = Some(DeviceGeometry {
+            width_um,
+            length_um,
+        });
+        Ok(())
+    }
+
+    pub fn device_characteristics(&self, id: Uuid) -> Result<DeviceCharacteristics, String> {
+        let component = self
+            .components
+            .iter()
+            .find(|component| component.id == id)
+            .ok_or_else(|| "component not found".to_string())?;
+        let technology = match component.kind.as_str() {
+            "nmos" => &self.technology.nmos,
+            "pmos" => &self.technology.pmos,
+            _ => return Err("device characteristics are only available for transistors".into()),
+        };
+        let geometry = component.device_geometry.clone().unwrap_or(DeviceGeometry {
+            width_um: technology.reference_width_um,
+            length_um: technology.reference_length_um,
+        });
+        Ok(DeviceCharacteristics {
+            width_um: geometry.width_um,
+            length_um: geometry.length_um,
+            effective_on_resistance_ohms: technology.nominal_on_resistance_ohms
+                * (geometry.length_um / technology.reference_length_um)
+                * (technology.reference_width_um / geometry.width_um),
+            gate_capacitance_ff: technology.gate_capacitance_ff_per_um
+                * geometry.width_um
+                * (geometry.length_um / technology.reference_length_um),
+            diffusion_capacitance_ff: technology.diffusion_capacitance_ff_per_um
+                * geometry.width_um,
+        })
+    }
+
     pub fn delete_components(&mut self, ids: &[Uuid]) -> Result<(), String> {
         if ids.is_empty() {
             return Err("select at least one component".into());
@@ -292,12 +439,19 @@ impl Project {
             return Err("cannot connect a terminal to itself".into());
         }
         for terminal in [&from, &to] {
-            if !self
+            let component = self
                 .components
                 .iter()
-                .any(|component| component.id == terminal.component_id)
+                .find(|component| component.id == terminal.component_id)
+                .ok_or_else(|| "wire references a missing component".to_string())?;
+            if !self
+                .component_terminals(component)
+                .contains(&terminal.terminal)
             {
-                return Err("wire references a missing component".into());
+                return Err(format!(
+                    "{} has no terminal named {}",
+                    component.name, terminal.terminal
+                ));
             }
         }
         if self.wires.iter().any(|wire| {
@@ -358,12 +512,16 @@ impl Project {
     }
 
     pub fn finish_wire(&mut self, id: Uuid, to: TerminalRef) -> Result<(), String> {
-        if !self
+        let component = self
             .components
             .iter()
-            .any(|component| component.id == to.component_id)
-        {
-            return Err("wire references a missing component".into());
+            .find(|component| component.id == to.component_id)
+            .ok_or_else(|| "wire references a missing component".to_string())?;
+        if !self.component_terminals(component).contains(&to.terminal) {
+            return Err(format!(
+                "{} has no terminal named {}",
+                component.name, to.terminal
+            ));
         }
         let wire = self
             .wires
@@ -399,11 +557,409 @@ impl Project {
         }
         Ok(())
     }
+
+    pub fn capture_block(&mut self, name: String) -> Result<Uuid, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("block name cannot be empty".into());
+        }
+        if self
+            .block_definitions
+            .iter()
+            .any(|definition| definition.name == name)
+        {
+            return Err(format!("block definition already exists: {name}"));
+        }
+        let pins = self
+            .components
+            .iter()
+            .filter_map(|component| {
+                let (role, terminal) = match component.kind.as_str() {
+                    "input" => (BlockPinRole::Input, "out"),
+                    "output" => (BlockPinRole::Output, "in"),
+                    "vdd" => (BlockPinRole::Power, "out"),
+                    "gnd" => (BlockPinRole::Ground, "out"),
+                    _ => return None,
+                };
+                Some(BlockPin {
+                    name: component.name.clone(),
+                    role,
+                    component_id: component.id,
+                    terminal: terminal.into(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if !pins.iter().any(|pin| pin.role == BlockPinRole::Input)
+            || !pins.iter().any(|pin| pin.role == BlockPinRole::Output)
+        {
+            return Err("a reusable block requires at least one input and output pin".into());
+        }
+        let id = Uuid::new_v4();
+        let definition = BlockDefinition {
+            id,
+            name: name.into(),
+            components: self.components.clone(),
+            wires: self.wires.clone(),
+            pins,
+        };
+        let mut candidate = self.clone();
+        candidate.block_definitions.push(definition.clone());
+        candidate.validate_block_graph()?;
+        self.block_definitions.push(definition);
+        Ok(id)
+    }
+
+    pub fn update_block_from_current(&mut self, definition_id: Uuid) -> Result<(), String> {
+        let existing = self
+            .block_definition(definition_id)
+            .cloned()
+            .ok_or_else(|| "block definition not found".to_string())?;
+        let mut snapshot = self.clone();
+        snapshot
+            .block_definitions
+            .iter_mut()
+            .find(|definition| definition.id == definition_id)
+            .expect("definition exists")
+            .name = format!("__updating_{definition_id}");
+        let replacement_id = snapshot.capture_block(existing.name.clone())?;
+        let mut replacement = snapshot
+            .block_definitions
+            .into_iter()
+            .find(|definition| definition.id == replacement_id)
+            .expect("captured definition exists");
+        let interface = |definition: &BlockDefinition| {
+            definition
+                .pins
+                .iter()
+                .map(|pin| (pin.name.clone(), pin.role))
+                .collect::<Vec<_>>()
+        };
+        if interface(&existing) != interface(&replacement) {
+            return Err(
+                "block pin names and roles must remain compatible with existing instances".into(),
+            );
+        }
+        replacement.id = definition_id;
+        let index = self
+            .block_definitions
+            .iter()
+            .position(|definition| definition.id == definition_id)
+            .expect("definition exists");
+        let mut candidate = self.clone();
+        candidate.block_definitions[index] = replacement.clone();
+        candidate.validate_block_graph()?;
+        self.block_definitions[index] = replacement;
+        Ok(())
+    }
+
+    pub fn place_block(&mut self, definition_id: Uuid, x: f64, y: f64) -> Result<Uuid, String> {
+        let definition = self
+            .block_definitions
+            .iter()
+            .find(|definition| definition.id == definition_id)
+            .ok_or_else(|| "block definition not found".to_string())?;
+        let number = self
+            .components
+            .iter()
+            .filter(|component| component.block_definition_id == Some(definition_id))
+            .count()
+            + 1;
+        let id = Uuid::new_v4();
+        self.components.push(Component {
+            id,
+            kind: "block".into(),
+            name: format!("X{}{}", definition.name, number),
+            position: Position { x, y, z: 0.0 },
+            rotation: 0.0,
+            device_geometry: None,
+            block_definition_id: Some(definition_id),
+        });
+        Ok(id)
+    }
+
+    pub fn block_definition(&self, id: Uuid) -> Option<&BlockDefinition> {
+        self.block_definitions
+            .iter()
+            .find(|definition| definition.id == id)
+    }
+
+    pub fn component_terminals(&self, component: &Component) -> Vec<String> {
+        if component.kind == "block" {
+            return component
+                .block_definition_id
+                .and_then(|id| self.block_definition(id))
+                .map(|definition| definition.pins.iter().map(|pin| pin.name.clone()).collect())
+                .unwrap_or_default();
+        }
+        match component.kind.as_str() {
+            "nmos" | "pmos" => vec!["gate".into(), "drain".into(), "source".into()],
+            "resistor" => vec!["a".into(), "b".into()],
+            "output" => vec!["in".into()],
+            "junction" | "net_label" => vec!["node".into()],
+            _ => vec!["out".into()],
+        }
+    }
+
+    pub fn validate_block_graph(&self) -> Result<(), String> {
+        fn visit(
+            project: &Project,
+            definition_id: Uuid,
+            visiting: &mut Vec<Uuid>,
+            visited: &mut HashSet<Uuid>,
+        ) -> Result<(), String> {
+            if let Some(index) = visiting.iter().position(|id| *id == definition_id) {
+                let mut names = visiting[index..]
+                    .iter()
+                    .filter_map(|id| project.block_definition(*id))
+                    .map(|definition| definition.name.clone())
+                    .collect::<Vec<_>>();
+                names.push(
+                    project
+                        .block_definition(definition_id)
+                        .map(|definition| definition.name.clone())
+                        .unwrap_or_else(|| definition_id.to_string()),
+                );
+                return Err(format!(
+                    "recursive block definition cycle: {}",
+                    names.join(" -> ")
+                ));
+            }
+            if visited.contains(&definition_id) {
+                return Ok(());
+            }
+            let definition = project
+                .block_definition(definition_id)
+                .ok_or_else(|| format!("missing block definition {definition_id}"))?;
+            visiting.push(definition_id);
+            for instance in definition
+                .components
+                .iter()
+                .filter(|component| component.kind == "block")
+            {
+                let child_id = instance.block_definition_id.ok_or_else(|| {
+                    format!(
+                        "{} in {} has no block definition",
+                        instance.name, definition.name
+                    )
+                })?;
+                if project.block_definition(child_id).is_none() {
+                    return Err(format!(
+                        "{} in {} references missing block definition {}",
+                        instance.name, definition.name, child_id
+                    ));
+                }
+                visit(project, child_id, visiting, visited)?;
+            }
+            visiting.pop();
+            visited.insert(definition_id);
+            Ok(())
+        }
+
+        let mut visited = HashSet::new();
+        for definition in &self.block_definitions {
+            visit(self, definition.id, &mut Vec::new(), &mut visited)?;
+        }
+        Ok(())
+    }
+
+    pub fn flattened(&self) -> Result<Project, String> {
+        self.validate_block_graph()?;
+        let mut flattened = Project {
+            format_version: self.format_version,
+            name: self.name.clone(),
+            components: self
+                .components
+                .iter()
+                .filter(|component| component.kind != "block")
+                .cloned()
+                .collect(),
+            wires: Vec::new(),
+            technology: self.technology.clone(),
+            block_definitions: Vec::new(),
+        };
+        let mut instance_terminals: HashMap<(Uuid, String), TerminalRef> = HashMap::new();
+        for instance in self
+            .components
+            .iter()
+            .filter(|component| component.kind == "block")
+        {
+            let definition_id = instance
+                .block_definition_id
+                .ok_or_else(|| format!("{} has no block definition", instance.name))?;
+            let definition = self.block_definition(definition_id).ok_or_else(|| {
+                format!("{} references a missing block definition", instance.name)
+            })?;
+            let pins = self.expand_block_definition(
+                definition,
+                instance.id,
+                &instance.name,
+                &instance.position,
+                &mut flattened,
+            )?;
+            for (pin, terminal) in pins {
+                instance_terminals.insert((instance.id, pin), terminal);
+            }
+        }
+        for source in &self.wires {
+            let mut wire = source.clone();
+            if let Some(replacement) =
+                instance_terminals.get(&(wire.from.component_id, wire.from.terminal.clone()))
+            {
+                wire.from = replacement.clone();
+            }
+            if let Some(to) = &mut wire.to {
+                if let Some(replacement) =
+                    instance_terminals.get(&(to.component_id, to.terminal.clone()))
+                {
+                    *to = replacement.clone();
+                }
+            }
+            flattened.wires.push(wire);
+        }
+        Ok(flattened)
+    }
+
+    fn expand_block_definition(
+        &self,
+        definition: &BlockDefinition,
+        namespace: Uuid,
+        prefix: &str,
+        offset: &Position,
+        flattened: &mut Project,
+    ) -> Result<HashMap<String, TerminalRef>, String> {
+        let mut component_ids = HashMap::new();
+        let mut child_terminals = HashMap::new();
+        let boundary_components = definition
+            .pins
+            .iter()
+            .map(|pin| pin.component_id)
+            .collect::<HashSet<_>>();
+
+        for source in &definition.components {
+            if source.kind == "block" {
+                let child_id = source.block_definition_id.ok_or_else(|| {
+                    format!(
+                        "{} in {} has no block definition",
+                        source.name, definition.name
+                    )
+                })?;
+                let child = self.block_definition(child_id).ok_or_else(|| {
+                    format!(
+                        "{} in {} references a missing block definition",
+                        source.name, definition.name
+                    )
+                })?;
+                let child_namespace = derived_uuid(namespace, source.id, 0x42);
+                let child_prefix = format!("{prefix}·{}", source.name);
+                let child_offset = Position {
+                    x: offset.x + source.position.x,
+                    y: offset.y + source.position.y,
+                    z: offset.z + source.position.z,
+                };
+                for (pin, terminal) in self.expand_block_definition(
+                    child,
+                    child_namespace,
+                    &child_prefix,
+                    &child_offset,
+                    flattened,
+                )? {
+                    child_terminals.insert((source.id, pin), terminal);
+                }
+                continue;
+            }
+
+            let id = derived_uuid(namespace, source.id, 0x43);
+            component_ids.insert(source.id, id);
+            let mut component = source.clone();
+            component.id = id;
+            component.name = format!("{prefix}·{}", source.name);
+            component.position.x += offset.x;
+            component.position.y += offset.y;
+            component.position.z += offset.z;
+            if boundary_components.contains(&source.id) {
+                component.kind = "junction".into();
+                component.block_definition_id = None;
+            }
+            flattened.components.push(component);
+        }
+
+        let map_terminal = |terminal: &TerminalRef| -> Result<TerminalRef, String> {
+            if let Some(replacement) =
+                child_terminals.get(&(terminal.component_id, terminal.terminal.clone()))
+            {
+                return Ok(replacement.clone());
+            }
+            let component_id = component_ids
+                .get(&terminal.component_id)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "{} contains a wire to missing component {}",
+                        definition.name, terminal.component_id
+                    )
+                })?;
+            Ok(TerminalRef {
+                component_id,
+                terminal: if boundary_components.contains(&terminal.component_id) {
+                    "node".into()
+                } else {
+                    terminal.terminal.clone()
+                },
+            })
+        };
+
+        for source in &definition.wires {
+            let mut wire = source.clone();
+            wire.id = derived_uuid(namespace, source.id, 0x57);
+            wire.from = map_terminal(&source.from)?;
+            wire.to = source.to.as_ref().map(&map_terminal).transpose()?;
+            if let Some(end) = &mut wire.end {
+                end.x += offset.x;
+                end.y += offset.y;
+                end.z += offset.z;
+            }
+            for waypoint in &mut wire.waypoints {
+                waypoint.x += offset.x;
+                waypoint.y += offset.y;
+                waypoint.z += offset.z;
+            }
+            if let Some(route_x) = &mut wire.route_x {
+                *route_x += offset.x;
+            }
+            flattened.wires.push(wire);
+        }
+
+        definition
+            .pins
+            .iter()
+            .map(|pin| {
+                let component_id =
+                    component_ids
+                        .get(&pin.component_id)
+                        .copied()
+                        .ok_or_else(|| {
+                            format!(
+                                "{} pin {} references a missing boundary component",
+                                definition.name, pin.name
+                            )
+                        })?;
+                Ok((
+                    pin.name.clone(),
+                    TerminalRef {
+                        component_id,
+                        terminal: "node".into(),
+                    },
+                ))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Project, TerminalRef};
+    use super::{Component, Position, Project, TerminalRef};
+    use crate::technology::Technology;
+    use uuid::Uuid;
 
     #[test]
     fn circuit_name_is_validated_and_persisted_in_the_model() {
@@ -411,6 +967,95 @@ mod tests {
         project.rename("CMOS Inverter".into()).unwrap();
         assert_eq!(project.name, "CMOS Inverter");
         assert!(project.rename("  ".into()).is_err());
+    }
+
+    #[test]
+    fn older_projects_receive_the_builtin_technology() {
+        let project = Project::default();
+        let mut serialized = serde_json::to_value(project).unwrap();
+        serialized.as_object_mut().unwrap().remove("technology");
+        let loaded: Project = serde_json::from_value(serialized).unwrap();
+        assert_eq!(loaded.technology, crate::technology::Technology::default());
+    }
+
+    #[test]
+    fn older_transistors_use_reference_geometry() {
+        let mut project = Project::default();
+        let nmos = project.add_component("nmos", 0.0, 0.0).unwrap();
+        let mut serialized = serde_json::to_value(project).unwrap();
+        serialized["components"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("deviceGeometry");
+        let loaded: Project = serde_json::from_value(serialized).unwrap();
+        let characteristics = loaded.device_characteristics(nmos).unwrap();
+        assert_eq!(
+            characteristics.width_um,
+            loaded.technology.nmos.reference_width_um
+        );
+        assert_eq!(
+            characteristics.length_um,
+            loaded.technology.nmos.reference_length_um
+        );
+    }
+
+    #[test]
+    fn device_geometry_scales_resistance_and_capacitance() {
+        let mut project = Project::default();
+        let nmos = project.add_component("nmos", 0.0, 0.0).unwrap();
+        let nominal = project.device_characteristics(nmos).unwrap();
+
+        project.set_device_geometry(nmos, 2.0, 1.0).unwrap();
+        let wider = project.device_characteristics(nmos).unwrap();
+        assert!(wider.effective_on_resistance_ohms < nominal.effective_on_resistance_ohms);
+        assert!(wider.gate_capacitance_ff > nominal.gate_capacitance_ff);
+        assert!(wider.diffusion_capacitance_ff > nominal.diffusion_capacitance_ff);
+
+        project.set_device_geometry(nmos, 1.0, 2.0).unwrap();
+        let longer = project.device_characteristics(nmos).unwrap();
+        assert!(longer.effective_on_resistance_ohms > nominal.effective_on_resistance_ohms);
+        assert!(longer.gate_capacitance_ff > nominal.gate_capacitance_ff);
+    }
+
+    #[test]
+    fn device_geometry_round_trips_with_the_project() {
+        let mut project = Project::default();
+        let pmos = project.add_component("pmos", 0.0, 0.0).unwrap();
+        project.set_device_geometry(pmos, 3.2, 0.8).unwrap();
+        let serialized = serde_json::to_string(&project).unwrap();
+        let loaded: Project = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            loaded.device_characteristics(pmos).unwrap(),
+            project.device_characteristics(pmos).unwrap()
+        );
+    }
+
+    #[test]
+    fn changing_technology_preserves_schematic_topology() {
+        let mut project = Project::default();
+        let input = project.add_component("input", -4.0, 0.0).unwrap();
+        let nmos = project.add_component("nmos", 0.0, 0.0).unwrap();
+        project
+            .connect(
+                TerminalRef {
+                    component_id: input,
+                    terminal: "out".into(),
+                },
+                TerminalRef {
+                    component_id: nmos,
+                    terminal: "gate".into(),
+                },
+            )
+            .unwrap();
+        let components = project.components.clone();
+        let wires = project.wires.clone();
+        let mut technology = Technology::default();
+        technology.name = "Topology-safe technology".into();
+
+        project.set_technology(technology);
+
+        assert_eq!(project.components, components);
+        assert_eq!(project.wires, wires);
     }
 
     #[test]
@@ -571,5 +1216,138 @@ mod tests {
             .unwrap();
         assert!(project.wires[0].to.is_some());
         assert!(project.wires[0].end.is_none());
+    }
+
+    #[test]
+    fn nested_blocks_flatten_recursively_and_preserve_promoted_pins() {
+        let mut leaf = Project::default();
+        let leaf_input = leaf.add_component("input", -2.0, 0.0).unwrap();
+        let leaf_output = leaf.add_component("output", 2.0, 0.0).unwrap();
+        leaf.connect(
+            TerminalRef {
+                component_id: leaf_input,
+                terminal: "out".into(),
+            },
+            TerminalRef {
+                component_id: leaf_output,
+                terminal: "in".into(),
+            },
+        )
+        .unwrap();
+        let leaf_id = leaf.capture_block("PASS".into()).unwrap();
+
+        let mut composite = Project::default();
+        composite.block_definitions = leaf.block_definitions;
+        let input = composite.add_component("input", -4.0, 0.0).unwrap();
+        let output = composite.add_component("output", 4.0, 0.0).unwrap();
+        let child = composite.place_block(leaf_id, 0.0, 0.0).unwrap();
+        composite
+            .connect(
+                TerminalRef {
+                    component_id: input,
+                    terminal: "out".into(),
+                },
+                TerminalRef {
+                    component_id: child,
+                    terminal: "IN1".into(),
+                },
+            )
+            .unwrap();
+        composite
+            .connect(
+                TerminalRef {
+                    component_id: child,
+                    terminal: "OUT1".into(),
+                },
+                TerminalRef {
+                    component_id: output,
+                    terminal: "in".into(),
+                },
+            )
+            .unwrap();
+        let composite_id = composite.capture_block("DOUBLE_PASS".into()).unwrap();
+
+        let mut parent = Project::default();
+        parent.block_definitions = composite.block_definitions;
+        let instance = parent.place_block(composite_id, 10.0, 20.0).unwrap();
+        let source = parent.add_component("input", 0.0, 20.0).unwrap();
+        parent
+            .connect(
+                TerminalRef {
+                    component_id: source,
+                    terminal: "out".into(),
+                },
+                TerminalRef {
+                    component_id: instance,
+                    terminal: "IN1".into(),
+                },
+            )
+            .unwrap();
+
+        let flattened = parent.flattened().unwrap();
+        assert!(flattened
+            .components
+            .iter()
+            .all(|component| component.kind != "block"));
+        assert!(flattened
+            .components
+            .iter()
+            .any(|component| component.name.contains("DOUBLE_PASS")
+                && component.name.contains("PASS")));
+        let parent_wire = flattened
+            .wires
+            .iter()
+            .find(|wire| wire.id == parent.wires[0].id)
+            .unwrap();
+        assert_ne!(parent_wire.to.as_ref().unwrap().component_id, instance);
+        assert_eq!(parent_wire.to.as_ref().unwrap().terminal, "node");
+    }
+
+    #[test]
+    fn block_graph_rejects_indirect_recursion() {
+        let mut project = Project::default();
+        project.add_component("input", -2.0, 0.0).unwrap();
+        project.add_component("output", 2.0, 0.0).unwrap();
+        let first = project.capture_block("FIRST".into()).unwrap();
+        let second = project.capture_block("SECOND".into()).unwrap();
+        let first_definition = project
+            .block_definitions
+            .iter_mut()
+            .find(|definition| definition.id == first)
+            .unwrap();
+        first_definition.components.push(Component {
+            id: Uuid::new_v4(),
+            kind: "block".into(),
+            name: "XSECOND1".into(),
+            position: Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            rotation: 0.0,
+            device_geometry: None,
+            block_definition_id: Some(second),
+        });
+        let second_definition = project
+            .block_definitions
+            .iter_mut()
+            .find(|definition| definition.id == second)
+            .unwrap();
+        second_definition.components.push(Component {
+            id: Uuid::new_v4(),
+            kind: "block".into(),
+            name: "XFIRST1".into(),
+            position: Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            rotation: 0.0,
+            device_geometry: None,
+            block_definition_id: Some(first),
+        });
+
+        let error = project.validate_block_graph().unwrap_err();
+        assert!(error.contains("FIRST -> SECOND -> FIRST"));
     }
 }

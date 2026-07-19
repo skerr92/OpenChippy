@@ -27,6 +27,11 @@ pub enum SwitchState {
 pub struct NamedState {
     pub name: String,
     pub state: LogicState,
+    pub voltage: Option<f64>,
+    pub high_drive_resistance_ohms: Option<f64>,
+    pub low_drive_resistance_ohms: Option<f64>,
+    pub load_capacitance_ff: f64,
+    pub estimated_delay_ns: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -35,6 +40,9 @@ pub struct TransistorState {
     pub component_id: Uuid,
     pub name: String,
     pub state: SwitchState,
+    pub gate_voltage: Option<f64>,
+    pub threshold_voltage: f64,
+    pub effective_on_resistance_ohms: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -52,6 +60,7 @@ pub struct SimulationResult {
     pub transistors: Vec<TransistorState>,
     pub wires: Vec<WireState>,
     pub converged: bool,
+    pub supply_voltage: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -81,7 +90,7 @@ pub struct WaveformConfig {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WaveformSample {
-    pub time_ns: u32,
+    pub time_ns: f64,
     pub state: LogicState,
 }
 
@@ -183,6 +192,83 @@ struct Transistor {
     gate: usize,
     drain: usize,
     source: usize,
+    threshold_voltage: f64,
+    effective_on_resistance_ohms: f64,
+}
+
+fn switch_state(transistor: &Transistor, gate: LogicState, supply_voltage: f64) -> SwitchState {
+    let gate_voltage = match gate {
+        LogicState::High => Some(supply_voltage),
+        LogicState::Low => Some(0.0),
+        // An undriven internal gate starts FLOATING while the combinational
+        // network settles. Keeping it open lets resolved upstream stages
+        // propagate without injecting provisional UNKNOWN drives into rails.
+        LogicState::Floating => return SwitchState::Off,
+        LogicState::Unknown | LogicState::Contended => None,
+    };
+    let Some(gate_voltage) = gate_voltage else {
+        return SwitchState::Unknown;
+    };
+    let overdrive = if transistor.pmos {
+        supply_voltage - gate_voltage - transistor.threshold_voltage.abs()
+    } else {
+        gate_voltage - transistor.threshold_voltage
+    };
+    let selected = if transistor.pmos {
+        gate == LogicState::Low
+    } else {
+        gate == LogicState::High
+    };
+    if selected && overdrive > 0.0 {
+        SwitchState::On
+    } else {
+        SwitchState::Off
+    }
+}
+
+fn shortest_drive_resistances(
+    net_count: usize,
+    transistors: &[Transistor],
+    switches: &[SwitchState],
+    direct_drives: &[Vec<LogicState>],
+    drive: LogicState,
+) -> Vec<Option<f64>> {
+    let mut distances = vec![f64::INFINITY; net_count];
+    let mut visited = vec![false; net_count];
+    for (net, states) in direct_drives.iter().enumerate() {
+        if states.contains(&drive) {
+            distances[net] = 0.0;
+        }
+    }
+    for _ in 0..net_count {
+        let Some(current) = (0..net_count)
+            .filter(|net| !visited[*net] && distances[*net].is_finite())
+            .min_by(|left, right| distances[*left].total_cmp(&distances[*right]))
+        else {
+            break;
+        };
+        visited[current] = true;
+        for (transistor, state) in transistors.iter().zip(switches) {
+            if *state != SwitchState::On {
+                continue;
+            }
+            let neighbor = if transistor.drain == current {
+                Some(transistor.source)
+            } else if transistor.source == current {
+                Some(transistor.drain)
+            } else {
+                None
+            };
+            if let Some(neighbor) = neighbor {
+                distances[neighbor] = distances[neighbor]
+                    .min(distances[current] + transistor.effective_on_resistance_ohms);
+            }
+        }
+    }
+    distances
+        .into_iter()
+        .map(|distance| distance.is_finite().then_some(distance))
+        .collect()
 }
 
 pub fn simulate(project: &Project, inputs: &HashMap<String, LogicState>) -> SimulationResult {
@@ -266,6 +352,15 @@ pub fn simulate(project: &Project, inputs: &HashMap<String, LogicState>) -> Simu
             gate: terminal_nets[&(component.id, "gate".into())],
             drain: terminal_nets[&(component.id, "drain".into())],
             source: terminal_nets[&(component.id, "source".into())],
+            threshold_voltage: if component.kind == "pmos" {
+                project.technology.pmos.threshold_voltage
+            } else {
+                project.technology.nmos.threshold_voltage
+            },
+            effective_on_resistance_ohms: project
+                .device_characteristics(component.id)
+                .expect("transistor characteristics are valid")
+                .effective_on_resistance_ohms,
         })
         .collect();
 
@@ -283,13 +378,12 @@ pub fn simulate(project: &Project, inputs: &HashMap<String, LogicState>) -> Simu
     for _ in 0..64 {
         let next_switches = transistors
             .iter()
-            .map(|transistor| match states[transistor.gate] {
-                LogicState::High if !transistor.pmos => SwitchState::On,
-                LogicState::Low if transistor.pmos => SwitchState::On,
-                LogicState::High | LogicState::Low => SwitchState::Off,
-                LogicState::Floating | LogicState::Unknown | LogicState::Contended => {
-                    SwitchState::Unknown
-                }
+            .map(|transistor| {
+                switch_state(
+                    transistor,
+                    states[transistor.gate],
+                    project.technology.supply_voltage,
+                )
             })
             .collect::<Vec<_>>();
 
@@ -352,13 +446,57 @@ pub fn simulate(project: &Project, inputs: &HashMap<String, LogicState>) -> Simu
         switches = next_switches;
     }
 
+    let high_resistance = shortest_drive_resistances(
+        net_count,
+        &transistors,
+        &switches,
+        &direct_drives,
+        LogicState::High,
+    );
+    let low_resistance = shortest_drive_resistances(
+        net_count,
+        &transistors,
+        &switches,
+        &direct_drives,
+        LogicState::Low,
+    );
+    let mut net_capacitance_ff = vec![0.0; net_count];
+    for transistor in &transistors {
+        let characteristics = project
+            .device_characteristics(transistor.component_id)
+            .expect("transistor characteristics are valid");
+        net_capacitance_ff[transistor.gate] += characteristics.gate_capacitance_ff;
+        net_capacitance_ff[transistor.drain] += characteristics.diffusion_capacitance_ff;
+        net_capacitance_ff[transistor.source] += characteristics.diffusion_capacitance_ff;
+    }
+    let named_state = |net: usize, name: String| NamedState {
+        name,
+        state: states[net],
+        voltage: match states[net] {
+            LogicState::High => Some(project.technology.supply_voltage),
+            LogicState::Low => Some(0.0),
+            LogicState::Floating | LogicState::Contended | LogicState::Unknown => None,
+        },
+        high_drive_resistance_ohms: high_resistance[net],
+        low_drive_resistance_ohms: low_resistance[net],
+        load_capacitance_ff: net_capacitance_ff[net],
+        estimated_delay_ns: match states[net] {
+            LogicState::High => high_resistance[net],
+            LogicState::Low => low_resistance[net],
+            LogicState::Floating | LogicState::Contended | LogicState::Unknown => None,
+        }
+        .map(|resistance| 0.69 * resistance * net_capacitance_ff[net] * 1e-6),
+    };
+
     let mut nets = (0..net_count)
         .map(|net| NamedState {
-            name: net_names[net]
-                .first()
-                .cloned()
-                .unwrap_or_else(|| format!("net-{}", net + 1)),
-            state: states[net],
+            ..named_state(
+                net,
+                net_names[net]
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| format!("net-{}", net + 1)),
+            )
         })
         .collect::<Vec<_>>();
     nets.sort_by(|left, right| left.name.cmp(&right.name));
@@ -367,9 +505,11 @@ pub fn simulate(project: &Project, inputs: &HashMap<String, LogicState>) -> Simu
         .components
         .iter()
         .filter(|component| component.kind == "output")
-        .map(|component| NamedState {
-            name: component.name.clone(),
-            state: states[terminal_nets[&(component.id, "in".into())]],
+        .map(|component| {
+            named_state(
+                terminal_nets[&(component.id, "in".into())],
+                component.name.clone(),
+            )
         })
         .collect::<Vec<_>>();
     outputs.sort_by(|left, right| left.name.cmp(&right.name));
@@ -384,6 +524,13 @@ pub fn simulate(project: &Project, inputs: &HashMap<String, LogicState>) -> Simu
                 component_id: transistor.component_id,
                 name: transistor.name.clone(),
                 state,
+                gate_voltage: match states[transistor.gate] {
+                    LogicState::High => Some(project.technology.supply_voltage),
+                    LogicState::Low => Some(0.0),
+                    _ => None,
+                },
+                threshold_voltage: transistor.threshold_voltage,
+                effective_on_resistance_ohms: transistor.effective_on_resistance_ohms,
             })
             .collect(),
         wires: project
@@ -395,6 +542,7 @@ pub fn simulate(project: &Project, inputs: &HashMap<String, LogicState>) -> Simu
             })
             .collect(),
         converged,
+        supply_voltage: project.technology.supply_voltage,
     }
 }
 
@@ -534,7 +682,7 @@ pub fn waveform(project: &Project, config: WaveformConfig) -> Result<WaveformRes
                     .get_mut(name)
                     .expect("input signal exists")
                     .push(WaveformSample {
-                        time_ns: time,
+                        time_ns: f64::from(time),
                         state,
                     });
                 (name.clone(), state)
@@ -542,13 +690,25 @@ pub fn waveform(project: &Project, config: WaveformConfig) -> Result<WaveformRes
             .collect::<HashMap<_, _>>();
         let result = simulate(project, &inputs);
         for output in result.outputs {
-            signal_samples
+            let samples = signal_samples
                 .get_mut(&output.name)
-                .expect("output signal exists")
-                .push(WaveformSample {
-                    time_ns: time,
+                .expect("output signal exists");
+            let previous = samples.last().map(|sample| sample.state);
+            if previous == Some(output.state) {
+                continue;
+            }
+            let delay = if time == 0 {
+                0.0
+            } else {
+                output.estimated_delay_ns.unwrap_or(0.0)
+            };
+            let transition_time = f64::from(time) + delay;
+            if transition_time <= f64::from(config.duration_ns) {
+                samples.push(WaveformSample {
+                    time_ns: transition_time,
                     state: output.state,
                 });
+            }
         }
     }
 
@@ -561,10 +721,12 @@ pub fn waveform(project: &Project, config: WaveformConfig) -> Result<WaveformRes
         });
     }
     for name in &output_names {
+        let mut samples = signal_samples.remove(name).unwrap_or_default();
+        samples.sort_by(|left, right| left.time_ns.total_cmp(&right.time_ns));
         signals.push(WaveformSignal {
             name: name.clone(),
             kind: "output",
-            samples: signal_samples.remove(name).unwrap_or_default(),
+            samples,
         });
     }
     Ok(WaveformResult {
@@ -622,6 +784,269 @@ mod tests {
             assert!(result.converged);
             assert_eq!(output(&result), expected);
         }
+    }
+
+    #[test]
+    fn reusable_block_instances_flatten_through_the_production_solver() {
+        let mut source = Project::default();
+        let vdd = source.add_component("vdd", 0.0, -4.0).unwrap();
+        let gnd = source.add_component("gnd", 0.0, 4.0).unwrap();
+        let input = source.add_component("input", -4.0, 0.0).unwrap();
+        let output_probe = source.add_component("output", 4.0, 0.0).unwrap();
+        let pmos = source.add_component("pmos", 0.0, -1.0).unwrap();
+        let nmos = source.add_component("nmos", 0.0, 1.0).unwrap();
+        connect(&mut source, (vdd, "out"), (pmos, "source"));
+        connect(&mut source, (gnd, "out"), (nmos, "source"));
+        connect(&mut source, (input, "out"), (pmos, "gate"));
+        connect(&mut source, (input, "out"), (nmos, "gate"));
+        connect(&mut source, (pmos, "drain"), (nmos, "drain"));
+        connect(&mut source, (pmos, "drain"), (output_probe, "in"));
+        let definition = source.capture_block("INV".into()).unwrap();
+
+        let mut parent = Project::default();
+        parent.block_definitions = source.block_definitions.clone();
+        let instance = parent.place_block(definition, 0.0, 0.0).unwrap();
+        let top_input = parent.add_component("input", -4.0, 0.0).unwrap();
+        let top_output = parent.add_component("output", 4.0, 0.0).unwrap();
+        let top_vdd = parent.add_component("vdd", 0.0, -4.0).unwrap();
+        let top_gnd = parent.add_component("gnd", 0.0, 4.0).unwrap();
+        connect(&mut parent, (top_input, "out"), (instance, "IN1"));
+        connect(&mut parent, (instance, "OUT1"), (top_output, "in"));
+        connect(&mut parent, (top_vdd, "out"), (instance, "VDD1"));
+        connect(&mut parent, (top_gnd, "out"), (instance, "GND1"));
+
+        let flattened = parent.flattened().unwrap();
+        assert!(!flattened
+            .components
+            .iter()
+            .any(|component| component.kind == "block"));
+        for (input_state, expected) in [
+            (LogicState::Low, LogicState::High),
+            (LogicState::High, LogicState::Low),
+        ] {
+            let result = simulate(&flattened, &HashMap::from([("IN1".into(), input_state)]));
+            assert_eq!(
+                result
+                    .outputs
+                    .iter()
+                    .find(|output| output.name == "OUT1")
+                    .unwrap()
+                    .state,
+                expected
+            );
+        }
+        let serialized = serde_json::to_string(&parent).unwrap();
+        let loaded: Project = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(loaded.block_definitions.len(), 1);
+        assert_eq!(loaded.components[0].block_definition_id, Some(definition));
+    }
+
+    #[test]
+    fn cascaded_reusable_nands_settle_before_propagating_unknowns() {
+        let mut source = Project::default();
+        let vdd = source.add_component("vdd", 0.0, -5.0).unwrap();
+        let gnd = source.add_component("gnd", 0.0, 5.0).unwrap();
+        let input_a = source.add_component("input", -5.0, -1.0).unwrap();
+        let input_b = source.add_component("input", -5.0, 1.0).unwrap();
+        let output_probe = source.add_component("output", 5.0, 0.0).unwrap();
+        let pmos_a = source.add_component("pmos", -1.0, -2.0).unwrap();
+        let pmos_b = source.add_component("pmos", 1.0, -2.0).unwrap();
+        let nmos_a = source.add_component("nmos", 0.0, 1.0).unwrap();
+        let nmos_b = source.add_component("nmos", 0.0, 3.0).unwrap();
+        connect(&mut source, (vdd, "out"), (pmos_a, "source"));
+        connect(&mut source, (vdd, "out"), (pmos_b, "source"));
+        connect(&mut source, (pmos_a, "drain"), (output_probe, "in"));
+        connect(&mut source, (pmos_b, "drain"), (output_probe, "in"));
+        connect(&mut source, (nmos_a, "drain"), (output_probe, "in"));
+        connect(&mut source, (nmos_a, "source"), (nmos_b, "drain"));
+        connect(&mut source, (nmos_b, "source"), (gnd, "out"));
+        connect(&mut source, (input_a, "out"), (pmos_a, "gate"));
+        connect(&mut source, (input_a, "out"), (nmos_a, "gate"));
+        connect(&mut source, (input_b, "out"), (pmos_b, "gate"));
+        connect(&mut source, (input_b, "out"), (nmos_b, "gate"));
+        let definition = source.capture_block("NAND2".into()).unwrap();
+
+        let mut parent = Project::default();
+        parent.block_definitions = source.block_definitions;
+        let first = parent.place_block(definition, -2.0, 0.0).unwrap();
+        let second = parent.place_block(definition, 2.0, 0.0).unwrap();
+        let top_vdd = parent.add_component("vdd", 0.0, -5.0).unwrap();
+        let top_gnd = parent.add_component("gnd", 0.0, 5.0).unwrap();
+        let top_a = parent.add_component("input", -6.0, -1.0).unwrap();
+        let top_b = parent.add_component("input", -6.0, 1.0).unwrap();
+        let top_output = parent.add_component("output", 6.0, 0.0).unwrap();
+        for instance in [first, second] {
+            connect(&mut parent, (top_vdd, "out"), (instance, "VDD1"));
+            connect(&mut parent, (top_gnd, "out"), (instance, "GND1"));
+        }
+        connect(&mut parent, (top_a, "out"), (first, "IN1"));
+        connect(&mut parent, (top_b, "out"), (first, "IN2"));
+        connect(&mut parent, (top_a, "out"), (second, "IN1"));
+        connect(&mut parent, (first, "OUT1"), (second, "IN2"));
+        connect(&mut parent, (second, "OUT1"), (top_output, "in"));
+
+        let flattened = parent.flattened().unwrap();
+        let result = simulate(
+            &flattened,
+            &HashMap::from([
+                ("IN1".into(), LogicState::Low),
+                ("IN2".into(), LogicState::Low),
+            ]),
+        );
+        assert!(result.converged);
+        assert_eq!(
+            result
+                .outputs
+                .iter()
+                .find(|output| output.name == "OUT1")
+                .unwrap()
+                .state,
+            LogicState::High
+        );
+        assert!(result
+            .transistors
+            .iter()
+            .all(|transistor| transistor.state != super::SwitchState::Unknown));
+    }
+
+    #[test]
+    fn insufficient_supply_overdrive_prevents_conduction() {
+        let mut project = Project::default();
+        project.technology.supply_voltage = 0.3;
+        let vdd = project.add_component("vdd", 0.0, -4.0).unwrap();
+        let gnd = project.add_component("gnd", 0.0, 4.0).unwrap();
+        let input = project.add_component("input", -4.0, 0.0).unwrap();
+        let output_probe = project.add_component("output", 4.0, 0.0).unwrap();
+        let pmos = project.add_component("pmos", 0.0, -1.0).unwrap();
+        let nmos = project.add_component("nmos", 0.0, 1.0).unwrap();
+        connect(&mut project, (vdd, "out"), (pmos, "source"));
+        connect(&mut project, (gnd, "out"), (nmos, "source"));
+        connect(&mut project, (input, "out"), (pmos, "gate"));
+        connect(&mut project, (input, "out"), (nmos, "gate"));
+        connect(&mut project, (pmos, "drain"), (nmos, "drain"));
+        connect(&mut project, (pmos, "drain"), (output_probe, "in"));
+
+        let result = simulate(&project, &HashMap::from([("IN1".into(), LogicState::High)]));
+        assert_eq!(output(&result), LogicState::Floating);
+        assert!(result
+            .transistors
+            .iter()
+            .all(|transistor| transistor.state == super::SwitchState::Off));
+    }
+
+    #[test]
+    fn series_paths_report_more_resistance_than_parallel_paths() {
+        fn pull_down(parallel: bool) -> super::SimulationResult {
+            let mut project = Project::default();
+            let gnd = project.add_component("gnd", 0.0, 4.0).unwrap();
+            let input = project.add_component("input", -4.0, 0.0).unwrap();
+            let output_probe = project.add_component("output", 4.0, 0.0).unwrap();
+            let first = project.add_component("nmos", 0.0, 1.0).unwrap();
+            let second = project.add_component("nmos", 0.0, 3.0).unwrap();
+            connect(&mut project, (input, "out"), (first, "gate"));
+            connect(&mut project, (input, "out"), (second, "gate"));
+            connect(&mut project, (first, "drain"), (output_probe, "in"));
+            if parallel {
+                connect(&mut project, (second, "drain"), (output_probe, "in"));
+                connect(&mut project, (first, "source"), (gnd, "out"));
+                connect(&mut project, (second, "source"), (gnd, "out"));
+            } else {
+                connect(&mut project, (first, "source"), (second, "drain"));
+                connect(&mut project, (second, "source"), (gnd, "out"));
+            }
+            simulate(&project, &HashMap::from([("IN1".into(), LogicState::High)]))
+        }
+
+        let series = pull_down(false).outputs[0]
+            .low_drive_resistance_ohms
+            .unwrap();
+        let parallel = pull_down(true).outputs[0]
+            .low_drive_resistance_ohms
+            .unwrap();
+        assert!(series > parallel);
+        assert_eq!(series, 24_000.0);
+        assert_eq!(parallel, 12_000.0);
+    }
+
+    #[test]
+    fn geometry_changes_reported_drive_resistance() {
+        let mut project = Project::default();
+        let gnd = project.add_component("gnd", 0.0, 4.0).unwrap();
+        let input = project.add_component("input", -4.0, 0.0).unwrap();
+        let output_probe = project.add_component("output", 4.0, 0.0).unwrap();
+        let nmos = project.add_component("nmos", 0.0, 1.0).unwrap();
+        project.set_device_geometry(nmos, 2.0, 1.0).unwrap();
+        connect(&mut project, (input, "out"), (nmos, "gate"));
+        connect(&mut project, (nmos, "drain"), (output_probe, "in"));
+        connect(&mut project, (nmos, "source"), (gnd, "out"));
+
+        let result = simulate(&project, &HashMap::from([("IN1".into(), LogicState::High)]));
+        assert_eq!(result.outputs[0].low_drive_resistance_ohms, Some(6_000.0));
+        assert_eq!(result.transistors[0].effective_on_resistance_ohms, 6_000.0);
+    }
+
+    fn inverter_with_fanout(fanout: usize, pmos_width: f64) -> Project {
+        let mut project = Project::default();
+        let vdd = project.add_component("vdd", 0.0, -4.0).unwrap();
+        let gnd = project.add_component("gnd", 0.0, 4.0).unwrap();
+        let input = project.add_component("input", -4.0, 0.0).unwrap();
+        let output_probe = project.add_component("output", 4.0, 0.0).unwrap();
+        let pmos = project.add_component("pmos", 0.0, -1.0).unwrap();
+        let nmos = project.add_component("nmos", 0.0, 1.0).unwrap();
+        project.set_device_geometry(pmos, pmos_width, 1.0).unwrap();
+        connect(&mut project, (vdd, "out"), (pmos, "source"));
+        connect(&mut project, (gnd, "out"), (nmos, "source"));
+        connect(&mut project, (input, "out"), (pmos, "gate"));
+        connect(&mut project, (input, "out"), (nmos, "gate"));
+        connect(&mut project, (pmos, "drain"), (nmos, "drain"));
+        connect(&mut project, (pmos, "drain"), (output_probe, "in"));
+        for index in 0..fanout {
+            let load = project
+                .add_component("nmos", 6.0, index as f64 * 2.0)
+                .unwrap();
+            connect(&mut project, (pmos, "drain"), (load, "gate"));
+        }
+        project
+    }
+
+    #[test]
+    fn fanout_increases_delay_and_stronger_drive_reduces_it() {
+        let input = HashMap::from([("IN1".into(), LogicState::Low)]);
+        let unloaded = simulate(&inverter_with_fanout(0, 1.0), &input).outputs[0]
+            .estimated_delay_ns
+            .unwrap();
+        let loaded = simulate(&inverter_with_fanout(4, 1.0), &input).outputs[0]
+            .estimated_delay_ns
+            .unwrap();
+        let stronger = simulate(&inverter_with_fanout(4, 2.0), &input).outputs[0]
+            .estimated_delay_ns
+            .unwrap();
+        assert!(loaded > unloaded);
+        assert!(stronger < loaded);
+    }
+
+    #[test]
+    fn waveform_edges_shift_by_the_estimated_delay() {
+        let project = inverter_with_fanout(4, 1.0);
+        let static_low = simulate(&project, &HashMap::from([("IN1".into(), LogicState::High)]));
+        let expected_delay = static_low.outputs[0].estimated_delay_ns.unwrap();
+        let result = waveform(
+            &project,
+            WaveformConfig {
+                duration_ns: 40,
+                clock_period_ns: 10,
+                input_change_ns: 10,
+            },
+        )
+        .unwrap();
+        let output = result
+            .signals
+            .iter()
+            .find(|signal| signal.kind == "output")
+            .unwrap();
+        assert_eq!(output.samples[0].state, LogicState::High);
+        assert_eq!(output.samples[1].state, LogicState::Low);
+        assert!((output.samples[1].time_ns - (10.0 + expected_delay)).abs() < 1e-9);
     }
 
     #[test]
@@ -787,14 +1212,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 LogicState::Low,
-                LogicState::Low,
-                LogicState::High,
                 LogicState::High,
                 LogicState::Low,
+                LogicState::High,
                 LogicState::Low,
-                LogicState::High,
-                LogicState::High,
-                LogicState::Low
             ]
         );
     }

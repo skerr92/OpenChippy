@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import type { LogicState, WaveformConfig, WaveformResult } from "./types";
 
 type Props = {
@@ -14,12 +15,39 @@ const stateY = (state: LogicState, top: number) => {
   return top + 25;
 };
 
+const valueAt = (
+  samples: Array<{ timeNs: number; state: LogicState }>,
+  timeNs: number,
+) => samples.reduce(
+  (current, sample) => sample.timeNs <= timeNs ? sample.state : current,
+  samples[0]?.state ?? "UNKNOWN",
+);
+
+const binaryValue = (state: LogicState) =>
+  state === "HIGH" ? "1" : state === "LOW" ? "0" : "X";
+
 export default function WaveformView({ config, result, running, onConfig, onRun }: Props) {
   const rowHeight = 52;
   const chartWidth = 1000;
   const chartHeight = Math.max((result?.signals.length ?? 1) * rowHeight + 34, 180);
+  const [cursorNs, setCursorNs] = useState(0);
+  const [edgeTimeNs, setEdgeTimeNs] = useState(0);
+  const waveformSvg = useRef<SVGSVGElement>(null);
+  useEffect(() => {
+    setCursorNs(0);
+    setEdgeTimeNs(0);
+  }, [result]);
   const update = (field: keyof WaveformConfig, value: string) => {
     onConfig({ ...config, [field]: Math.max(1, Number(value) || 1) });
+  };
+  const moveCursor = (event: React.PointerEvent<SVGSVGElement>) => {
+    if (!result) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const fraction = Math.min(
+      1,
+      Math.max(0, (event.clientX - bounds.left) / Math.max(bounds.width, 1)),
+    );
+    setCursorNs(fraction * result.durationNs);
   };
 
   return (
@@ -43,7 +71,7 @@ export default function WaveformView({ config, result, running, onConfig, onRun 
           {running ? "Running…" : "Run waveform"}
         </button>
         <p className="waveform-note">
-          Inputs named CLK or CLOCK use the clock period. Other inputs advance as a binary sequence.
+          Inputs named CLK or CLOCK use the clock period. Output edges include the educational 0.69 × R × C propagation estimate.
         </p>
         <div className="waveform-key">
           {(["HIGH", "LOW", "FLOATING", "CONTENDED", "UNKNOWN"] as LogicState[]).map((state) => (
@@ -53,20 +81,47 @@ export default function WaveformView({ config, result, running, onConfig, onRun 
       </aside>
       <section className="waveform-canvas">
         <div className="waveform-header">
-          <div><strong>Waveforms</strong><small>{result ? `${result.signals.length} signals · ${result.durationNs} ns` : "Configure and run a simulation"}</small></div>
+          <div><strong>Waveforms</strong><small>{result ? `${result.signals.length} signals · ${result.durationNs} ns · cursor ${cursorNs.toFixed(3)} ns` : "Configure and run a simulation"}</small></div>
         </div>
         {result ? (
-          <div className="waveform-scroll">
+          <div className="waveform-scroll" onScroll={(event) => {
+            const width = waveformSvg.current?.getBoundingClientRect().width ?? chartWidth;
+            setEdgeTimeNs(Math.min(
+              result.durationNs,
+              Math.max(0, event.currentTarget.scrollLeft / Math.max(width, 1) * result.durationNs),
+            ));
+          }}>
             <div className="waveform-labels" style={{ height: chartHeight }}>
               <div className="time-label">Signal</div>
               {result.signals.map((signal) => (
                 <div key={`${signal.kind}-${signal.name}`} className={`waveform-label ${signal.kind}`}>
-                  <small>{signal.kind}</small><strong>{signal.name}</strong>
+                  <small>{signal.kind}</small>
+                  <div className="waveform-label-heading">
+                    <strong>{signal.name}</strong>
+                    <span className={`waveform-value logic-${valueAt(signal.samples, cursorNs).toLowerCase()}`}>
+                      {valueAt(signal.samples, cursorNs)}
+                    </span>
+                  </div>
+                  {(() => {
+                    const state = valueAt(signal.samples, edgeTimeNs);
+                    return (
+                      <span className={`waveform-edge-value edge-${state.toLowerCase()}`}>
+                        {binaryValue(state)}
+                      </span>
+                    );
+                  })()}
                 </div>
               ))}
             </div>
-            <svg className="waveform-svg" viewBox={`0 0 ${chartWidth} ${chartHeight}`}
-              preserveAspectRatio="none" style={{ width: chartWidth, height: chartHeight }}>
+            <svg ref={waveformSvg} className="waveform-svg" viewBox={`0 0 ${chartWidth} ${chartHeight}`}
+              preserveAspectRatio="none" style={{ width: chartWidth, height: chartHeight }}
+              onPointerDown={(event) => {
+                event.currentTarget.setPointerCapture(event.pointerId);
+                moveCursor(event);
+              }}
+              onPointerMove={(event) => {
+                if (event.buttons & 1) moveCursor(event);
+              }}>
               <g className="time-grid">
                 {Array.from({ length: 11 }, (_, index) => {
                   const x = index * chartWidth / 10;
@@ -90,6 +145,13 @@ export default function WaveformView({ config, result, running, onConfig, onRun 
                   })}
                 </g>;
               })}
+              <line
+                className="waveform-cursor"
+                x1={cursorNs / result.durationNs * chartWidth}
+                x2={cursorNs / result.durationNs * chartWidth}
+                y1="0"
+                y2={chartHeight}
+              />
             </svg>
           </div>
         ) : (

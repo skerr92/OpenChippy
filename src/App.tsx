@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import * as backend from "./backend";
-import type { ComponentKind, LogicState, SimulationResult, TerminalRef, TruthTableResult, ValidationReport, WaveformConfig, WaveformResult, WorkspaceState } from "./types";
+import type { ComponentKind, DeviceCharacteristics, LogicState, PhysicalLayoutIr, SimulationResult, TerminalRef, TruthTableResult, ValidationReport, WaveformConfig, WaveformResult, WorkspaceState } from "./types";
+import PhysicalViewport from "./PhysicalViewport";
 import SchematicViewport from "./SchematicViewport";
-import Viewport from "./Viewport";
 import WaveformView from "./WaveformView";
 
 type ViewMode = "schematic" | "3d" | "waveform";
@@ -16,6 +16,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("schematic");
   const [placementKind, setPlacementKind] = useState<ComponentKind | null>(null);
+  const [blockPlacementId, setBlockPlacementId] = useState<string | null>(null);
   const [pendingTerminal, setPendingTerminal] = useState<TerminalRef | null>(null);
   const [pendingWireId, setPendingWireId] = useState<string | null>(null);
   const [validation, setValidation] = useState<ValidationReport | null>(null);
@@ -29,6 +30,13 @@ export default function App() {
   });
   const [waveform, setWaveform] = useState<WaveformResult | null>(null);
   const [waveformRunning, setWaveformRunning] = useState(false);
+  const [deviceCharacteristics, setDeviceCharacteristics] = useState<DeviceCharacteristics | null>(null);
+  const [physicalIr, setPhysicalIr] = useState<PhysicalLayoutIr | null>(null);
+  const [blockDialogOpen, setBlockDialogOpen] = useState(false);
+  const [blockName, setBlockName] = useState("");
+  const [blockDialogError, setBlockDialogError] = useState<string | null>(null);
+  const [blockSaving, setBlockSaving] = useState(false);
+  const [schematicFitRevision, setSchematicFitRevision] = useState(0);
   const project = workspace?.project ?? null;
   const selectedComponents = useMemo(
     () => project?.components.filter(({ id }) => selectedIds.includes(id)) ?? [],
@@ -48,9 +56,47 @@ export default function App() {
   }, [digitalInputs]);
 
   useEffect(() => {
+    if (!selected || (selected.kind !== "nmos" && selected.kind !== "pmos")) {
+      setDeviceCharacteristics(null);
+      return;
+    }
+    let active = true;
+    backend.deviceCharacteristics(selected.id)
+      .then((characteristics) => {
+        if (active) setDeviceCharacteristics(characteristics);
+      })
+      .catch((reason) => {
+        if (active) showError(reason);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selected]);
+
+  useEffect(() => {
+    if (viewMode !== "3d" || !project) {
+      setPhysicalIr(null);
+      return;
+    }
+    setPhysicalIr(null);
+    let active = true;
+    backend.generatePhysicalIr()
+      .then((ir) => {
+        if (active) setPhysicalIr(ir);
+      })
+      .catch((reason) => {
+        if (active) showError(reason);
+      });
+    return () => {
+      active = false;
+    };
+  }, [viewMode, project]);
+
+  useEffect(() => {
     backend.createProject()
       .then((value) => {
         setWorkspace(value);
+        setSchematicFitRevision((revision) => revision + 1);
         setStatus(backend.inTauri() ? "Desktop backend ready" : "Browser preview");
       })
       .catch(showError);
@@ -60,8 +106,11 @@ export default function App() {
     const cancelPlacement = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setPlacementKind(null);
+        setBlockPlacementId(null);
         setPendingTerminal(null);
         setPendingWireId(null);
+        setBlockDialogOpen(false);
+        setBlockDialogError(null);
         setStatus("Placement cancelled");
       }
     };
@@ -74,8 +123,9 @@ export default function App() {
     setStatus("Action failed");
   };
 
-  const replaceWorkspace = (next: WorkspaceState, message: string) => {
+  const replaceWorkspace = (next: WorkspaceState, message: string, fitDesign = false) => {
     setWorkspace(next);
+    if (fitDesign) setSchematicFitRevision((revision) => revision + 1);
     setSelectedIds([]);
     setSelectedWireId(null);
     setError(null);
@@ -87,10 +137,16 @@ export default function App() {
   };
 
   const placeComponent = async (x: number, y: number) => {
-    if (!placementKind) return;
+    if (!placementKind && !blockPlacementId) return;
     try {
-      replaceWorkspace(await backend.addComponent(placementKind, x, y), `Placed ${placementKind.toUpperCase()} at (${x}, ${y})`);
+      if (blockPlacementId) {
+        const definition = project?.blockDefinitions.find(({ id }) => id === blockPlacementId);
+        replaceWorkspace(await backend.placeBlock(blockPlacementId, x, y), `Placed ${definition?.name ?? "block"} at (${x}, ${y})`);
+      } else if (placementKind) {
+        replaceWorkspace(await backend.addComponent(placementKind, x, y), `Placed ${placementKind.toUpperCase()} at (${x}, ${y})`);
+      }
       setPlacementKind(null);
+      setBlockPlacementId(null);
     } catch (reason) {
       showError(reason);
     }
@@ -99,9 +155,53 @@ export default function App() {
   const armPlacement = (kind: ComponentKind) => {
     setViewMode("schematic");
     setPlacementKind(kind);
+    setBlockPlacementId(null);
     setPendingTerminal(null);
     setPendingWireId(null);
     setStatus(`Click a grid point to place ${kind.toUpperCase()} · Esc to cancel`);
+  };
+
+  const armBlockPlacement = (definitionId: string) => {
+    const definition = project?.blockDefinitions.find(({ id }) => id === definitionId);
+    setViewMode("schematic");
+    setPlacementKind(null);
+    setBlockPlacementId(definitionId);
+    setPendingTerminal(null);
+    setPendingWireId(null);
+    setStatus(`Click a grid point to place ${definition?.name ?? "block"} · Esc to cancel`);
+  };
+
+  const openBlockDialog = () => {
+    setBlockName(project?.name.replaceAll(" ", "_") ?? "Device_Block");
+    setBlockDialogError(null);
+    setBlockDialogOpen(true);
+  };
+
+  const captureCurrentBlock = async () => {
+    const name = blockName.trim();
+    if (!name) {
+      setBlockDialogError("Enter a name for the reusable block.");
+      return;
+    }
+    setBlockSaving(true);
+    setBlockDialogError(null);
+    try {
+      replaceWorkspace(await backend.captureBlock(name), `Saved ${name.trim()} as a reusable block`);
+      setBlockDialogOpen(false);
+    } catch (reason) {
+      setBlockDialogError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBlockSaving(false);
+    }
+  };
+
+  const exportDefinition = async (definitionId: string, name: string) => {
+    try {
+      const path = await backend.exportBlock(definitionId);
+      setStatus(`Exported ${name} to ${path}`);
+    } catch (reason) {
+      showError(reason);
+    }
   };
 
   const moveComponent = async (id: string, x: number, y: number) => {
@@ -240,6 +340,23 @@ export default function App() {
     }
   };
 
+  const updateDeviceGeometry = async (widthUm: number, lengthUm: number) => {
+    if (!selected || !deviceCharacteristics) return;
+    if (
+      widthUm === deviceCharacteristics.widthUm
+      && lengthUm === deviceCharacteristics.lengthUm
+    ) return;
+    try {
+      replaceWorkspace(
+        await backend.setDeviceGeometry(selected.id, widthUm, lengthUm),
+        `Updated ${selected.name} geometry to W=${widthUm} µm, L=${lengthUm} µm`,
+      );
+      setSelectedIds([selected.id]);
+    } catch (reason) {
+      showError(reason);
+    }
+  };
+
   const runDrc = async () => {
     try {
       const report = await backend.validateProject();
@@ -355,7 +472,7 @@ export default function App() {
     try {
       if (!(await confirmDiscard())) return;
       const path = await open({ multiple: false, filters: [{ name: "OpenChippy", extensions: ["chippy"] }] });
-      if (typeof path === "string") replaceWorkspace(await backend.loadProject(path), "Project loaded");
+      if (typeof path === "string") replaceWorkspace(await backend.loadProject(path), "Project loaded", true);
     } catch (reason) {
       showError(reason);
     }
@@ -363,7 +480,31 @@ export default function App() {
 
   const newProject = async () => {
     try {
-      if (await confirmDiscard()) replaceWorkspace(await backend.createProject(), "New project");
+      if (await confirmDiscard()) replaceWorkspace(await backend.createProject(), "New project", true);
+    } catch (reason) {
+      showError(reason);
+    }
+  };
+
+  const loadTechnology = async () => {
+    try {
+      const path = await open({
+        multiple: false,
+        filters: [{ name: "Technology YAML", extensions: ["yaml", "yml"] }],
+      });
+      if (typeof path === "string") {
+        const next = await backend.loadTechnology(path);
+        replaceWorkspace(next, `Loaded technology ${next.project.technology.name}`);
+      }
+    } catch (reason) {
+      showError(reason);
+    }
+  };
+
+  const resetTechnology = async () => {
+    try {
+      const next = await backend.resetTechnology();
+      replaceWorkspace(next, "Restored built-in educational technology");
     } catch (reason) {
       showError(reason);
     }
@@ -409,7 +550,7 @@ export default function App() {
             </div>
           </details>
           <button className="truth-table-button" disabled={!digitalInputs.length} onClick={generateTruthTable}>Truth Table</button>
-          <button className="primary" onClick={() => armPlacement("nmos")}>+ Place NMOS</button>
+          <button disabled={!project.components.length} onClick={openBlockDialog}>Save as Block</button>
         </nav>
       </header>
       <aside className="library">
@@ -445,24 +586,36 @@ export default function App() {
           <span className="component-icon resistor-glyph">╱╲╱</span>
           <span><strong>Resistor</strong><small>Two-terminal passive</small></span>
         </button>
+        <p className="library-section">Reusable Blocks</p>
+        {project.blockDefinitions.map((definition) => (
+          <button key={definition.id} className={`component-card ${blockPlacementId === definition.id ? "active" : ""}`}
+            onClick={() => armBlockPlacement(definition.id)}>
+            <span className="component-icon block-glyph">▣</span>
+            <span><strong>{definition.name}</strong><small>{definition.pins.length} pins · shared definition</small></span>
+          </button>
+        ))}
+        {!project.blockDefinitions.length && <p className="library-empty">Save the current transistor circuit as a reusable block.</p>}
       </aside>
       <section className="stage">
-        <div className="stage-label">
+        {viewMode !== "3d" && <div className="stage-label">
           <span>{workspace.dirty ? "● " : ""}{project.name}</span>
-          <small>{workspace.path?.split(/[/\\]/).pop() ?? "Not saved"} · {project.components.length} components</small>
-        </div>
-        <div className="view-switch" role="group" aria-label="Editor view">
+          <small>{workspace.path?.split(/[/\\]/).pop() ?? "Not saved"} · {project.components.length} components · {project.technology.name}</small>
+        </div>}
+        {viewMode !== "3d" && <div className="view-switch" role="group" aria-label="Editor view">
           <button className={viewMode === "schematic" ? "active" : ""} onClick={() => setViewMode("schematic")}>2D Schematic</button>
-          <button className={viewMode === "3d" ? "active" : ""} onClick={() => { setViewMode("3d"); setPlacementKind(null); }}>3D View</button>
+          <button onClick={() => { setViewMode("3d"); setPlacementKind(null); }}>3D View</button>
           <button className={viewMode === "waveform" ? "active" : ""} onClick={() => { setViewMode("waveform"); setPlacementKind(null); }}>Waveforms</button>
-        </div>
+        </div>}
         {viewMode === "schematic" ? (
           <SchematicViewport
+            fitRevision={schematicFitRevision}
             components={project.components}
             wires={project.wires}
+            blockDefinitions={project.blockDefinitions}
             selectedIds={selectedIds}
             selectedWireId={selectedWireId}
             placementKind={placementKind}
+            placementActive={Boolean(placementKind || blockPlacementId)}
             pendingTerminal={pendingTerminal}
             routingActive={Boolean(pendingTerminal || pendingWireId)}
             simulation={simulation}
@@ -477,12 +630,22 @@ export default function App() {
             onDanglingEnd={chooseDanglingEnd}
           />
         ) : viewMode === "3d" ? (
-          <Viewport components={project.components} wires={project.wires} selectedIds={selectedIds} simulation={simulation} onSelect={selectComponent} />
+          <PhysicalViewport
+            layout={physicalIr}
+            selectedIds={selectedIds}
+            projectName={project.name}
+            technologyName={project.technology.name}
+            onSelect={selectComponent}
+            onView={(view) => {
+              setViewMode(view);
+              setPlacementKind(null);
+            }}
+          />
         ) : (
           <WaveformView config={waveformConfig} result={waveform} running={waveformRunning}
             onConfig={setWaveformConfig} onRun={runWaveform} />
         )}
-        {viewMode !== "waveform" && (digitalInputs.length > 0 || simulation) && (
+        {viewMode === "schematic" && (digitalInputs.length > 0 || simulation) && (
           <div className="simulation-panel">
             <span className="simulation-title">Switch simulation</span>
             {digitalInputs.map((input) => (
@@ -528,19 +691,16 @@ export default function App() {
             </div>
           </div>
         )}
-        {viewMode !== "waveform" && (placementKind || pendingTerminal || pendingWireId) && <div className="placement-hint">
-          {placementKind
-            ? `Place ${placementKind.toUpperCase()} on grid`
+        {viewMode !== "waveform" && (placementKind || blockPlacementId || pendingTerminal || pendingWireId) && <div className="placement-hint">
+          {placementKind || blockPlacementId
+            ? `Place ${placementKind?.toUpperCase() ?? project.blockDefinitions.find(({ id }) => id === blockPlacementId)?.name ?? "BLOCK"} on grid`
             : pendingWireId
               ? "Select a terminal to finish this wire"
               : "Select a terminal or click the grid"}
-          <button onClick={() => { setPlacementKind(null); setPendingTerminal(null); setPendingWireId(null); }}>Cancel</button>
+          <button onClick={() => { setPlacementKind(null); setBlockPlacementId(null); setPendingTerminal(null); setPendingWireId(null); }}>Cancel</button>
         </div>}
-        {viewMode === "schematic" && !placementKind && !pendingTerminal && !pendingWireId && (
-          <div className="viewport-help">Drag empty canvas / two-finger / arrows to pan · Pinch or Ctrl-wheel to zoom · Click a terminal, then the grid, to leave a routed endpoint</div>
-        )}
-        {viewMode === "3d" && (
-          <div className="viewport-help">Drag to pan · Right-drag to rotate · Arrows pan · Wheel or pinch to zoom · Click layers to select</div>
+        {viewMode === "schematic" && !placementKind && !blockPlacementId && !pendingTerminal && !pendingWireId && (
+          <div className="viewport-help">Drag empty canvas / two-finger / arrows to pan · Shift-arrows pan faster · Pinch or Ctrl-wheel to zoom · F or Home fits the circuit · Click a terminal, then the grid, to leave a routed endpoint</div>
         )}
       </section>
       <aside className="properties">
@@ -570,6 +730,7 @@ export default function App() {
           <>
             <div className={`simulation-summary ${simulation.converged ? "passed" : "failed"}`}>
               <strong>{simulation.converged ? "Stable solution" : "Solver did not converge"}</strong>
+              <small>Digital rails: 0 V / {simulation.supplyVoltage} V</small>
               <small>
                 {simulation.outputs.some(({ state }) => state === "CONTENDED")
                   ? "One or more outputs have conflicting drivers."
@@ -593,7 +754,21 @@ export default function App() {
             <div className="state-list">
               {simulation.outputs.map((output) => (
                 <button key={output.name} onClick={() => selectComponent(project.components.find((component) => component.name === output.name)?.id ?? null)}>
-                  <span>{output.name}</span>
+                  <span>
+                    {output.name}
+                    <small>
+                      {output.voltage === null ? "no resolved voltage" : `${output.voltage} V`}
+                      {output.state === "HIGH" && output.highDriveResistanceOhms !== null
+                        ? ` · pull-up ${output.highDriveResistanceOhms.toLocaleString(undefined, { maximumFractionDigits: 1 })} Ω`
+                        : output.state === "LOW" && output.lowDriveResistanceOhms !== null
+                          ? ` · pull-down ${output.lowDriveResistanceOhms.toLocaleString(undefined, { maximumFractionDigits: 1 })} Ω`
+                          : ""}
+                      {` · ${output.loadCapacitanceFf.toLocaleString(undefined, { maximumFractionDigits: 3 })} fF`}
+                      {output.estimatedDelayNs !== null
+                        ? ` · ${output.estimatedDelayNs.toLocaleString(undefined, { maximumFractionDigits: 4 })} ns`
+                        : ""}
+                    </small>
+                  </span>
                   <strong className={`logic-${output.state.toLowerCase()}`}>{output.state}</strong>
                 </button>
               ))}
@@ -603,7 +778,14 @@ export default function App() {
             <div className="state-list transistor-states">
               {simulation.transistors.map((transistor) => (
                 <button key={transistor.componentId} onClick={() => selectComponent(transistor.componentId)}>
-                  <span>{transistor.name}</span>
+                  <span>
+                    {transistor.name}
+                    <small>
+                      Vg {transistor.gateVoltage === null ? "?" : `${transistor.gateVoltage} V`}
+                      {" · "}Vt {transistor.thresholdVoltage} V
+                      {" · "}{transistor.effectiveOnResistanceOhms.toLocaleString(undefined, { maximumFractionDigits: 1 })} Ω
+                    </small>
+                  </span>
                   <strong className={`switch-${transistor.state}`}>{transistor.state.toUpperCase()}</strong>
                 </button>
               ))}
@@ -652,6 +834,68 @@ export default function App() {
               <dt>ID</dt><dd>{selected.id.slice(0, 8)}</dd>
               <dt>Position</dt><dd>{selected.position.x}, {selected.position.y}</dd>
             </dl>
+            {deviceCharacteristics && (
+              <>
+                <p className="inspector-section">Device geometry</p>
+                <dl>
+                  <dt>Width</dt>
+                  <dd>
+                    <input
+                      className="property-input numeric-property"
+                      type="number"
+                      min="0.001"
+                      step="0.1"
+                      key={`${selected.id}-w-${deviceCharacteristics.widthUm}`}
+                      defaultValue={deviceCharacteristics.widthUm}
+                      onBlur={(event) => updateDeviceGeometry(
+                        event.currentTarget.valueAsNumber,
+                        deviceCharacteristics.lengthUm,
+                      )}
+                    /> µm
+                  </dd>
+                  <dt>Length</dt>
+                  <dd>
+                    <input
+                      className="property-input numeric-property"
+                      type="number"
+                      min="0.001"
+                      step="0.1"
+                      key={`${selected.id}-l-${deviceCharacteristics.lengthUm}`}
+                      defaultValue={deviceCharacteristics.lengthUm}
+                      onBlur={(event) => updateDeviceGeometry(
+                        deviceCharacteristics.widthUm,
+                        event.currentTarget.valueAsNumber,
+                      )}
+                    /> µm
+                  </dd>
+                </dl>
+                <p className="inspector-section">Derived characteristics</p>
+                <dl>
+                  <dt>Effective Ron</dt>
+                  <dd>{deviceCharacteristics.effectiveOnResistanceOhms.toLocaleString(undefined, { maximumFractionDigits: 2 })} Ω</dd>
+                  <dt>Gate cap.</dt>
+                  <dd>{deviceCharacteristics.gateCapacitanceFf.toLocaleString(undefined, { maximumFractionDigits: 3 })} fF</dd>
+                  <dt>Diffusion cap.</dt>
+                  <dd>{deviceCharacteristics.diffusionCapacitanceFf.toLocaleString(undefined, { maximumFractionDigits: 3 })} fF</dd>
+                </dl>
+                <p className="selection-note">Educational estimates from the active technology. Timing application begins in Milestone 3.5.</p>
+              </>
+            )}
+            {selected.kind === "block" && (() => {
+              const definition = project.blockDefinitions.find(({ id }) => id === selected.blockDefinitionId);
+              return definition ? (
+                <div className="block-inspector">
+                  <p className="inspector-section">Shared definition</p>
+                  <strong>{definition.name}</strong>
+                  <small>{definition.components.length} source components · {definition.wires.length} wires</small>
+                  <div className="block-pin-list">
+                    {definition.pins.map((pin) => <span key={pin.name}><b>{pin.name}</b>{pin.role}</span>)}
+                  </div>
+                  <p className="selection-note">Instances share this transistor-level source. Analysis and physical generation flatten it temporarily.</p>
+                  <button className="close-results" onClick={() => exportDefinition(definition.id, definition.name)}>Export portable block</button>
+                </div>
+              ) : <p className="selection-note">This instance references a missing definition.</p>;
+            })()}
             <div className="selection-actions">
               <button onClick={() => transformSelection("rotate")}>Rotate</button>
               <button className="danger" onClick={() => transformSelection("delete")}>Delete</button>
@@ -671,10 +915,56 @@ export default function App() {
                 if (event.key === "Enter") event.currentTarget.blur();
               }}
             />
+            <div className="technology-card">
+              <p className="inspector-section">Active technology</p>
+              <strong>{project.technology.name}</strong>
+              <dl>
+                <dt>Format</dt><dd>v{project.technology.format_version}</dd>
+                <dt>Supply</dt><dd>{project.technology.supply_voltage} V</dd>
+                <dt>Routing metals</dt><dd>{project.technology.max_metal_layers}</dd>
+                <dt>NMOS Vt</dt><dd>{project.technology.nmos.threshold_voltage} V</dd>
+                <dt>NMOS Ron</dt><dd>{project.technology.nmos.nominal_on_resistance_ohms.toLocaleString()} Ω</dd>
+                <dt>PMOS Vt</dt><dd>{project.technology.pmos.threshold_voltage} V</dd>
+                <dt>PMOS Ron</dt><dd>{project.technology.pmos.nominal_on_resistance_ohms.toLocaleString()} Ω</dd>
+              </dl>
+              <div className="selection-actions">
+                <button onClick={loadTechnology}>Load YAML</button>
+                <button onClick={resetTechnology}>Use built-in</button>
+              </div>
+            </div>
             <div className="empty compact"><span>⌁</span><p>Select an object in the viewport to inspect it.</p></div>
           </>
         )}
       </aside>
+      {blockDialogOpen && (
+        <div className="modal-backdrop" role="presentation" onPointerDown={() => {
+          if (!blockSaving) setBlockDialogOpen(false);
+        }}>
+          <form className="block-dialog" role="dialog" aria-modal="true" aria-labelledby="block-dialog-title"
+            onPointerDown={(event) => event.stopPropagation()}
+            onSubmit={(event) => {
+              event.preventDefault();
+              void captureCurrentBlock();
+            }}>
+            <p className="eyebrow">Reusable Device Block</p>
+            <h2 id="block-dialog-title">Save current circuit as a block</h2>
+            <p>The current schematic will be copied into one shared definition. Inputs, outputs, VDD, and GND become instance pins.</p>
+            <label htmlFor="block-name">Block name</label>
+            <input id="block-name" className="property-input" autoFocus value={blockName}
+              onChange={(event) => {
+                setBlockName(event.currentTarget.value);
+                setBlockDialogError(null);
+              }} />
+            {blockDialogError && <div className="block-dialog-error">{blockDialogError}</div>}
+            <div className="block-dialog-actions">
+              <button type="button" disabled={blockSaving} onClick={() => setBlockDialogOpen(false)}>Cancel</button>
+              <button className="primary" type="submit" disabled={blockSaving}>
+                {blockSaving ? "Saving…" : "Save Block"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
       <footer className={error ? "has-error" : ""}>
         <span className="ready-dot" />{error ?? status}
         <span className="footer-right">{workspace.dirty ? "Unsaved · " : ""}Format v{project.formatVersion}</span>

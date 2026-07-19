@@ -209,9 +209,141 @@ pub fn validate(project: &Project) -> ValidationReport {
     }
 }
 
+pub fn validate_hierarchical(project: &Project) -> ValidationReport {
+    fn inspect_scope(
+        project: &Project,
+        components: &[Component],
+        wires: &[crate::model::Wire],
+        scope: &str,
+        visited: &mut HashSet<Uuid>,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
+        for instance in components
+            .iter()
+            .filter(|component| component.kind == "block")
+        {
+            let Some(definition_id) = instance.block_definition_id else {
+                diagnostics.push(Diagnostic {
+                    code: "missing_block_definition",
+                    severity: Severity::Error,
+                    message: format!(
+                        "{scope}/{} has no reusable block definition.",
+                        instance.name
+                    ),
+                    component_ids: vec![instance.id],
+                });
+                continue;
+            };
+            let Some(definition) = project.block_definition(definition_id) else {
+                diagnostics.push(Diagnostic {
+                    code: "missing_block_definition",
+                    severity: Severity::Error,
+                    message: format!(
+                        "{scope}/{} references a missing reusable block.",
+                        instance.name
+                    ),
+                    component_ids: vec![instance.id],
+                });
+                continue;
+            };
+            let pins = definition
+                .pins
+                .iter()
+                .map(|pin| pin.name.as_str())
+                .collect::<HashSet<_>>();
+            for pin in &definition.pins {
+                let connected = wires.iter().any(|wire| {
+                    (wire.from.component_id == instance.id && wire.from.terminal == pin.name)
+                        || wire.to.as_ref().is_some_and(|terminal| {
+                            terminal.component_id == instance.id && terminal.terminal == pin.name
+                        })
+                });
+                if !connected {
+                    diagnostics.push(Diagnostic {
+                        code: "unconnected_block_pin",
+                        severity: Severity::Warning,
+                        message: format!(
+                            "{scope}/{}.{} is not connected.",
+                            instance.name, pin.name
+                        ),
+                        component_ids: vec![instance.id],
+                    });
+                }
+            }
+            for terminal in wires
+                .iter()
+                .flat_map(|wire| std::iter::once(&wire.from).chain(wire.to.as_ref()))
+            {
+                if terminal.component_id == instance.id
+                    && !pins.contains(terminal.terminal.as_str())
+                {
+                    diagnostics.push(Diagnostic {
+                        code: "broken_block_pin",
+                        severity: Severity::Error,
+                        message: format!(
+                            "{scope}/{} has no promoted pin named {}.",
+                            instance.name, terminal.terminal
+                        ),
+                        component_ids: vec![instance.id],
+                    });
+                }
+            }
+            if visited.insert(definition.id) {
+                inspect_scope(
+                    project,
+                    &definition.components,
+                    &definition.wires,
+                    &format!("{scope}/{}", instance.name),
+                    visited,
+                    diagnostics,
+                );
+            }
+        }
+    }
+
+    let mut hierarchy = Vec::new();
+    inspect_scope(
+        project,
+        &project.components,
+        &project.wires,
+        &project.name,
+        &mut HashSet::new(),
+        &mut hierarchy,
+    );
+    let mut report = match project.flattened() {
+        Ok(flattened) => validate(&flattened),
+        Err(message) => ValidationReport {
+            diagnostics: vec![Diagnostic {
+                code: "invalid_hierarchy",
+                severity: Severity::Error,
+                message,
+                component_ids: project
+                    .components
+                    .iter()
+                    .filter(|component| component.kind == "block")
+                    .map(|component| component.id)
+                    .collect(),
+            }],
+            error_count: 1,
+            warning_count: 0,
+        },
+    };
+    hierarchy.append(&mut report.diagnostics);
+    let error_count = hierarchy
+        .iter()
+        .filter(|item| item.severity == Severity::Error)
+        .count();
+    let warning_count = hierarchy.len() - error_count;
+    ValidationReport {
+        diagnostics: hierarchy,
+        error_count,
+        warning_count,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::validate;
+    use super::{validate, validate_hierarchical};
     use crate::model::{Project, TerminalRef};
 
     #[test]
@@ -277,5 +409,44 @@ mod tests {
             .diagnostics
             .iter()
             .any(|item| item.message.contains("missing component")));
+    }
+
+    #[test]
+    fn hierarchy_reports_missing_definitions_and_broken_pins() {
+        let mut source = Project::default();
+        source.add_component("input", -2.0, 0.0).unwrap();
+        source.add_component("output", 2.0, 0.0).unwrap();
+        let definition = source.capture_block("PASS".into()).unwrap();
+
+        let mut parent = Project::default();
+        parent.block_definitions = source.block_definitions;
+        let instance = parent.place_block(definition, 0.0, 0.0).unwrap();
+        parent.wires.push(crate::model::Wire {
+            id: uuid::Uuid::new_v4(),
+            from: TerminalRef {
+                component_id: instance,
+                terminal: "REMOVED_PIN".into(),
+            },
+            to: None,
+            end: Some(crate::model::Position {
+                x: 2.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+            waypoints: Vec::new(),
+            route_x: None,
+        });
+        let report = validate_hierarchical(&parent);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "broken_block_pin"));
+
+        parent.components[0].block_definition_id = Some(uuid::Uuid::new_v4());
+        let report = validate_hierarchical(&parent);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "missing_block_definition"));
     }
 }
