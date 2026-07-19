@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import * as backend from "./backend";
-import type { ComponentKind, TerminalRef, ValidationReport, WorkspaceState } from "./types";
+import type { ComponentKind, LogicState, SimulationResult, TerminalRef, TruthTableResult, ValidationReport, WaveformConfig, WaveformResult, WorkspaceState } from "./types";
 import SchematicViewport from "./SchematicViewport";
 import Viewport from "./Viewport";
+import WaveformView from "./WaveformView";
 
-type ViewMode = "schematic" | "3d";
+type ViewMode = "schematic" | "3d" | "waveform";
 
 export default function App() {
   const [workspace, setWorkspace] = useState<WorkspaceState | null>(null);
@@ -18,6 +19,16 @@ export default function App() {
   const [pendingTerminal, setPendingTerminal] = useState<TerminalRef | null>(null);
   const [pendingWireId, setPendingWireId] = useState<string | null>(null);
   const [validation, setValidation] = useState<ValidationReport | null>(null);
+  const [simulation, setSimulation] = useState<SimulationResult | null>(null);
+  const [inputStates, setInputStates] = useState<Record<string, LogicState>>({});
+  const [truthTable, setTruthTable] = useState<TruthTableResult | null>(null);
+  const [waveformConfig, setWaveformConfig] = useState<WaveformConfig>({
+    durationNs: 100,
+    clockPeriodNs: 10,
+    inputChangeNs: 20,
+  });
+  const [waveform, setWaveform] = useState<WaveformResult | null>(null);
+  const [waveformRunning, setWaveformRunning] = useState(false);
   const project = workspace?.project ?? null;
   const selectedComponents = useMemo(
     () => project?.components.filter(({ id }) => selectedIds.includes(id)) ?? [],
@@ -25,6 +36,16 @@ export default function App() {
   );
   const selected = selectedComponents.length === 1 ? selectedComponents[0] : null;
   const selectedWire = project?.wires.find(({ id }) => id === selectedWireId) ?? null;
+  const digitalInputs = useMemo(
+    () => project?.components.filter(({ kind }) => kind === "input") ?? [],
+    [project],
+  );
+
+  useEffect(() => {
+    setInputStates((current) => Object.fromEntries(
+      digitalInputs.map((input) => [input.name, current[input.name] ?? "LOW"]),
+    ));
+  }, [digitalInputs]);
 
   useEffect(() => {
     backend.createProject()
@@ -59,6 +80,9 @@ export default function App() {
     setSelectedWireId(null);
     setError(null);
     setValidation(null);
+    setSimulation(null);
+    setTruthTable(null);
+    setWaveform(null);
     setStatus(message);
   };
 
@@ -232,6 +256,54 @@ export default function App() {
     }
   };
 
+  const runSimulation = async (inputs = inputStates) => {
+    try {
+      const result = await backend.simulateProject(inputs);
+      setSimulation(result);
+      setValidation(null);
+      setError(null);
+      setStatus(result.converged ? "Simulation converged" : "Simulation did not converge");
+    } catch (reason) {
+      showError(reason);
+    }
+  };
+
+  const toggleInput = (name: string) => {
+    const sequence: LogicState[] = ["LOW", "HIGH", "UNKNOWN"];
+    const current = inputStates[name] ?? "LOW";
+    const next: Record<string, LogicState> = {
+      ...inputStates,
+      [name]: sequence[(sequence.indexOf(current) + 1) % sequence.length],
+    };
+    setInputStates(next);
+    void runSimulation(next);
+  };
+
+  const generateTruthTable = async () => {
+    try {
+      const table = await backend.generateTruthTable();
+      setTruthTable(table);
+      setError(null);
+      setStatus(`Generated ${table.rows.length}-row truth table`);
+    } catch (reason) {
+      showError(reason);
+    }
+  };
+
+  const runWaveform = async () => {
+    setWaveformRunning(true);
+    try {
+      const result = await backend.simulateWaveform(waveformConfig);
+      setWaveform(result);
+      setError(null);
+      setStatus(`Generated ${result.durationNs} ns waveform`);
+    } catch (reason) {
+      showError(reason);
+    } finally {
+      setWaveformRunning(false);
+    }
+  };
+
   useEffect(() => {
     const editSelection = (event: KeyboardEvent) => {
       if (event.key === "Delete" || event.key === "Backspace") {
@@ -322,6 +394,21 @@ export default function App() {
           <button disabled={!workspace.canRedo} onClick={() => stepHistory("redo")}>Redo</button>
           <button disabled={!selectedIds.length} onClick={() => transformSelection("rotate")}>Rotate</button>
           <button className="drc-button" onClick={runDrc}>Run DRC</button>
+          <details className="simulation-menu">
+            <summary className="simulate-button">Simulate <span>▾</span></summary>
+            <div>
+              <button disabled={!project.components.length} onClick={(event) => {
+                event.currentTarget.closest("details")?.removeAttribute("open");
+                void runSimulation();
+              }}><strong>Operating point</strong><small>Resolve current input states</small></button>
+              <button onClick={(event) => {
+                event.currentTarget.closest("details")?.removeAttribute("open");
+                setViewMode("waveform");
+                setPlacementKind(null);
+              }}><strong>Waveform view</strong><small>Run a timed input sequence</small></button>
+            </div>
+          </details>
+          <button className="truth-table-button" disabled={!digitalInputs.length} onClick={generateTruthTable}>Truth Table</button>
           <button className="primary" onClick={() => armPlacement("nmos")}>+ Place NMOS</button>
         </nav>
       </header>
@@ -367,6 +454,7 @@ export default function App() {
         <div className="view-switch" role="group" aria-label="Editor view">
           <button className={viewMode === "schematic" ? "active" : ""} onClick={() => setViewMode("schematic")}>2D Schematic</button>
           <button className={viewMode === "3d" ? "active" : ""} onClick={() => { setViewMode("3d"); setPlacementKind(null); }}>3D View</button>
+          <button className={viewMode === "waveform" ? "active" : ""} onClick={() => { setViewMode("waveform"); setPlacementKind(null); }}>Waveforms</button>
         </div>
         {viewMode === "schematic" ? (
           <SchematicViewport
@@ -377,6 +465,8 @@ export default function App() {
             placementKind={placementKind}
             pendingTerminal={pendingTerminal}
             routingActive={Boolean(pendingTerminal || pendingWireId)}
+            simulation={simulation}
+            inputStates={inputStates}
             onSelect={selectComponent}
             onPlace={placeComponent}
             onMove={moveComponent}
@@ -386,10 +476,59 @@ export default function App() {
             onFreePoint={connectToFreePoint}
             onDanglingEnd={chooseDanglingEnd}
           />
+        ) : viewMode === "3d" ? (
+          <Viewport components={project.components} wires={project.wires} selectedIds={selectedIds} simulation={simulation} onSelect={selectComponent} />
         ) : (
-          <Viewport components={project.components} wires={project.wires} selectedIds={selectedIds} onSelect={selectComponent} />
+          <WaveformView config={waveformConfig} result={waveform} running={waveformRunning}
+            onConfig={setWaveformConfig} onRun={runWaveform} />
         )}
-        {(placementKind || pendingTerminal || pendingWireId) && <div className="placement-hint">
+        {viewMode !== "waveform" && (digitalInputs.length > 0 || simulation) && (
+          <div className="simulation-panel">
+            <span className="simulation-title">Switch simulation</span>
+            {digitalInputs.map((input) => (
+              <button key={input.id} className={`logic-pill logic-${(inputStates[input.name] ?? "LOW").toLowerCase()}`}
+                onClick={() => toggleInput(input.name)} title="Cycle LOW → HIGH → UNKNOWN">
+                {input.name} <strong>{inputStates[input.name] ?? "LOW"}</strong>
+              </button>
+            ))}
+            {simulation?.outputs.map((output) => (
+              <span key={output.name} className={`logic-pill output logic-${output.state.toLowerCase()}`}>
+                {output.name} <strong>{output.state}</strong>
+              </span>
+            ))}
+            {simulation && <span className={`convergence ${simulation.converged ? "ok" : "failed"}`}>{simulation.converged ? "stable" : "unstable"}</span>}
+          </div>
+        )}
+        {viewMode !== "waveform" && truthTable && (
+          <div className="truth-table-panel">
+            <div className="truth-table-heading">
+              <div><strong>Truth table</strong><small>{truthTable.rows.length} combinations</small></div>
+              <button onClick={() => setTruthTable(null)} aria-label="Close truth table">×</button>
+            </div>
+            <div className="truth-table-scroll">
+              <table>
+                <thead><tr>
+                  {truthTable.inputNames.map((name) => <th key={`input-${name}`}>{name}</th>)}
+                  {truthTable.outputNames.map((name) => <th key={`output-${name}`} className="output">{name}</th>)}
+                </tr></thead>
+                <tbody>
+                  {truthTable.rows.map((row, rowIndex) => <tr key={rowIndex} className={row.converged ? "" : "unstable"}
+                    onClick={() => {
+                      const inputs = Object.fromEntries(
+                        truthTable.inputNames.map((name, index) => [name, row.inputs[index]]),
+                      );
+                      setInputStates(inputs);
+                      void runSimulation(inputs);
+                    }}>
+                    {row.inputs.map((state, index) => <td key={`input-${index}`} className={`logic-${state.toLowerCase()}`}>{state}</td>)}
+                    {row.outputs.map((state, index) => <td key={`output-${index}`} className={`output logic-${state.toLowerCase()}`}>{state}</td>)}
+                  </tr>)}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+        {viewMode !== "waveform" && (placementKind || pendingTerminal || pendingWireId) && <div className="placement-hint">
           {placementKind
             ? `Place ${placementKind.toUpperCase()} on grid`
             : pendingWireId
@@ -405,7 +544,7 @@ export default function App() {
         )}
       </section>
       <aside className="properties">
-        <p className="eyebrow">{validation ? "Design Rules" : "Inspector"}</p>
+        <p className="eyebrow">{validation ? "Design Rules" : simulation && !selectedWire && !selectedComponents.length ? "Simulation" : "Inspector"}</p>
         {validation ? (
           <>
             <div className={`drc-summary ${validation.errorCount ? "failed" : "passed"}`}>
@@ -426,6 +565,58 @@ export default function App() {
               ))}
             </div>
             <button className="close-results" onClick={() => setValidation(null)}>Close results</button>
+          </>
+        ) : simulation && !selectedWire && !selectedComponents.length ? (
+          <>
+            <div className={`simulation-summary ${simulation.converged ? "passed" : "failed"}`}>
+              <strong>{simulation.converged ? "Stable solution" : "Solver did not converge"}</strong>
+              <small>
+                {simulation.outputs.some(({ state }) => state === "CONTENDED")
+                  ? "One or more outputs have conflicting drivers."
+                  : simulation.outputs.some(({ state }) => state === "FLOATING")
+                    ? "One or more outputs have no active driver."
+                    : simulation.outputs.some(({ state }) => state === "UNKNOWN")
+                      ? "One or more outputs depend on an unknown condition."
+                      : "All output probes resolved to a digital level."}
+              </small>
+            </div>
+            <p className="inspector-section">Inputs</p>
+            <div className="state-list">
+              {digitalInputs.map((input) => (
+                <button key={input.id} onClick={() => toggleInput(input.name)}>
+                  <span>{input.name}</span>
+                  <strong className={`logic-${(inputStates[input.name] ?? "LOW").toLowerCase()}`}>{inputStates[input.name] ?? "LOW"}</strong>
+                </button>
+              ))}
+            </div>
+            <p className="inspector-section">Outputs</p>
+            <div className="state-list">
+              {simulation.outputs.map((output) => (
+                <button key={output.name} onClick={() => selectComponent(project.components.find((component) => component.name === output.name)?.id ?? null)}>
+                  <span>{output.name}</span>
+                  <strong className={`logic-${output.state.toLowerCase()}`}>{output.state}</strong>
+                </button>
+              ))}
+              {!simulation.outputs.length && <p className="selection-note">No output probes are placed.</p>}
+            </div>
+            <p className="inspector-section">Transistors</p>
+            <div className="state-list transistor-states">
+              {simulation.transistors.map((transistor) => (
+                <button key={transistor.componentId} onClick={() => selectComponent(transistor.componentId)}>
+                  <span>{transistor.name}</span>
+                  <strong className={`switch-${transistor.state}`}>{transistor.state.toUpperCase()}</strong>
+                </button>
+              ))}
+            </div>
+            <details className="net-state-details">
+              <summary>Nets ({simulation.nets.length})</summary>
+              <div className="state-list">
+                {simulation.nets.map((net) => (
+                  <div key={net.name}><span>{net.name}</span><strong className={`logic-${net.state.toLowerCase()}`}>{net.state}</strong></div>
+                ))}
+              </div>
+            </details>
+            <button className="close-results" onClick={() => setSimulation(null)}>Clear simulation</button>
           </>
         ) : selectedWire ? (
           <>

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ValidationReport, WorkspaceState } from "./types";
+import type { LogicState, Project, SimulationResult, TruthTableResult, ValidationReport, WaveformConfig, WaveformResult, WorkspaceState } from "./types";
 
 const browserFallback = (): WorkspaceState => ({
   project: {
@@ -99,6 +99,18 @@ export async function renameProject(name: string): Promise<WorkspaceState> {
 
 export async function validateProject(): Promise<ValidationReport> {
   return invoke("validate_project");
+}
+
+export async function simulateProject(inputs: Record<string, LogicState>): Promise<SimulationResult> {
+  return invoke("simulate_project", { inputs });
+}
+
+export async function generateTruthTable(): Promise<TruthTableResult> {
+  return invoke("generate_truth_table");
+}
+
+export async function simulateWaveform(config: WaveformConfig): Promise<WaveformResult> {
+  return invoke("simulate_waveform", { config });
 }
 
 export async function undo(): Promise<WorkspaceState> {

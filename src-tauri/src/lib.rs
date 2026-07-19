@@ -2,12 +2,14 @@ mod history;
 mod model;
 #[allow(dead_code)]
 mod plugins;
+mod simulation;
 mod validation;
 
 use history::ProjectHistory;
 use model::{Project, TerminalRef, CURRENT_FORMAT_VERSION};
 use serde::Serialize;
-use std::{fs, path::Path, sync::Mutex};
+use simulation::{LogicState, SimulationResult, TruthTableResult, WaveformConfig, WaveformResult};
+use std::{collections::HashMap, fs, path::Path, sync::Mutex};
 use thiserror::Error;
 use validation::ValidationReport;
 
@@ -369,6 +371,39 @@ fn validate_project(state: tauri::State<AppState>) -> Result<ValidationReport, P
 }
 
 #[tauri::command]
+fn simulate_project(
+    inputs: HashMap<String, LogicState>,
+    state: tauri::State<AppState>,
+) -> Result<SimulationResult, ProjectError> {
+    let workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| ProjectError::StateUnavailable)?;
+    Ok(simulation::simulate(&workspace.history.current(), &inputs))
+}
+
+#[tauri::command]
+fn generate_truth_table(state: tauri::State<AppState>) -> Result<TruthTableResult, ProjectError> {
+    let workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| ProjectError::StateUnavailable)?;
+    simulation::truth_table(&workspace.history.current()).map_err(ProjectError::InvalidAction)
+}
+
+#[tauri::command]
+fn simulate_waveform(
+    config: WaveformConfig,
+    state: tauri::State<AppState>,
+) -> Result<WaveformResult, ProjectError> {
+    let workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| ProjectError::StateUnavailable)?;
+    simulation::waveform(&workspace.history.current(), config).map_err(ProjectError::InvalidAction)
+}
+
+#[tauri::command]
 fn undo(state: tauri::State<AppState>) -> Result<WorkspaceState, ProjectError> {
     let mut workspace = state
         .workspace
@@ -457,6 +492,9 @@ pub fn run() {
             rename_component,
             rename_project,
             validate_project,
+            simulate_project,
+            generate_truth_table,
+            simulate_waveform,
             undo,
             redo,
             save_project,

@@ -164,6 +164,55 @@ without editing any files manually.
 
 Simulate CMOS transistor networks using an educational switch model.
 
+## Milestone 2.1 — Operational Model
+
+Build and verify the headless Rust simulation core before adding visualization:
+
+* Derive electrical nets from schematic connectivity and matching net labels
+* Treat NMOS as conducting with a HIGH gate
+* Treat PMOS as conducting with a LOW gate
+* Resolve driven, floating, contended, and unknown net states
+* Report output-probe and transistor switch states
+* Verify inverter and NAND truth tables in automated tests
+
+## Milestone 2.2 — Simulation Visualization
+
+Add input controls and visualize conducting transistors, active paths, output
+states, and problematic nets using the stable operational-model results.
+
+## Milestone 2.3 — Truth Tables & Acceptance
+
+Complete and exercise the initial switch-level feature set:
+
+* Generate complete binary truth tables from the production Rust solver
+* Display input/output combinations and convergence in the desktop UI
+* Apply a truth-table row back to the live visualization
+* Verify CMOS NOR behavior
+* Verify transmission-gate pass and high-impedance behavior
+* Bound truth-table enumeration to a practical number of inputs
+
+## Milestone 2.4 — State Exploration & Diagnostics
+
+Make non-binary simulation behavior understandable:
+
+* Allow LOW, HIGH, and UNKNOWN input stimulus
+* Summarize stable and non-converged simulation runs
+* Explain floating, contended, and unknown output conditions
+* Inspect resolved output, transistor, and net states
+* Link simulation entries back to schematic components
+
+## Milestone 2.5 — Waveform View
+
+Add a GTKWave-inspired time-domain view:
+
+* Open Waveforms from the Simulate menu or editor view switch
+* Configure simulation length, clock period, and input-change interval
+* Generate timed input stimulus in the Rust simulation backend
+* Treat inputs named CLK or CLOCK as periodic clocks
+* Drive remaining inputs as a deterministic binary sequence
+* Plot input and output states with a shared nanosecond time axis
+* Preserve HIGH, LOW, FLOATING, CONTENDED, and UNKNOWN states in traces
+
 ### Initial Model
 
 NMOS

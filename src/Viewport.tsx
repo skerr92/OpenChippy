@@ -2,12 +2,13 @@ import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { MapControls } from "three/addons/controls/MapControls.js";
 import { terminalPosition } from "./SchematicViewport";
-import type { Component, Wire } from "./types";
+import type { Component, LogicState, SimulationResult, Wire } from "./types";
 
 type Props = {
   components: Component[];
   wires: Wire[];
   selectedIds: string[];
+  simulation?: SimulationResult | null;
   onSelect: (id: string | null, additive?: boolean) => void;
 };
 
@@ -63,7 +64,15 @@ const segmentsIntersect = (
       <= Math.min(Math.max(a1.y, a2.y), Math.max(b1.y, b2.y)) + epsilon;
 };
 
-export default function Viewport({ components, wires, selectedIds, onSelect }: Props) {
+const simulationColor = (state?: LogicState) => {
+  if (state === "HIGH") return "#55e39f";
+  if (state === "LOW") return "#5b9fea";
+  if (state === "CONTENDED") return "#f0645d";
+  if (state === "UNKNOWN") return "#dfb85f";
+  return state === "FLOATING" ? "#65756f" : undefined;
+};
+
+export default function Viewport({ components, wires, selectedIds, simulation, onSelect }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const resetViewRef = useRef<() => void>(() => {});
   const selectRef = useRef(onSelect);
@@ -112,9 +121,11 @@ export default function Viewport({ components, wires, selectedIds, onSelect }: P
     const materials: THREE.Material[] = [];
     const componentById = new Map(components.map((component) => [component.id, component]));
 
-    const materialFor = (color: string, opacity = 1) => {
+    const materialFor = (color: string, opacity = 1, highlight?: string) => {
       const material = new THREE.MeshStandardMaterial({
         color,
+        emissive: highlight ?? "#000000",
+        emissiveIntensity: highlight ? .75 : 0,
         transparent: opacity < 1,
         opacity,
         roughness: .5,
@@ -132,11 +143,12 @@ export default function Viewport({ components, wires, selectedIds, onSelect }: P
       layer: keyof typeof LAYERS,
       componentId?: string,
       opacity = 1,
+      highlight?: string,
     ) => {
       const spec = LAYERS[layer];
       const geometry = new THREE.BoxGeometry(Math.max(sizeX, .05), spec.height, Math.max(sizeZ, .05));
       const selected = componentId ? selectedIds.includes(componentId) : false;
-      const material = materialFor(selected ? "#ffd277" : spec.color, opacity);
+      const material = materialFor(selected ? "#ffd277" : spec.color, opacity, selected ? undefined : highlight);
       const mesh = new THREE.Mesh(geometry, material);
       mesh.position.set(x, spec.y, z);
       geometries.push(geometry);
@@ -158,6 +170,8 @@ export default function Viewport({ components, wires, selectedIds, onSelect }: P
     scene.add(boundaryHelper);
 
     const pmos = components.filter((component) => component.kind === "pmos");
+    const transistorStates = new Map(simulation?.transistors.map((item) => [item.componentId, item.state]) ?? []);
+    const wireStates = new Map(simulation?.wires.map((item) => [item.wireId, item.state]) ?? []);
     if (pmos.length) {
       const wellMinX = Math.min(...pmos.map((item) => item.position.x)) - 1.6;
       const wellMaxX = Math.max(...pmos.map((item) => item.position.x)) + 1.6;
@@ -171,9 +185,11 @@ export default function Viewport({ components, wires, selectedIds, onSelect }: P
       const z = component.position.y;
       if (component.kind === "nmos" || component.kind === "pmos") {
         const diffusion = component.kind === "nmos" ? "ndiff" : "pdiff";
-        const diffusionShape = addRect(2.5, 1.15, x, z, diffusion, component.id);
+        const switchState = transistorStates.get(component.id);
+        const highlight = switchState === "on" ? "#55e39f" : switchState === "unknown" ? "#dfb85f" : undefined;
+        const diffusionShape = addRect(2.5, 1.15, x, z, diffusion, component.id, switchState === "off" ? .45 : 1, highlight);
         diffusionShape.rotation.y = component.rotation;
-        const poly = addRect(.28, 1.75, x, z, "poly", component.id);
+        const poly = addRect(.28, 1.75, x, z, "poly", component.id, switchState === "off" ? .45 : 1, highlight);
         poly.rotation.y = component.rotation;
       } else if (component.kind === "vdd" || component.kind === "gnd") {
         const [, railZ] = terminalPosition(component, "out");
@@ -286,7 +302,7 @@ export default function Viewport({ components, wires, selectedIds, onSelect }: P
         layerByNet.set(net, m1Conflicts <= m2Conflicts ? "metal1" : "metal2");
       });
 
-    const addMetalSegment = (start: THREE.Vector2, end: THREE.Vector2, layer: MetalLayer) => {
+    const addMetalSegment = (start: THREE.Vector2, end: THREE.Vector2, layer: MetalLayer, highlight?: string) => {
       const horizontal = Math.abs(end.x - start.x) >= Math.abs(end.y - start.y);
       addRect(
         horizontal ? Math.abs(end.x - start.x) + .28 : .28,
@@ -294,12 +310,16 @@ export default function Viewport({ components, wires, selectedIds, onSelect }: P
         (start.x + end.x) / 2,
         (start.y + end.y) / 2,
         layer,
+        undefined,
+        1,
+        highlight,
       );
     };
     routes.forEach((route, routeIndex) => {
       const layer = layerByNet.get(find(routeIndex)) ?? "metal1";
+      const highlight = simulationColor(wireStates.get(route.wire.id));
       for (let index = 0; index < route.points.length - 1; index += 1) {
-        addMetalSegment(route.points[index], route.points[index + 1], layer);
+        addMetalSegment(route.points[index], route.points[index + 1], layer, highlight);
       }
       const needsContact = (component: Component) =>
         component.kind === "nmos"
@@ -431,7 +451,7 @@ export default function Viewport({ components, wires, selectedIds, onSelect }: P
       }
       container.removeChild(renderer.domElement);
     };
-  }, [components, wires, selectedIds]);
+  }, [components, wires, selectedIds, simulation]);
 
   return (
     <div className="layout-viewport">

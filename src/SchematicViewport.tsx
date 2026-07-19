@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { Component, ComponentKind, TerminalRef, Wire } from "./types";
+import type { Component, ComponentKind, LogicState, SimulationResult, TerminalRef, Wire } from "./types";
 
 type Props = {
   components: Component[];
@@ -9,6 +9,8 @@ type Props = {
   placementKind: ComponentKind | null;
   pendingTerminal: TerminalRef | null;
   routingActive: boolean;
+  simulation: SimulationResult | null;
+  inputStates: Record<string, LogicState>;
   onSelect: (id: string | null, additive?: boolean) => void;
   onPlace: (x: number, y: number) => void;
   onMove: (id: string, x: number, y: number) => void;
@@ -68,16 +70,18 @@ function DeviceShape({ component }: { component: Component }) {
   return <path className="symbol-body" d="M -2.4 0 H -1.5 L -1.15 -.55 L -.65 .55 L -.15 -.55 L .35 .55 L .85 -.55 L 1.5 0 H 2.4" />;
 }
 
-function Symbol({ component, selected, pendingTerminal, onSelect, onDragStart, onTerminal }: {
+function Symbol({ component, selected, pendingTerminal, logicState, switchState, onSelect, onDragStart, onTerminal }: {
   component: Component;
   selected: boolean;
   pendingTerminal: TerminalRef | null;
+  logicState?: LogicState;
+  switchState?: "on" | "off" | "unknown";
   onSelect: () => void;
   onDragStart: (event: React.PointerEvent) => void;
   onTerminal: (name: string) => void;
 }) {
   return (
-    <g className={`schematic-component device-${component.kind} ${selected ? "selected" : ""}`}
+    <g className={`schematic-component device-${component.kind} ${selected ? "selected" : ""} ${logicState ? `logic-${logicState.toLowerCase()}` : ""} ${switchState ? `switch-${switchState}` : ""}`}
       transform={`translate(${component.position.x} ${component.position.y}) rotate(${component.rotation * 180 / Math.PI})`}
       onPointerDown={onDragStart}>
       <rect className="symbol-hitbox" x="-1.8" y="-1.55" width="3.6" height="3.1" rx=".18" />
@@ -89,6 +93,8 @@ function Symbol({ component, selected, pendingTerminal, onSelect, onDragStart, o
           onPointerDown={(event) => { event.stopPropagation(); onTerminal(terminal); }} />;
       })}
       <text x="0" y="-1.8" textAnchor="middle">{component.name}</text>
+      {logicState && <text className="simulation-state-label" x="0" y="2.05" textAnchor="middle">{logicState}</text>}
+      {switchState && <text className="simulation-state-label" x="0" y="2.05" textAnchor="middle">{switchState.toUpperCase()}</text>}
     </g>
   );
 }
@@ -106,6 +112,9 @@ export default function SchematicViewport(props: Props) {
     return point.matrixTransform(svg.getScreenCTM()!.inverse());
   };
   const componentById = new Map(props.components.map((component) => [component.id, component]));
+  const wireStates = new Map(props.simulation?.wires.map((wire) => [wire.wireId, wire.state]) ?? []);
+  const outputStates = new Map(props.simulation?.outputs.map((output) => [output.name, output.state]) ?? []);
+  const transistorStates = new Map(props.simulation?.transistors.map((transistor) => [transistor.componentId, transistor.state]) ?? []);
   const wirePoint = (terminal: TerminalRef) => {
     const component = componentById.get(terminal.componentId);
     if (!component) return [0, 0] as const;
@@ -221,7 +230,8 @@ export default function SchematicViewport(props: Props) {
           const path = waypoints.length
             ? `M ${x1} ${y1} ${waypoints.map((point) => `H ${point.x} V ${point.y}`).join(" ")}${wire.to ? ` H ${x2} V ${y2}` : ""}`
             : `M ${x1} ${y1} H ${wire.routeX ?? (x1 + x2) / 2} V ${y2} H ${x2}`;
-          return <g key={wire.id} className={wire.id === props.selectedWireId ? "selected" : ""}>
+          const logicState = wireStates.get(wire.id);
+          return <g key={wire.id} className={`${wire.id === props.selectedWireId ? "selected" : ""} ${logicState ? `logic-${logicState.toLowerCase()}` : ""}`}>
             <path className="wire-hitbox" d={path} onPointerDown={(event) => {
               event.stopPropagation();
               props.onSelect(null);
@@ -242,6 +252,8 @@ export default function SchematicViewport(props: Props) {
       </g>
       {props.components.map((component) => <Symbol key={component.id} component={component}
         selected={props.selectedIds.includes(component.id)} pendingTerminal={props.pendingTerminal}
+        logicState={component.kind === "input" ? props.inputStates[component.name] : component.kind === "output" ? outputStates.get(component.name) : undefined}
+        switchState={transistorStates.get(component.id)}
         onSelect={() => props.onSelect(component.id)}
         onDragStart={(event) => {
           event.stopPropagation(); props.onSelect(component.id, event.shiftKey);

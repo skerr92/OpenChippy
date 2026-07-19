@@ -64,3 +64,49 @@ export type ValidationReport = {
   errorCount: number;
   warningCount: number;
 };
+
+export type LogicState = "HIGH" | "LOW" | "FLOATING" | "CONTENDED" | "UNKNOWN";
+
+export type NamedLogicState = {
+  name: string;
+  state: LogicState;
+};
+
+export type TransistorSimulationState = {
+  componentId: string;
+  name: string;
+  state: "on" | "off" | "unknown";
+};
+
+export type SimulationResult = {
+  nets: NamedLogicState[];
+  outputs: NamedLogicState[];
+  transistors: TransistorSimulationState[];
+  wires: Array<{ wireId: string; state: LogicState }>;
+  converged: boolean;
+};
+
+export type TruthTableResult = {
+  inputNames: string[];
+  outputNames: string[];
+  rows: Array<{
+    inputs: LogicState[];
+    outputs: LogicState[];
+    converged: boolean;
+  }>;
+};
+
+export type WaveformConfig = {
+  durationNs: number;
+  clockPeriodNs: number;
+  inputChangeNs: number;
+};
+
+export type WaveformResult = {
+  durationNs: number;
+  signals: Array<{
+    name: string;
+    kind: "input" | "output";
+    samples: Array<{ timeNs: number; state: LogicState }>;
+  }>;
+};
