@@ -31,13 +31,24 @@ The current Milestone 0–3 implementation includes:
   and `UNKNOWN`) with supply and threshold awareness, geometry-derived resistance and
   capacitance, path resistance, and `0.69RC` delay estimates.
 * Interactive operating-point visualization, generated truth tables, and a bounded
-  GTKWave-inspired timed waveform view.
+  GTKWave-inspired timed waveform view with persisted multi-bit buses, explicit
+  MSB-to-LSB ordering, binary/hex radix, cursor values, expandable scalar lanes,
+  and a zoomable time axis that reveals values inside stable bus intervals.
 * Versioned technology YAML with validated NMOS/PMOS characteristics and an explicit
-  process routing-layer ceiling. The built-in educational process provides five metals.
+  process routing-layer ceiling. The built-in educational process provides five metals
+  plus a versioned physical rule deck for manufacturing grid, layer width/spacing/area,
+  contact/via geometry and enclosure, gate extension, wells, and per-layer overrides.
 * A Rust-normalized physical-layout IR independent of schematic drawing coordinates,
   aspect-ratio-aware folded CMOS row banks, diffusion/poly/contact geometry,
   process-bounded direction-separated routing through a reserved signal channel,
   stacked vias, and a broadly zoomable Three.js layer view.
+* Headless process DRC with stable shape-indexed diagnostics plus a 3D inspector
+  that filters by rule, severity, layer, and net; isolates and frames offending
+  geometry; compares measured and required values; and saves versioned reports
+  with the selected placement and routing metrics.
+* Large-layout DRC closure that coalesces fragmented spacing reports by
+  electrical net pair into actionable conflict groups before conflict-driven
+  rerouting.
 * Reusable device blocks captured from transistor-level or block-composed circuits with
   promoted input, output, VDD, and GND pins; compact shared instances; arbitrary-depth,
   cycle-checked nesting; project persistence and undo/redo; automatic portable
@@ -45,9 +56,14 @@ The current Milestone 0–3 implementation includes:
   deterministic hierarchy flattening for DRC, simulation, truth tables, waveforms, and
   physical generation.
 
-The Rust suite currently validates 52 tests covering project history, model
+The Rust suite currently validates 66 tests covering project history, model
 compatibility, technology files, CMOS behavior, timing, hierarchy, DRC, and physical
-routing. The TypeScript/Vite production build and packaged Tauri release build are also
+routing, including headless process-rule checks and process-derived floorplan/routing
+resource planning and topology/congestion-scored legal device placement against
+canonical layout geometry, plus priority-ordered capacity routing, bounded
+rip-up/reroute behavior, and process-grid detailed track polygons with local
+conflict repair, pin-access, wire-length, and via accounting. The
+TypeScript/Vite production build and packaged Tauri release build are also
 part of the milestone validation workflow. Detailed scope and future work live in the
 [roadmap](docs/roadmap.md).
 

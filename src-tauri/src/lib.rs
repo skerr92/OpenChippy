@@ -1,6 +1,11 @@
 mod history;
 mod model;
+mod physical_detailed_routing;
+mod physical_drc;
+mod physical_global_routing;
 mod physical_layout;
+mod physical_placement;
+mod physical_planning;
 #[allow(dead_code)]
 mod plugins;
 mod simulation;
@@ -8,7 +13,11 @@ pub mod technology;
 mod validation;
 
 use history::ProjectHistory;
-use model::{BlockDefinition, DeviceCharacteristics, Project, TerminalRef, CURRENT_FORMAT_VERSION};
+use model::{
+    BlockDefinition, DeviceCharacteristics, Project, TerminalRef, WaveformGroup,
+    CURRENT_FORMAT_VERSION,
+};
+use physical_drc::PhysicalDrcReport;
 use physical_layout::PhysicalLayoutIr;
 use serde::Serialize;
 use simulation::{LogicState, SimulationResult, TruthTableResult, WaveformConfig, WaveformResult};
@@ -21,6 +30,13 @@ use std::{
 use technology::Technology;
 use thiserror::Error;
 use validation::ValidationReport;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PhysicalInspection {
+    layout: PhysicalLayoutIr,
+    drc: PhysicalDrcReport,
+}
 
 const BLOCK_LIBRARY_DIRECTORY: &str = "chippyblocks";
 
@@ -480,6 +496,22 @@ fn rename_project(
 }
 
 #[tauri::command]
+fn set_waveform_groups(
+    groups: Vec<WaveformGroup>,
+    state: tauri::State<AppState>,
+) -> Result<WorkspaceState, ProjectError> {
+    let mut workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| ProjectError::StateUnavailable)?;
+    workspace
+        .history
+        .try_update(|project| project.set_waveform_groups(groups))
+        .map_err(ProjectError::InvalidAction)?;
+    Ok(workspace.state())
+}
+
+#[tauri::command]
 fn validate_project(state: tauri::State<AppState>) -> Result<ValidationReport, ProjectError> {
     let workspace = state
         .workspace
@@ -502,6 +534,47 @@ fn generate_physical_ir(state: tauri::State<AppState>) -> Result<PhysicalLayoutI
         .flattened()
         .map_err(ProjectError::InvalidAction)?;
     physical_layout::normalize(&flattened).map_err(ProjectError::InvalidAction)
+}
+
+#[tauri::command]
+fn validate_physical_layout(
+    state: tauri::State<AppState>,
+) -> Result<PhysicalDrcReport, ProjectError> {
+    let workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| ProjectError::StateUnavailable)?;
+    let flattened = workspace
+        .history
+        .current()
+        .flattened()
+        .map_err(ProjectError::InvalidAction)?;
+    let layout = physical_layout::normalize(&flattened).map_err(ProjectError::InvalidAction)?;
+    Ok(physical_drc::validate(&layout, &flattened.technology))
+}
+
+#[tauri::command]
+fn inspect_physical_layout(
+    state: tauri::State<AppState>,
+) -> Result<PhysicalInspection, ProjectError> {
+    let workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| ProjectError::StateUnavailable)?;
+    let flattened = workspace
+        .history
+        .current()
+        .flattened()
+        .map_err(ProjectError::InvalidAction)?;
+    let layout = physical_layout::normalize(&flattened).map_err(ProjectError::InvalidAction)?;
+    let drc = physical_drc::validate(&layout, &flattened.technology);
+    Ok(PhysicalInspection { layout, drc })
+}
+
+#[tauri::command]
+fn save_physical_drc_report(path: String, data: String) -> Result<String, ProjectError> {
+    fs::write(Path::new(&path), data)?;
+    Ok(path)
 }
 
 #[tauri::command]
@@ -746,8 +819,12 @@ pub fn run() {
             set_device_geometry,
             device_characteristics,
             rename_project,
+            set_waveform_groups,
             validate_project,
             generate_physical_ir,
+            validate_physical_layout,
+            inspect_physical_layout,
+            save_physical_drc_report,
             capture_block,
             place_block,
             update_block_from_current,
@@ -768,9 +845,25 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_block_library, save_block_library, Workspace, BLOCK_LIBRARY_DIRECTORY};
+    use super::{
+        load_block_library, save_block_library, save_physical_drc_report, Workspace,
+        BLOCK_LIBRARY_DIRECTORY,
+    };
     use crate::model::Project;
     use std::fs;
+
+    #[test]
+    fn physical_drc_report_is_saved_verbatim() {
+        let directory =
+            std::env::temp_dir().join(format!("openchippy-drc-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("report.json");
+        let data = r#"{"formatVersion":1,"report":{"errorCount":0}}"#;
+        let saved = save_physical_drc_report(path.to_string_lossy().into(), data.into()).unwrap();
+        assert_eq!(saved, path.to_string_lossy());
+        assert_eq!(fs::read_to_string(&path).unwrap(), data);
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn workspace_tracks_dirty_state_across_history() {

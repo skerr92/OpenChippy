@@ -529,7 +529,38 @@ Features:
 * Pin mapping
 * Library browser
 
-## Milestone 4.1 — Process-Aware Physical DRC
+Delivery inchstones:
+
+1. **4.1 — Physical Rule-Deck Model (complete):** versioned Rust/YAML schema, educational
+   defaults, validation, layer/via overrides, and backward-compatible projects.
+2. **4.2 — Headless Physical DRC (complete foundation):** grid, legal-layer,
+   width, spacing, area, cut, enclosure, well, and gate-extension checks against
+   canonical shapes. Tap, rail, and pin-access checks follow their explicit
+   structures in 4.3–4.6.
+3. **4.3 — Physical Planning & Routing Resources (complete):** process-derived sites,
+   tracks, preferred directions, layer capacities, obstacles, pin access,
+   net classes, initial floorplan sizing, and bounded growth policy.
+4. **4.4 — Global Placement & Legalization (complete):** deterministic placement
+   candidates, topology/diffusion sharing, density and congestion feedback,
+   legal sites, metrics, ranking, and selection rationale.
+5. **4.5 — Negotiated Global Routing (complete):** coarse routing guides, global-net
+   priority, capacity accounting, overflow analysis, bounded rip-up/reroute,
+   and floorplan retry.
+6. **4.6 — Detailed Routing & Compaction (complete foundation):** pin access and track assignment,
+   initial track routing, DRC-driven search-and-repair, local rip-up/reroute,
+   and safe post-route compaction.
+7. **4.7 — 3D DRC Inspection (complete):** selectable violations, affected-shape
+   highlighting, layer isolation, framing, explanations, and saved reports.
+8. **4.7.1 — Physical DRC Closure (in progress):** coalesced conflict graphs,
+   access-column repair, detailed-polygon connectivity equivalence, and
+   DRC-clean rendered/GDS cutover for hierarchical multi-net designs.
+9. **4.8 — Grouped Waveform Buses:** persisted ordered signal groups, binary/hex
+   radix, crossed value transitions, and scalar expand/collapse.
+
+Each inchstone must have independently testable fixtures and preserve all
+accepted behavior from earlier milestones.
+
+## Milestones 4.1–4.2 and 4.7 — Process-Aware Physical DRC
 
 Extend the technology model into a versioned physical rule deck and validate the
 same layout geometry consumed by the 2D/GDS and 3D views. This is a concrete
@@ -574,7 +605,107 @@ Acceptance:
 * A machine-readable report can be compared later with Milestone 9
   foundry-qualified DRC results
 
-## Milestone 4.2 — Multi-Pass Cell Placement & Routing
+Current 4.1 implementation:
+
+* `Technology` embeds a versioned physical rule deck and older `.chippy`
+  projects receive the educational defaults.
+* The rule deck declares database units, manufacturing grid, base diffusion,
+  poly, well, and metal width/spacing/area rules, contact/via
+  size/spacing/enclosure, gate extension, and well enclosure.
+* Named `metalN` and adjacent `viaNN` overrides support process-specific layers
+  within the configured metal ceiling.
+* Rust rejects unsupported versions, non-positive/off-grid values, invalid
+  layer names, and non-adjacent or out-of-range via overrides.
+* YAML round-trip and backward-compatibility tests cover the new schema; the
+  inspector exposes the active rule-deck version, grid, contact size, and via
+  size.
+
+Current 4.2 implementation:
+
+* A renderer-independent Rust engine validates canonical physical-layout
+  rectangles and returns a machine-readable report through
+  `validate_physical_layout`.
+* Diagnostics contain a stable rule ID, severity, layer, deterministic shape
+  indices, measured and required values, and an explanatory message.
+* Implemented checks cover grid and legal layers; width, area, and same-layer
+  spacing; contact/via size and adjacent-metal enclosure; device-side contact
+  enclosure; P-diffusion containment in N-well; and poly gate extension.
+* Generated rectangles are edge-snapped to the process grid. Gates and wells
+  use active enclosure rules, and every via transition receives complete
+  landing pads on both adjacent metals.
+* Deliberate violations are fixture-tested, while generated inverter and NAND
+  cells pass the educational deck. Explicit tap, rail, and pin-access
+  structures will gain dedicated semantics when those canonical structures are
+  introduced rather than being guessed from unrelated rectangles.
+
+## Milestones 4.3–4.6 — Negotiated Cell Placement & Routing
+
+OpenChippy should follow the staged structure of contemporary physical-design
+flows while adapting it to transistor-level educational cells. It should not
+copy a chip-scale analytic placer blindly, but it must preserve the same
+separation of concerns:
+
+1. Build process-owned placement sites, routing tracks, layer directions,
+   capacities, obstacles, via transitions, and pin-access points.
+2. Estimate a floorplan and place devices without committing to exact wires.
+3. Legalize devices to valid sites while preserving spacing and well regions.
+4. Globally route nets on a coarse capacity graph to expose congestion before
+   detailed geometry exists.
+5. Assign tracks and produce detailed routes.
+6. Search and repair remaining DRC violations, ripping up only the conflicting
+   routes when possible.
+7. Compact only after a legal route proves the reserved space is unnecessary.
+
+### 4.3 — Physical planning and tangible space budgets
+
+The process YAML must describe routing pitch/offset, preferred direction,
+usable signal layers, reserved power layers, via transitions, placement sites,
+and per-layer capacity reductions. Planning derives space from demand:
+
+* Device rows use legal diffusion/poly geometry plus device spacing, well
+  enclosure, contacts, and tap/endcap reservations.
+* Routing bins count available tracks after obstacles, power reservations, via
+  keep-outs, and a configurable capacity margin.
+* Estimated net demand uses pin count, bounding boxes, and rectilinear
+  Steiner-tree length rather than one full-width track per net.
+* Initial core area is the greater of device-area/density demand and estimated
+  routing demand. Educational defaults target 60–70% device density and no
+  more than 75% estimated routing utilization; both are process configurable.
+* Try a small deterministic set of aspect ratios appropriate to the topology,
+  such as `1:1`, `4:3`, and a topology-derived linear option.
+* If global routing still overflows, grow the congested dimension by 5–10% and
+  retry, up to three floorplan-growth passes by default. Report failure rather
+  than silently emitting an illegal layout after the budget is exhausted.
+
+These are explicit effort defaults, not manufacturing truths. The selected
+process can override them, and every run records actual density, capacity,
+demand, overflow, and growth decisions.
+
+Current 4.3 implementation:
+
+* Technology snapshots and YAML now carry validated placement-site dimensions,
+  row height, density/utilization targets, floorplan-growth policy, routing and
+  repair effort limits, and per-metal pitch, offset, preferred direction,
+  capacity adjustment, and power reservation.
+* Older technologies resolve a compatible educational resource model
+  dynamically up to their configured metal-layer ceiling.
+* Rust classifies nets as power, global, or signal and emits a stable routing
+  order. VDD/GND are reserved first; external and high-fanout nets precede
+  ordinary signals.
+* The planner produces square, balanced, and topology-derived candidates,
+  estimates device density and routing demand/capacity, applies bounded
+  directional growth, and selects the lowest-area feasible score.
+* The selected candidate owns a coarse routing grid with deterministic bins and
+  per-layer horizontal/vertical track capacities. This is the graph boundary
+  consumed by Milestone 4.5.
+* Physical IR exposes every candidate, selected rationale inputs, resource
+  limits, planned nets, and bins. The 3D sidebar reports selected dimensions,
+  density, routing utilization, candidate/growth counts, and bin dimensions.
+* The existing preview now takes its columns and bounds from the selected plan;
+  Milestone 4.4 will replace its provisional device ordering with legal
+  congestion-aware placement.
+
+### 4.4 — Global placement and legalization
 
 Replace the single physical-layout heuristic with two or three deterministic
 candidate runs for each cell or repeated block region:
@@ -585,10 +716,161 @@ candidate runs for each cell or repeated block region:
 3. When the design size warrants it, a pin- and congestion-aware candidate
    favoring routability and balanced dimensions
 
-Every candidate must pass physical DRC before it can win. Rank legal candidates
-using recorded metrics rather than assuming a square is always optimal:
+Placement uses net weights and placement constraints before routing:
+
+* Fix or reserve power rails, well regions, external pins, taps, and other
+  physical anchors first.
+* Give global/high-fanout nets and constrained pins more placement influence,
+  but do not let one high-fanout net collapse unrelated devices into a hotspot.
+* Favor complementary PMOS/NMOS alignment, diffusion sharing, short gate
+  connections, and local series/parallel clusters.
+* Estimate congestion after each placement pass. Inflate or spread devices in
+  congested bins and retain the best non-divergent snapshot.
+* Legalize to process sites/rows with routing padding, then recalculate
+  congestion because legalization changes pin positions.
+
+Current 4.4 implementation:
+
+* Rust emits three deterministic device-placement candidates: topology-aware,
+  diffusion-oriented, and congestion-spreading.
+* Topology placement greedily clusters devices sharing non-power nets and
+  assigns extra affinity to shared source/drain nets. Diffusion placement uses
+  stable source/drain and gate signatures; congestion placement alternates
+  high-connectivity devices across the available order.
+* Each polarity is folded into serpentine rows and legalized to the 4.3
+  placement sites, row height, planned dimensions, diffusion width, and
+  process spacing. Duplicate kind/row/site occupancy makes a candidate
+  ineligible.
+* Candidate metrics include estimated half-perimeter wire length, peak demand
+  against the 4.3 coarse-bin capacities, and adjacent diffusion-sharing pairs.
+  Illegal candidates lose lexicographically; legal candidates minimize
+  wire/congestion cost while rewarding diffusion sharing.
+* Physical IR persists every placement candidate and selected index. Canonical
+  diffusion, poly, contact, and routing anchors now consume the selected legal
+  device coordinates instead of recreating an implicit name-sorted grid.
+* The 3D sidebar reports the winning strategy, legality, HPWL estimate, peak
+  coarse-bin utilization, and diffusion-sharing count.
+
+### 4.5 — Negotiated global routing
+
+Global routing produces layer-aware coarse guides, not final polygons:
+
+* Reserve power/ground resources first. Route clocks or future clock-like
+  global nets next, then constrained/high-fanout nets, then ordinary signals.
+* Build rectilinear tree candidates for multi-terminal nets and charge every
+  traversed bin edge and via transition against capacity.
+* After an initial route, identify overflow edges and rip up nets contributing
+  most to those conflicts.
+* Reroute with negotiated costs: current congestion, accumulated historical
+  congestion, wire length, vias, wrong-way travel, pin-access scarcity, and net
+  priority.
+* Preserve clean routes where possible. Do not clear and rebuild every net
+  after each conflict.
+* Default to at most 30 global-routing iterations. Stop early when overflow
+  reaches zero or when the best score fails to improve for three iterations.
+* If overflow remains, return to placement or grow only the congested
+  floorplan dimension within the 4.3 pass budget.
+
+Current 4.5 implementation:
+
+* Rust maps selected 4.4 device locations and external pins into the selected
+  4.3 coarse bins, then connects multi-terminal nets with deterministic
+  Manhattan guide trees.
+* Nets route in stable power, global/high-fanout, then signal order. Power nets
+  prefer process-reserved layers; ordinary nets prefer signal resources.
+* Every adjacent-bin guide edge chooses a physical metal and charges the
+  directional capacity declared for both bins. Layer changes are counted as
+  estimated vias.
+* Each negotiation pass identifies over-capacity edges and the exact nets using
+  them. Only contributing nets are ripped up; clean routes remain fixed.
+* Rerouting costs include current utilization, accumulated historical overflow,
+  wrong-way or unavailable capacity, and a deterministic layer tie-breaker.
+  Alternate Manhattan orientation provides a second path family without
+  introducing randomness.
+* The router stops at zero overflow, the configured non-improvement limit, or
+  the maximum iteration budget. It retains the lowest-overflow snapshot and
+  reports explicit bounded failure when capacity cannot converge.
+* Physical IR exposes per-net segments/layers, estimated length, via and rip-up
+  counts, plus iteration overflow/reroute history. The 3D sidebar reports
+  convergence, overflow, routed-net count, and negotiation passes. Exact
+  process-grid polygons remain the Milestone 4.6 detailed-router boundary.
+
+### 4.6 — Detailed routing, search-and-repair, and compaction
+
+Detailed routing converts guides into exact process-grid polygons:
+
+* Analyze pin access before committing routes and require at least one legal
+  access point for every terminal.
+* Assign preferred-direction tracks, then run an initial detailed route within
+  each global guide.
+* Run physical DRC and build a conflict graph from shape-indexed violations.
+* Select a bounded conflict set, rip up its lowest-priority or highest-cost
+  routes, and maze-route alternatives with history costs.
+* Repair locally first; expand the search window or change layers only when a
+  local repair cannot succeed.
+* Default to ten detailed search-and-repair rounds. Preserve the best legal or
+  lowest-violation snapshot so cancellation never discards all progress.
+* Compact device banks and channels only after rerunning pin access, routing,
+  connectivity equivalence, and physical DRC.
+
+Current 4.6 foundation:
+
+* A dedicated Rust detailed-routing stage consumes the selected global guides
+  and assigns deterministic preferred-direction tracks at process-declared
+  pitch. Multiple users of a guide edge receive distinct centered track slots.
+* Guide edges become exact manufacturing-grid metal rectangles. Layer changes
+  produce explicit adjacent-layer via polygons, and same-bin local connections
+  remain valid pin-access cases without wasting a global track.
+* Every detailed net reports its exact polygons, accessible and blocked pin
+  counts, wire length, via count, priority, and repair count. The aggregate
+  report exposes convergence, conflicts, blocked pins, bounded iterations,
+  total wire length, and total vias in the physical IR and 3D sidebar.
+* Cross-net same-layer polygon spacing builds the initial conflict set. Repair
+  keeps unaffected routes stable, shifts only the deterministic lower-priority
+  conflict owners, reruns conflict detection, and preserves the best snapshot
+  within the process-defined ten-pass default.
+* The NAND regression begins with detailed conflicts and converges after local
+  repair; it also verifies polygon edges against the manufacturing grid,
+  bounded iteration accounting, net identity, pin access, and wire metrics.
+* Detailed polygons are retained beside the existing DRC-clean preview shapes
+  until connectivity-equivalence coverage can make them the sole rendered/GDS
+  geometry. This avoids presenting an incomplete pin-access migration as a
+  clean layout; that cutover and post-route bank compaction remain the next
+  refinement inside the physical pipeline.
+
+The current Milestone 3 preview deliberately reserves one unique central track
+coordinate per signal to avoid accidental cross-net via and metal collisions.
+On high-net-count designs this can produce a visibly sparse routing canyon:
+PMOS and NMOS banks are pushed to opposite cell edges while most of the space
+between them contains only long interconnect and via transitions. Milestone 4
+must replace that safety-first allocation with legal, utilization-aware routing:
+
+* Reuse track coordinates on electrically isolated metal layers when via stacks
+  and enclosures cannot collide
+* Split one global channel into multiple local channels or routing regions near
+  the devices and pins they serve
+* Move transistor banks closer after detailed routing proves that fewer tracks
+  are required
+* Prefer short local routes and shared access points over full-cell vertical
+  drops
+* Measure channel density, whitespace, and via-only area explicitly
+* Reject compaction that introduces shorts, blocked vias, inaccessible pins, or
+  process-spacing violations
+
+Candidate selection is lexicographic: correctness first, then routability, then
+quality. A smaller illegal cell never beats a larger legal one:
+
+1. Connectivity equivalence and zero shorts/opens
+2. Zero illegal placement and physical DRC errors
+3. Zero global/detailed routing overflow
+4. Minimum area and unused channel area
+5. Weighted wire length, vias, and pin-access risk
+6. Aspect-ratio preference only as a final bounded tie-breaker
+
+Record the following metrics rather than assuming a square is always optimal:
 
 * Bounding-box area and unused channel area
+* Routing-channel utilization and via-only whitespace
 * Routing overflow, congestion, and blocked pin access
 * Total estimated wire length
 * Via and layer-transition count
@@ -604,14 +886,113 @@ Acceptance:
 
 * The Rust backend emits two or three reproducible candidates and a score
   breakdown for each
-* The selected candidate is DRC-clean and no worse in area than the baseline
-  single-pass result
+* Every run exposes stage, pass, elapsed time, best score, density, congestion,
+  overflow, DRC count, and floorplan growth so the UI can show determinate
+  progress, cancellation, and a best-so-far preview
+* The selected candidate is connectivity-equivalent, DRC-clean, and has zero
+  routing overflow; failure to meet a bounded search budget is explicit
 * NAND, NOR, mux, full-adder, and repeated full-adder fixtures demonstrate that
   different topologies can select different aspect ratios
+* Turning off metal visibility no longer reveals a large avoidable empty canyon
+  between device banks in high-net-count fixtures
+* Compaction reduces bank separation and/or unused channel area without adding
+  any cross-net overlap or DRC violation
 * Candidate selection does not depend on schematic drawing coordinates
 * The 3D inspector can report why the winning candidate was selected
 
-## Milestone 4.3 — Grouped Waveform Buses
+## Milestone 4.7 — 3D DRC Inspection
+
+Consume the stable headless DRC report after the negotiated router exists:
+
+* List and filter violations by rule, severity, layer, and net
+* Select a diagnostic to frame and highlight its exact shapes
+* Isolate contributing layers and show measured versus required geometry
+* Show the placement/routing pass that introduced a violation
+* Save the report with the selected candidate and generation metrics
+
+Current implementation:
+
+* Entering 3D view generates the physical IR and headless Rust DRC report from
+  the same project snapshot, preserving the report's stable shape indices.
+* The scrollable physical sidebar reports clean/error/warning totals and lists
+  diagnostics with rule ID, layer, message, severity, and measured-versus-
+  required geometry. Filters cover rule, severity, layer, and affected net.
+* Selecting a diagnostic isolates its contributing layer, renders every exact
+  offending shape with a red emissive material, and frames that geometry with
+  the orthographic camera. Normal layer visibility and Top view / Fit remain
+  available to restore broader context.
+* Save DRC report writes a versioned JSON artifact containing the project and
+  technology identities, physical-IR version, selected planning and placement
+  candidates, global and detailed routing metrics, and the complete stable
+  diagnostic report.
+* Clean generated inverter/NAND coverage remains green, headless violating
+  fixtures retain deterministic shape IDs and measurements, and artifact
+  persistence is verified byte-for-byte in Rust.
+
+### 4.7.1 — Physical DRC closure
+
+Large hierarchical circuits exposed a gap hidden by the clean inverter, NAND,
+and same-net array fixtures: independently folded device rows can reuse the
+same X access column for unrelated long vertical drops. The result is real
+cross-net spacing conflicts on intermediate metals and via landings. The old
+pairwise DRC presentation then multiplied one physical conflict across every
+overlapping polygon fragment, producing four-digit result lists.
+
+This closure pass precedes waveform buses because 4.8 does not alter physical
+IR or layout geometry:
+
+* Coalesce same-rule, same-layer, same-net-pair spacing fragments into one
+  deterministic conflict diagnostic while retaining every affected shape
+  index and the minimum measured spacing.
+* Use the resulting conflict graph to allocate or repair access columns and
+  vertical tracks across legal layers without introducing long Metal-1 jogs.
+* Add multi-row, many-independent-net fixtures representative of flattened
+  reusable-block designs; do not accept same-net-only stress tests as routing
+  closure.
+* Promote 4.6 detailed polygons to rendered/GDS geometry only after terminal
+  connectivity equivalence, zero opens/shorts, and physical DRC pass together.
+
+Current first slice:
+
+* Rust DRC now collapses pairwise metal-spacing fragments by layer and
+  electrical net pair, unions and sorts all contributing shape indices, keeps
+  the worst measured clearance, and recomputes stable report totals.
+* A 32-independent-inverter/64-MOS fixture reproduces the folded multi-net
+  access-column failure and verifies that hundreds of raw fragment pairs become
+  fewer than 100 actionable conflicts with multi-shape ownership. Geometry
+  repair remains required; coalescing does not relabel a real conflict clean.
+* A first attempt to distribute nets by ID across preferred M2/M4 vertical
+  resources passed the generic fixture but regressed `4B_ADDER` from 496 to
+  520 diagnostics. That heuristic was rejected and reverted. Future repair
+  must consume the actual conflict graph and cannot select layers from net ID
+  or synthetic-fixture score alone.
+* The attached `4B_ADDER` report proved the pipeline was committing to its
+  planning-stage square winner before routing: 32×34 produced 253 global
+  overflow, 203 detailed conflicts, and 496 coalesced DRC errors. Routing all
+  three bounded candidates showed 38×30.6 at 182/175 and topology-shaped
+  72×23.8 at 82/45. Physical normalization now ranks candidates
+  lexicographically by global overflow, detailed conflicts, then placement
+  score, selecting the 72×23.8 result and reducing actual `4B_ADDER` DRC to
+  189 (22 M2 and 167 M3 spacing conflicts).
+* Saved DRC artifacts now include the complete canonical physical IR in
+  addition to the summarized selected candidate, so offline shape indices can
+  be resolved back to layers, nets, bounds, and exact polygon geometry.
+* The complete follow-up artifact showed that directly substituting detailed
+  guide polygons would create illegal terminal access and regress the exact
+  design to 440 errors. The accepted repair instead scores legal connected
+  drop/via candidates against the emitted conflict graph, runs original,
+  reversed, and high-fanout-first net orders, and retains the lowest-conflict
+  physical geometry. `4B_ADDER` now falls from 189 to 132 errors (22 M2, 97
+  M3, and 13 M4) without regressing clean inverter/NAND fixtures. Detailed
+  polygon cutover still requires a router-owned legal pin-access stage.
+* Cut spacing now follows manufacturing semantics: same-net continuous metal
+  may merge without a spacing error, but contacts and vias remain discrete
+  cuts and must satisfy the process cut pitch even on the same net. Exact
+  duplicate generated vias are collapsed before DRC, and violations use the
+  distinct `CUT.MIN_SPACING` rule so they cannot be confused with metal
+  spacing. The exact `4B_ADDER` result remains 132 after this correction.
+
+## Milestone 4.8 — Grouped Waveform Buses
 
 Let users combine related scalar inputs, outputs, or internal signals into a
 named waveform bus similar to GTKWave and QuestaSim:
@@ -647,6 +1028,25 @@ Acceptance:
 * Group definitions, ordering, radix, and collapsed state survive project
   save/load
 * Expanding a group shows member traces without changing simulation data
+
+Current implementation:
+
+* Rust persists validated, undoable waveform groups in the project with unique
+  membership, explicit signal order, radix, and collapsed state. Input/output
+  renames follow group references and deleting members removes invalid groups.
+* The waveform sidebar creates, renames, reorders, edits, expands/collapses, and
+  removes groups. Scalar signals remain available below expanded buses.
+* Aggregate lanes preserve leading zeroes, propagate unresolved bits as `X`,
+  show the same value at the active cursor and sticky viewport edge, label
+  stable intervals when space permits, and draw crossed transition boundaries
+  after all same-time member changes are resolved.
+* Fit/zoom buttons and Ctrl/Command-wheel scale the horizontal time axis from
+  1× to 32× while retaining a centered viewport and denser time ticks. Stable
+  aggregate intervals reveal their binary/hex values as zoom creates enough
+  room, matching conventional waveform-inspection behavior.
+* Aggregate rendering coalesces adjacent member-event slices when the formatted
+  bus value did not change. Input buses therefore show labels across their true
+  stable interval instead of losing text to numerous no-op sample boundaries.
 
 ---
 

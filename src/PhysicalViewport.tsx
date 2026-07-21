@@ -1,16 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { MapControls } from "three/addons/controls/MapControls.js";
-import type { PhysicalLayoutIr } from "./types";
+import type { PhysicalDrcDiagnostic, PhysicalDrcReport, PhysicalLayoutIr } from "./types";
 
 type ViewMode = "schematic" | "3d" | "waveform";
 
 type Props = {
   layout: PhysicalLayoutIr | null;
+  drc: PhysicalDrcReport | null;
   selectedIds: string[];
   projectName: string;
   technologyName: string;
   onSelect: (id: string | null, additive?: boolean) => void;
+  onSaveDrc: () => void;
   onView: (view: ViewMode) => void;
 };
 
@@ -58,10 +60,12 @@ type LayerName = string;
 
 export default function PhysicalViewport({
   layout,
+  drc,
   selectedIds,
   projectName,
   technologyName,
   onSelect,
+  onSaveDrc,
   onView,
 }: Props) {
   const host = useRef<HTMLDivElement>(null);
@@ -71,11 +75,19 @@ export default function PhysicalViewport({
   const [visibleLayers, setVisibleLayers] = useState<Set<LayerName>>(
     () => new Set(Object.keys(createLayers(5))),
   );
+  const [selectedDiagnostic, setSelectedDiagnostic] = useState<number | null>(null);
+  const [drcLayer, setDrcLayer] = useState("all");
+  const [drcRule, setDrcRule] = useState("all");
+  const [drcSeverity, setDrcSeverity] = useState("all");
+  const [drcNet, setDrcNet] = useState("all");
   selectRef.current = onSelect;
 
   useEffect(() => {
     setVisibleLayers(new Set(Object.keys(layers)));
+    setSelectedDiagnostic(null);
   }, [layers]);
+
+  const selectedDrc = selectedDiagnostic === null ? null : drc?.diagnostics[selectedDiagnostic] ?? null;
 
   useEffect(() => {
     if (!host.current || !layout) return;
@@ -111,9 +123,10 @@ export default function PhysicalViewport({
     const geometries: THREE.BufferGeometry[] = [];
     const materials: THREE.Material[] = [];
     const pickables: THREE.Mesh[] = [];
-    layout.shapes
-      .filter((shape) => visibleLayers.has(shape.layer))
-      .forEach((shape) => {
+    const highlightedIndices = new Set(selectedDrc?.shapeIndices ?? []);
+    const highlightedBox = new THREE.Box3();
+    layout.shapes.forEach((shape, shapeIndex) => {
+        if (!visibleLayers.has(shape.layer)) return;
         const layer = layers[shape.layer];
         if (!layer) return;
         const geometry = new THREE.BoxGeometry(
@@ -122,8 +135,11 @@ export default function PhysicalViewport({
           Math.max(shape.height, .04),
         );
         const selected = shape.componentId ? selectedIds.includes(shape.componentId) : false;
+        const violation = highlightedIndices.has(shapeIndex);
         const material = new THREE.MeshStandardMaterial({
-          color: selected ? "#ffd277" : layer.color,
+          color: violation ? "#ff5252" : selected ? "#ffd277" : layer.color,
+          emissive: violation ? "#7a0909" : "#000000",
+          emissiveIntensity: violation ? 1.8 : 0,
           transparent: shape.layer === "nwell" || shape.layer === "substrate",
           opacity: shape.layer === "nwell" ? .48 : shape.layer === "substrate" ? .9 : 1,
           roughness: .5,
@@ -131,6 +147,7 @@ export default function PhysicalViewport({
         });
         const mesh = new THREE.Mesh(geometry, material);
         mesh.position.set(shape.x, layer.elevation, shape.y);
+        if (violation) highlightedBox.expandByObject(mesh);
         if (shape.componentId) {
           mesh.userData.componentId = shape.componentId;
           pickables.push(mesh);
@@ -171,6 +188,18 @@ export default function PhysicalViewport({
       controls.update();
     };
     resetView.current();
+    if (!highlightedBox.isEmpty()) {
+      const violationCenter = highlightedBox.getCenter(new THREE.Vector3());
+      const violationSize = highlightedBox.getSize(new THREE.Vector3());
+      const violationSpan = Math.max(violationSize.x, violationSize.z, .5);
+      controls.target.copy(violationCenter);
+      camera.position.set(violationCenter.x, span * 2, violationCenter.z + .001);
+      camera.lookAt(violationCenter);
+      const aspect = container.clientWidth / Math.max(container.clientHeight, 1);
+      camera.zoom = Math.min((2 * aspect) / (violationSpan * 1.8), 2 / (violationSpan * 1.8));
+      camera.updateProjectionMatrix();
+      controls.update();
+    }
 
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
@@ -216,7 +245,7 @@ export default function PhysicalViewport({
       renderer.dispose();
       renderer.domElement.remove();
     };
-  }, [layout, selectedIds, visibleLayers, layers]);
+  }, [layout, selectedIds, visibleLayers, layers, selectedDrc]);
 
   const toggleLayer = (layer: LayerName) => {
     setVisibleLayers((current) => {
@@ -226,6 +255,30 @@ export default function PhysicalViewport({
       return next;
     });
   };
+
+  const showAllLayers = () => setVisibleLayers(new Set(Object.keys(layers)));
+  const soloLayer = (layer: LayerName) => setVisibleLayers(new Set([layer]));
+
+  const selectViolation = (index: number, diagnostic: PhysicalDrcDiagnostic) => {
+    setSelectedDiagnostic(index);
+    if (layers[diagnostic.layer]) setVisibleLayers(new Set([diagnostic.layer]));
+  };
+
+  const drcRules = Array.from(new Set(drc?.diagnostics.map((diagnostic) => diagnostic.ruleId) ?? [])).sort();
+  const drcLayers = Array.from(new Set(drc?.diagnostics.map((diagnostic) => diagnostic.layer) ?? [])).sort();
+  const diagnosticNets = (diagnostic: PhysicalDrcDiagnostic) => Array.from(new Set(
+    diagnostic.shapeIndices.flatMap((index) => {
+      const net = layout?.shapes[index]?.net;
+      return net === null || net === undefined ? [] : [net];
+    }),
+  ));
+  const drcNets = Array.from(new Set((drc?.diagnostics ?? []).flatMap(diagnosticNets))).sort((a, b) => a - b);
+  const filteredDiagnostics = (drc?.diagnostics ?? [])
+    .map((diagnostic, index) => ({ diagnostic, index }))
+    .filter(({ diagnostic }) => drcLayer === "all" || diagnostic.layer === drcLayer)
+    .filter(({ diagnostic }) => drcRule === "all" || diagnostic.ruleId === drcRule)
+    .filter(({ diagnostic }) => drcSeverity === "all" || diagnostic.severity === drcSeverity)
+    .filter(({ diagnostic }) => drcNet === "all" || diagnosticNets(diagnostic).includes(Number(drcNet)));
 
   return (
     <div className="physical-workspace">
@@ -246,8 +299,71 @@ export default function PhysicalViewport({
           <span>{layout ? `${layout.devices.length} MOS` : "Generating…"}</span>
           <span>{layout ? `${layout.nets.length} nets · ${layout.pins.length} pins` : ""}</span>
           <span>{layout ? `${layout.maxMetalLayers} routing metals` : ""}</span>
+          {layout && (() => {
+            const candidate = layout.planning.candidates[layout.planning.selectedCandidate];
+            const placement = layout.placement.candidates[layout.placement.selectedCandidate];
+            return candidate ? (
+              <>
+                <span>{candidate.strategy} plan · {candidate.widthUm.toFixed(2)} × {candidate.heightUm.toFixed(2)} µm</span>
+                <span>{(candidate.deviceDensity * 100).toFixed(1)}% density · {(candidate.estimatedRoutingUtilization * 100).toFixed(1)}% route estimate</span>
+                <span>{layout.planning.candidates.length} candidates · {candidate.growthPasses} growth passes</span>
+                <span>{layout.planning.binColumns} × {layout.planning.binRows} coarse routing bins</span>
+                {placement && (
+                  <>
+                    <span>{placement.strategy} placement · {placement.legal ? "legal" : "illegal"}</span>
+                    <span>{placement.estimatedWireLengthUm.toFixed(1)} µm HPWL · {(placement.peakBinUtilization * 100).toFixed(1)}% peak bin</span>
+                    <span>{placement.diffusionSharingPairs} diffusion-sharing pairs</span>
+                  </>
+                )}
+                <span>{layout.globalRouting.converged ? "global route converged" : `${layout.globalRouting.totalOverflow} route overflow`}</span>
+                <span>{layout.globalRouting.routes.length} routed nets · {layout.globalRouting.iterations.length} negotiation passes</span>
+                <span>{layout.detailedRouting.converged ? "detailed route converged" : `${layout.detailedRouting.conflictCount} detail conflicts · ${layout.detailedRouting.blockedPinCount} blocked pins`}</span>
+                <span>{layout.detailedRouting.totalWireLengthUm.toFixed(1)} µm detailed wire · {layout.detailedRouting.totalViaCount} vias · {layout.detailedRouting.iterations.length} repair passes</span>
+              </>
+            ) : null;
+          })()}
         </div>
+        <p className="physical-sidebar-section">Physical DRC</p>
+        <div className={`physical-drc-status ${drc?.errorCount ? "has-errors" : "clean"}`}>
+          <strong>{drc ? (drc.errorCount ? `${drc.errorCount} errors` : "DRC clean") : "Checking…"}</strong>
+          <span>{drc ? `${drc.warningCount} warnings · ${drc.diagnostics.length} results` : "Rust rule deck"}</span>
+        </div>
+        <div className="physical-drc-filters">
+          <select aria-label="Filter DRC by layer" value={drcLayer} onChange={(event) => setDrcLayer(event.target.value)}>
+            <option value="all">All layers</option>
+            {drcLayers.map((layer) => <option key={layer} value={layer}>{layer}</option>)}
+          </select>
+          <select aria-label="Filter DRC by rule" value={drcRule} onChange={(event) => setDrcRule(event.target.value)}>
+            <option value="all">All rules</option>
+            {drcRules.map((rule) => <option key={rule} value={rule}>{rule}</option>)}
+          </select>
+          <select aria-label="Filter DRC by severity" value={drcSeverity} onChange={(event) => setDrcSeverity(event.target.value)}>
+            <option value="all">All severities</option>
+            <option value="error">Errors</option>
+            <option value="warning">Warnings</option>
+          </select>
+          <select aria-label="Filter DRC by net" value={drcNet} onChange={(event) => setDrcNet(event.target.value)}>
+            <option value="all">All nets</option>
+            {drcNets.map((net) => <option key={net} value={net}>Net {net}: {layout?.nets.find((item) => item.id === net)?.name ?? "unnamed"}</option>)}
+          </select>
+        </div>
+        <div className="physical-drc-list">
+          {filteredDiagnostics.map(({ diagnostic, index }) => (
+            <button
+              key={`${diagnostic.ruleId}-${index}`}
+              className={selectedDiagnostic === index ? "active" : ""}
+              onClick={() => selectViolation(index, diagnostic)}
+            >
+              <span><strong>{diagnostic.ruleId}</strong><i>{diagnostic.layer}</i></span>
+              <small>{diagnostic.message}</small>
+              <em>{diagnostic.measured.toFixed(4)} µm measured · {diagnostic.required.toFixed(4)} µm required</em>
+            </button>
+          ))}
+          {drc && !filteredDiagnostics.length && <p>{drc.diagnostics.length ? "No results match these filters." : "No physical violations."}</p>}
+        </div>
+        <button className="physical-reset" disabled={!drc} onClick={onSaveDrc}>Save DRC report…</button>
         <p className="physical-sidebar-section">Layers</p>
+        <button className="physical-reset" onClick={showAllLayers}>Show all layers</button>
         <div className="physical-layers">
           {Object.entries(layers).map(([name, layer]) => (
             <label key={name}>
@@ -257,7 +373,12 @@ export default function PhysicalViewport({
                 onChange={() => toggleLayer(name)}
               />
               <i style={{ background: layer.color }} />
-              {layer.label}
+              <span>{layer.label}</span>
+              <button type="button" onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                soloLayer(name);
+              }}>Solo</button>
             </label>
           ))}
         </div>

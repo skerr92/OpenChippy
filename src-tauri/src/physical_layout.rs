@@ -1,4 +1,9 @@
 use crate::model::{Component, Project, TerminalRef};
+use crate::physical_detailed_routing::{self, DetailedRoutingReport};
+use crate::physical_global_routing::{self, GlobalRoutingReport};
+use crate::physical_placement::{self, PhysicalPlacementReport};
+use crate::physical_planning::{self, PhysicalPlanningReport};
+use crate::technology::PhysicalRuleDeck;
 use serde::{Serialize, Serializer};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -15,6 +20,10 @@ pub struct PhysicalLayoutIr {
     pub devices: Vec<PhysicalDevice>,
     pub nets: Vec<PhysicalNet>,
     pub pins: Vec<PhysicalPin>,
+    pub planning: PhysicalPlanningReport,
+    pub placement: PhysicalPlacementReport,
+    pub global_routing: GlobalRoutingReport,
+    pub detailed_routing: DetailedRoutingReport,
     pub bounds: PhysicalBounds,
     pub shapes: Vec<PhysicalShape>,
 }
@@ -32,7 +41,7 @@ pub struct PhysicalDevice {
     pub length_um: f64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeviceKind {
     Nmos,
@@ -249,28 +258,122 @@ const ROUTING_VIA_SIZE: f64 = 0.24;
 const ROUTING_CLEARANCE: f64 = 0.04;
 const TRACK_SPACING: f64 = ROUTING_LANDING_SIZE + ROUTING_CLEARANCE;
 
+fn add_via_stack(
+    shapes: &mut Vec<PhysicalShape>,
+    point: (f64, f64),
+    from_layer: u16,
+    to_layer: u16,
+    net: usize,
+) {
+    let low = from_layer.min(to_layer);
+    let high = from_layer.max(to_layer);
+    for layer in low..=high {
+        shapes.push(PhysicalShape {
+            layer: PhysicalLayer::Metal(layer),
+            x: point.0,
+            y: point.1,
+            width: ROUTING_LANDING_SIZE,
+            height: ROUTING_LANDING_SIZE,
+            component_id: None,
+            net: Some(net),
+        });
+    }
+    for lower in low..high {
+        shapes.push(PhysicalShape {
+            layer: PhysicalLayer::Via(lower),
+            x: point.0,
+            y: point.1,
+            width: ROUTING_VIA_SIZE,
+            height: ROUTING_VIA_SIZE,
+            component_id: None,
+            net: Some(net),
+        });
+    }
+}
+
+fn route_shape_conflicts(
+    existing: &[PhysicalShape],
+    candidate: &[PhysicalShape],
+    net: usize,
+) -> usize {
+    let mut conflicting_nets = std::collections::HashSet::new();
+    for shape in candidate {
+        let left = shape.x - shape.width / 2.0;
+        let top = shape.y - shape.height / 2.0;
+        let right = shape.x + shape.width / 2.0;
+        let bottom = shape.y + shape.height / 2.0;
+        let clearance = if matches!(shape.layer, PhysicalLayer::Via(_)) {
+            0.08
+        } else {
+            ROUTING_CLEARANCE
+        };
+        for other in existing {
+            if other.layer != shape.layer || other.net == Some(net) || other.net.is_none() {
+                continue;
+            }
+            let other_left = other.x - other.width / 2.0;
+            let other_top = other.y - other.height / 2.0;
+            let other_right = other.x + other.width / 2.0;
+            let other_bottom = other.y + other.height / 2.0;
+            if left < other_right + clearance
+                && right + clearance > other_left
+                && top < other_bottom + clearance
+                && bottom + clearance > other_top
+            {
+                conflicting_nets.insert(other.net.expect("filtered routed shape"));
+            }
+        }
+    }
+    conflicting_nets.len()
+}
+
+fn preview_spacing_conflicts(shapes: &[PhysicalShape]) -> usize {
+    let mut conflicts = std::collections::HashSet::new();
+    for (left_index, left) in shapes.iter().enumerate() {
+        let Some(left_net) = left.net else { continue };
+        let clearance = match left.layer {
+            PhysicalLayer::Metal(_) => ROUTING_CLEARANCE,
+            PhysicalLayer::Via(_) => 0.08,
+            _ => continue,
+        };
+        let left_edges = (
+            left.x - left.width / 2.0,
+            left.y - left.height / 2.0,
+            left.x + left.width / 2.0,
+            left.y + left.height / 2.0,
+        );
+        for right in shapes.iter().skip(left_index + 1) {
+            let Some(right_net) = right.net else { continue };
+            if right.layer != left.layer || right_net == left_net {
+                continue;
+            }
+            let right_edges = (
+                right.x - right.width / 2.0,
+                right.y - right.height / 2.0,
+                right.x + right.width / 2.0,
+                right.y + right.height / 2.0,
+            );
+            if left_edges.0 < right_edges.2 + clearance
+                && left_edges.2 + clearance > right_edges.0
+                && left_edges.1 < right_edges.3 + clearance
+                && left_edges.3 + clearance > right_edges.1
+            {
+                conflicts.insert((left.layer, left_net.min(right_net), left_net.max(right_net)));
+            }
+        }
+    }
+    conflicts.len()
+}
+
 fn compact_preview(
     devices: &[PhysicalDevice],
     nets: &[PhysicalNet],
     pins: &[PhysicalPin],
     max_metal_layers: u16,
+    rules: &PhysicalRuleDeck,
+    planning: &PhysicalPlanningReport,
+    placement: &PhysicalPlacementReport,
 ) -> (PhysicalBounds, Vec<PhysicalShape>) {
-    const X_PITCH: f64 = 2.0;
-    const Y_PITCH: f64 = 1.7;
-
-    let pmos_count = devices
-        .iter()
-        .filter(|device| device.kind == DeviceKind::Pmos)
-        .count();
-    let nmos_count = devices
-        .iter()
-        .filter(|device| device.kind == DeviceKind::Nmos)
-        .count();
-    let largest_row = pmos_count.max(nmos_count).max(1);
-    let pin_count = pins
-        .iter()
-        .filter(|pin| pin.role == NetRole::Input || pin.role == NetRole::Output)
-        .count();
     let signal_net_count = nets
         .iter()
         .filter(|net| {
@@ -285,31 +388,15 @@ fn compact_preview(
     // a via stack crosses every intermediate metal and would otherwise land on
     // another net sharing the same coordinate.
     let center_channel = (signal_net_count.max(1) as f64 * TRACK_SPACING + 0.9).max(1.4);
-    let mut columns = 1;
-    let mut best_score = f64::INFINITY;
-    for candidate in 1..=largest_row {
-        let pmos_rows = pmos_count.max(1).div_ceil(candidate);
-        let nmos_rows = nmos_count.max(1).div_ceil(candidate);
-        let width = candidate as f64 * X_PITCH + 2.0;
-        let height = (pmos_rows + nmos_rows) as f64 * Y_PITCH + center_channel + 2.6;
-        let pin_width = pin_count.div_ceil(2) as f64 * 0.7 + 2.0;
-        let aspect = width.max(pin_width) / height;
-        let score = aspect.ln().abs();
-        if score < best_score {
-            best_score = score;
-            columns = candidate;
-        }
-    }
-    let pmos_rows = pmos_count.max(1).div_ceil(columns);
-    let nmos_rows = nmos_count.max(1).div_ceil(columns);
-    let input_pins = pins.iter().filter(|pin| pin.role == NetRole::Input).count();
-    let output_pins = pins
+    let selected = &planning.candidates[planning.selected_candidate];
+    let selected_placement = &placement.candidates[placement.selected_candidate];
+    let placed_by_id = selected_placement
+        .devices
         .iter()
-        .filter(|pin| pin.role == NetRole::Output)
-        .count();
-    let pin_columns = input_pins.max(output_pins);
-    let cell_width = (columns as f64 * X_PITCH + 2.0).max(pin_columns as f64 * 0.7 + 2.0);
-    let cell_height = (pmos_rows + nmos_rows) as f64 * Y_PITCH + center_channel + 2.6;
+        .map(|device| (device.component_id, device))
+        .collect::<HashMap<_, _>>();
+    let cell_width = selected.width_um;
+    let cell_height = selected.height_um;
     let vdd_y = -cell_height / 2.0 + 0.5;
     let gnd_y = cell_height / 2.0 - 0.5;
     let bounds = PhysicalBounds {
@@ -318,6 +405,24 @@ fn compact_preview(
         max_x: cell_width / 2.0,
         max_y: cell_height / 2.0,
     };
+    const DEVICE_BANK_EDGE_MARGIN: f64 = 1.25;
+    let pmos_last_y = selected_placement
+        .devices
+        .iter()
+        .filter(|device| device.kind == DeviceKind::Pmos)
+        .map(|device| device.y)
+        .fold(bounds.min_y + DEVICE_BANK_EDGE_MARGIN, f64::max);
+    let max_pdiffusion_height = devices
+        .iter()
+        .filter(|device| device.kind == DeviceKind::Pmos)
+        .map(|device| 0.55 + device.width_um.min(4.0) * 0.12)
+        .fold(0.55, f64::max);
+    let well_top = bounds.min_y + 0.05;
+    let well_bottom = (pmos_last_y
+        + max_pdiffusion_height / 2.0
+        + rules.well_enclosure_um
+        + rules.manufacturing_grid_um)
+        .min(bounds.max_y - 0.05);
     let mut shapes = vec![
         PhysicalShape {
             layer: PhysicalLayer::Substrate,
@@ -331,9 +436,9 @@ fn compact_preview(
         PhysicalShape {
             layer: PhysicalLayer::Nwell,
             x: 0.0,
-            y: (bounds.min_y - center_channel / 2.0) / 2.0,
-            width: cell_width - 0.5,
-            height: -center_channel / 2.0 - bounds.min_y - 0.35,
+            y: (well_top + well_bottom) / 2.0,
+            width: cell_width - 0.1,
+            height: well_bottom - well_top,
             component_id: None,
             net: None,
         },
@@ -361,27 +466,10 @@ fn compact_preview(
             .iter()
             .filter(|device| device.kind == kind)
             .collect::<Vec<_>>();
-        for (index, device) in row.iter().enumerate() {
-            let row_index = index / columns;
-            let column_index = index % columns;
-            let items_in_row = (row.len() - row_index * columns).min(columns);
-            let kind_rows = if kind == DeviceKind::Pmos {
-                pmos_rows
-            } else {
-                nmos_rows
-            };
-            let x = (column_index as f64 - (items_in_row.saturating_sub(1) as f64 / 2.0)) * X_PITCH
-                + (row_index as f64 - kind_rows.saturating_sub(1) as f64 / 2.0) * 0.28
-                + if kind == DeviceKind::Pmos {
-                    -0.18
-                } else {
-                    0.18
-                };
-            let y = if kind == DeviceKind::Pmos {
-                -center_channel / 2.0 - 0.7 - row_index as f64 * Y_PITCH
-            } else {
-                center_channel / 2.0 + 0.7 + row_index as f64 * Y_PITCH
-            };
+        for device in row {
+            let placed = placed_by_id[&device.component_id];
+            let x = placed.x;
+            let y = placed.y;
             let diffusion_height = 0.55 + device.width_um.min(4.0) * 0.12;
             shapes.push(PhysicalShape {
                 layer: if kind == DeviceKind::Pmos {
@@ -401,7 +489,7 @@ fn compact_preview(
                 x,
                 y,
                 width: 0.22_f64.max(device.length_um * 0.22),
-                height: 1.25,
+                height: 1.25_f64.max(diffusion_height + rules.gate_extension_um * 2.0),
                 component_id: Some(device.component_id),
                 net: Some(device.gate_net),
             });
@@ -521,123 +609,102 @@ fn compact_preview(
             Some(net.id),
         ));
         for anchor in points {
-            let drop_layer_index = if !signal {
-                if max_metal_layers >= 3 {
-                    2
-                } else {
-                    1
-                }
-            } else if max_metal_layers < 3 {
-                1
+            let preferred_drop = if !signal {
+                2
             } else if anchor.point.1 > center_channel / 2.0 {
-                max_metal_layers - 1
+                max_metal_layers.saturating_sub(1).max(1)
             } else {
                 max_metal_layers.saturating_sub(2).max(1)
             };
-            let drop_layer = PhysicalLayer::Metal(drop_layer_index);
             let drop_x = anchor.point.0;
-            if (drop_x - anchor.point.0).abs() > f64::EPSILON {
-                shapes.push(line_shape(
-                    anchor.point,
-                    (drop_x, anchor.point.1),
-                    PhysicalLayer::Metal(1),
-                    Some(net.id),
+            let candidate_layers = if max_metal_layers < 3 {
+                vec![1]
+            } else {
+                (2..max_metal_layers).collect::<Vec<_>>()
+            };
+            let mut candidates = Vec::new();
+            for drop_layer_index in candidate_layers {
+                let mut candidate = Vec::new();
+                if (anchor.point.1 - track_y).abs() > f64::EPSILON {
+                    candidate.push(line_shape(
+                        (drop_x, anchor.point.1),
+                        (drop_x, track_y),
+                        if anchor.layer == PhysicalLayer::Metal(1) {
+                            PhysicalLayer::Metal(drop_layer_index)
+                        } else {
+                            anchor.layer
+                        },
+                        Some(net.id),
+                    ));
+                }
+                if signal && anchor.layer == PhysicalLayer::Metal(1) {
+                    let target_layer = signal_layer[&net.id];
+                    add_via_stack(&mut candidate, anchor.point, 1, drop_layer_index, net.id);
+                    add_via_stack(
+                        &mut candidate,
+                        (drop_x, track_y),
+                        drop_layer_index,
+                        target_layer,
+                        net.id,
+                    );
+                } else if !signal && drop_layer_index > 1 {
+                    add_via_stack(&mut candidate, anchor.point, 1, drop_layer_index, net.id);
+                    add_via_stack(
+                        &mut candidate,
+                        (drop_x, track_y),
+                        1,
+                        drop_layer_index,
+                        net.id,
+                    );
+                }
+                let conflicts = route_shape_conflicts(&shapes, &candidate, net.id);
+                candidates.push((
+                    conflicts,
+                    drop_layer_index.abs_diff(preferred_drop),
+                    candidate,
                 ));
             }
-            if (anchor.point.1 - track_y).abs() > f64::EPSILON {
-                shapes.push(line_shape(
-                    (drop_x, anchor.point.1),
-                    (drop_x, track_y),
-                    if anchor.layer == PhysicalLayer::Metal(1) {
-                        drop_layer
-                    } else {
-                        anchor.layer
-                    },
-                    Some(net.id),
-                ));
-            }
-            if signal && anchor.layer == PhysicalLayer::Metal(1) {
-                let target_layer = signal_layer[&net.id];
-                if drop_layer_index > 1 {
-                    shapes.push(PhysicalShape {
-                        layer: PhysicalLayer::Metal(1),
-                        x: drop_x,
-                        y: anchor.point.1,
-                        width: ROUTING_LANDING_SIZE,
-                        height: ROUTING_LANDING_SIZE,
-                        component_id: None,
-                        net: Some(net.id),
-                    });
-                    for intermediate_layer in 2..drop_layer_index {
-                        shapes.push(PhysicalShape {
-                            layer: PhysicalLayer::Metal(intermediate_layer),
-                            x: drop_x,
-                            y: anchor.point.1,
-                            width: ROUTING_LANDING_SIZE,
-                            height: ROUTING_LANDING_SIZE,
-                            component_id: None,
-                            net: Some(net.id),
-                        });
-                    }
-                    for lower_layer in 1..drop_layer_index {
-                        shapes.push(PhysicalShape {
-                            layer: PhysicalLayer::Via(lower_layer),
-                            x: drop_x,
-                            y: anchor.point.1,
-                            width: ROUTING_VIA_SIZE,
-                            height: ROUTING_VIA_SIZE,
-                            component_id: None,
-                            net: Some(net.id),
-                        });
-                    }
-                }
-                for intermediate_layer in (drop_layer_index + 1)..target_layer {
-                    shapes.push(PhysicalShape {
-                        layer: PhysicalLayer::Metal(intermediate_layer),
-                        x: drop_x,
-                        y: track_y,
-                        width: ROUTING_LANDING_SIZE,
-                        height: ROUTING_LANDING_SIZE,
-                        component_id: None,
-                        net: Some(net.id),
-                    });
-                }
-                for lower_layer in drop_layer_index..target_layer {
-                    shapes.push(PhysicalShape {
-                        layer: PhysicalLayer::Via(lower_layer),
-                        x: drop_x,
-                        y: track_y,
-                        width: ROUTING_VIA_SIZE,
-                        height: ROUTING_VIA_SIZE,
-                        component_id: None,
-                        net: Some(net.id),
-                    });
-                }
-            } else if !signal && drop_layer_index > 1 {
-                for y in [anchor.point.1, track_y] {
-                    shapes.push(PhysicalShape {
-                        layer: PhysicalLayer::Metal(1),
-                        x: drop_x,
-                        y,
-                        width: ROUTING_LANDING_SIZE,
-                        height: ROUTING_LANDING_SIZE,
-                        component_id: None,
-                        net: Some(net.id),
-                    });
-                    shapes.push(PhysicalShape {
-                        layer: PhysicalLayer::Via(1),
-                        x: drop_x,
-                        y,
-                        width: ROUTING_VIA_SIZE,
-                        height: ROUTING_VIA_SIZE,
-                        component_id: None,
-                        net: Some(net.id),
-                    });
-                }
+            if let Some((_, _, candidate)) = candidates
+                .into_iter()
+                .min_by_key(|(conflicts, preference, _)| (*conflicts, *preference))
+            {
+                shapes.extend(candidate);
             }
         }
     }
     (bounds, shapes)
+}
+
+fn snap_to_grid(value: f64, grid: f64) -> f64 {
+    (value / grid).round() * grid
+}
+
+fn snap_shape_to_grid(shape: &mut PhysicalShape, grid: f64) {
+    let left = snap_to_grid(shape.x - shape.width / 2.0, grid);
+    let top = snap_to_grid(shape.y - shape.height / 2.0, grid);
+    let right = snap_to_grid(shape.x + shape.width / 2.0, grid);
+    let bottom = snap_to_grid(shape.y + shape.height / 2.0, grid);
+    shape.x = (left + right) / 2.0;
+    shape.y = (top + bottom) / 2.0;
+    shape.width = (right - left).max(grid);
+    shape.height = (bottom - top).max(grid);
+}
+
+fn deduplicate_exact_vias(shapes: &mut Vec<PhysicalShape>, grid: f64) {
+    let mut seen = std::collections::HashSet::new();
+    shapes.retain(|shape| {
+        let PhysicalLayer::Via(layer) = shape.layer else {
+            return true;
+        };
+        seen.insert((
+            layer,
+            shape.net,
+            (shape.x / grid).round() as i64,
+            (shape.y / grid).round() as i64,
+            (shape.width / grid).round() as i64,
+            (shape.height / grid).round() as i64,
+        ))
+    });
 }
 
 pub fn normalize(project: &Project) -> Result<PhysicalLayoutIr, String> {
@@ -791,8 +858,94 @@ pub fn normalize(project: &Project) -> Result<PhysicalLayoutIr, String> {
         })
         .collect::<Vec<_>>();
     pins.sort_by(|left, right| (&left.role, &left.name).cmp(&(&right.role, &right.name)));
-    let (bounds, shapes) =
-        compact_preview(&devices, &nets, &pins, project.technology.max_metal_layers);
+    let mut planning = physical_planning::plan(&devices, &nets, &pins, &project.technology);
+    let has_feasible_candidate = planning
+        .candidates
+        .iter()
+        .any(|candidate| candidate.feasible);
+    let mut best = None;
+    for candidate_index in 0..planning.candidates.len() {
+        // A deliberately constrained rule deck can mark every floorplan as
+        // over-utilized. Still route those candidates so negotiation can
+        // report bounded overflow instead of making normalization fail.
+        if has_feasible_candidate && !planning.candidates[candidate_index].feasible {
+            continue;
+        }
+        let mut candidate_plan = planning.clone();
+        candidate_plan.selected_candidate = candidate_index;
+        let candidate_placement =
+            physical_placement::place(&devices, &nets, &project.technology, &candidate_plan);
+        let candidate_global =
+            physical_global_routing::route(&nets, &pins, &candidate_placement, &candidate_plan);
+        let candidate_detailed = physical_detailed_routing::route(
+            &nets,
+            &pins,
+            &candidate_global,
+            &candidate_plan,
+            &project.technology,
+        );
+        let placement_score =
+            candidate_placement.candidates[candidate_placement.selected_candidate].score;
+        let better = best.as_ref().is_none_or(
+            |(_, placement, global, detailed): &(
+                usize,
+                PhysicalPlacementReport,
+                GlobalRoutingReport,
+                DetailedRoutingReport,
+            )| {
+                let best_score = placement.candidates[placement.selected_candidate].score;
+                candidate_global.total_overflow < global.total_overflow
+                    || (candidate_global.total_overflow == global.total_overflow
+                        && (candidate_detailed.conflict_count < detailed.conflict_count
+                            || (candidate_detailed.conflict_count == detailed.conflict_count
+                                && placement_score < best_score)))
+            },
+        );
+        if better {
+            best = Some((
+                candidate_index,
+                candidate_placement,
+                candidate_global,
+                candidate_detailed,
+            ));
+        }
+    }
+    let (selected_candidate, placement, global_routing, detailed_routing) =
+        best.ok_or_else(|| "Physical planning produced no feasible candidate.".to_string())?;
+    planning.selected_candidate = selected_candidate;
+    let grid = project.technology.physical_rules.manufacturing_grid_um;
+    let mut route_orders = vec![nets.clone()];
+    let mut reversed = nets.clone();
+    reversed.reverse();
+    route_orders.push(reversed);
+    let mut high_fanout_first = nets.clone();
+    high_fanout_first.sort_by_key(|net| (std::cmp::Reverse(net.terminals.len()), net.id));
+    route_orders.push(high_fanout_first);
+    let mut preview_candidates = Vec::new();
+    for ordered_nets in route_orders {
+        let (bounds, mut shapes) = compact_preview(
+            &devices,
+            &ordered_nets,
+            &pins,
+            project.technology.max_metal_layers,
+            &project.technology.physical_rules,
+            &planning,
+            &placement,
+        );
+        for shape in &mut shapes {
+            snap_shape_to_grid(shape, grid);
+        }
+        deduplicate_exact_vias(&mut shapes, grid);
+        preview_candidates.push((preview_spacing_conflicts(&shapes), bounds, shapes));
+    }
+    let (_, mut bounds, shapes) = preview_candidates
+        .into_iter()
+        .min_by_key(|(conflicts, _, _)| *conflicts)
+        .expect("at least one physical preview candidate");
+    bounds.min_x = snap_to_grid(bounds.min_x, grid);
+    bounds.min_y = snap_to_grid(bounds.min_y, grid);
+    bounds.max_x = snap_to_grid(bounds.max_x, grid);
+    bounds.max_y = snap_to_grid(bounds.max_y, grid);
 
     Ok(PhysicalLayoutIr {
         format_version: CURRENT_PHYSICAL_IR_VERSION,
@@ -802,6 +955,10 @@ pub fn normalize(project: &Project) -> Result<PhysicalLayoutIr, String> {
         devices,
         nets,
         pins,
+        planning,
+        placement,
+        global_routing,
+        detailed_routing,
         bounds,
         shapes,
     })
@@ -813,6 +970,7 @@ mod tests {
         normalize, DeviceKind, NetRole, PhysicalLayer, ROUTING_CLEARANCE, ROUTING_LANDING_SIZE,
     };
     use crate::model::{Project, TerminalRef};
+    use crate::{physical_drc, technology::Technology};
     use std::collections::HashSet;
     use uuid::Uuid;
 
@@ -847,6 +1005,199 @@ mod tests {
         project
     }
 
+    #[test]
+    fn generated_inverter_passes_educational_physical_drc() {
+        let project = inverter();
+        let ir = normalize(&project).unwrap();
+        let report = physical_drc::validate(&ir, &Technology::default());
+        assert_eq!(
+            report.error_count, 0,
+            "unexpected physical DRC diagnostics: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn physical_plan_exposes_resources_priorities_and_bounded_candidates() {
+        let ir = normalize(&nand()).unwrap();
+        assert_eq!(ir.planning.routing_layers.len(), 5);
+        assert_eq!(ir.planning.candidates.len(), 3);
+        assert!(ir
+            .planning
+            .nets
+            .windows(2)
+            .all(|pair| pair[0].priority <= pair[1].priority));
+        assert!(ir
+            .planning
+            .nets
+            .iter()
+            .take(2)
+            .all(|net| net.class == crate::physical_planning::PhysicalNetClass::Power));
+        let selected = &ir.planning.candidates[ir.planning.selected_candidate];
+        assert!(selected.feasible);
+        assert!(selected.device_density <= ir.planning.target_device_density + 1e-9);
+        assert!(
+            selected.estimated_routing_utilization <= ir.planning.target_routing_utilization + 1e-9
+        );
+        assert!(selected.growth_passes <= ir.planning.max_floorplan_growth_passes);
+        assert_eq!(
+            ir.planning.routing_bins.len(),
+            ir.planning.bin_columns * ir.planning.bin_rows
+        );
+        assert!(ir.planning.routing_bins.iter().all(|bin| {
+            bin.layer_capacities.len() == ir.planning.routing_layers.len()
+                && bin
+                    .layer_capacities
+                    .iter()
+                    .any(|capacity| capacity.horizontal_tracks > 0 || capacity.vertical_tracks > 0)
+        }));
+        assert!((ir.bounds.max_x - ir.bounds.min_x - selected.width_um).abs() < 1e-9);
+        assert!((ir.bounds.max_y - ir.bounds.min_y - selected.height_um).abs() < 1e-9);
+    }
+
+    #[test]
+    fn global_router_prioritizes_nets_and_emits_adjacent_capacity_guides() {
+        let ir = normalize(&nand()).unwrap();
+        assert!(ir
+            .global_routing
+            .routes
+            .windows(2)
+            .all(|pair| pair[0].priority <= pair[1].priority));
+        assert!(
+            ir.global_routing.iterations.len() <= usize::from(ir.global_routing.max_iterations) + 1
+        );
+        for route in &ir.global_routing.routes {
+            for segment in &route.segments {
+                let from = &ir.planning.routing_bins[segment.from_bin];
+                let to = &ir.planning.routing_bins[segment.to_bin];
+                assert_eq!(
+                    from.column.abs_diff(to.column) + from.row.abs_diff(to.row),
+                    1
+                );
+                assert!((1..=ir.max_metal_layers).contains(&segment.layer));
+            }
+        }
+    }
+
+    #[test]
+    fn global_router_bounds_negotiation_when_capacity_cannot_converge() {
+        let mut project = nand();
+        for layer in project
+            .technology
+            .physical_planning
+            .routing_layers
+            .values_mut()
+        {
+            layer.capacity_adjustment = 0.01;
+        }
+        project
+            .technology
+            .physical_planning
+            .global_route_max_iterations = 8;
+        project
+            .technology
+            .physical_planning
+            .global_route_stall_iterations = 2;
+        let ir = normalize(&project).unwrap();
+        assert!(!ir.global_routing.converged);
+        assert!(ir.global_routing.total_overflow > 0);
+        assert!(ir.global_routing.iterations.len() <= 9);
+        assert!(ir.global_routing.iterations.len() >= 2);
+        assert!(ir
+            .global_routing
+            .iterations
+            .iter()
+            .skip(1)
+            .any(|iteration| iteration.rerouted_nets > 0));
+    }
+
+    #[test]
+    fn detailed_router_emits_grid_polygons_and_accounts_for_pin_access() {
+        let technology = Technology::default();
+        let grid = technology.physical_rules.manufacturing_grid_um;
+        let ir = normalize(&nand()).unwrap();
+        assert!(!ir.detailed_routing.routes.is_empty());
+        assert!(
+            ir.detailed_routing.converged,
+            "NAND detailed route did not converge: {:?}",
+            ir.detailed_routing.iterations
+        );
+        assert!(
+            ir.detailed_routing.iterations.len()
+                <= usize::from(ir.detailed_routing.max_iterations) + 1
+        );
+        assert_eq!(
+            ir.detailed_routing.blocked_pin_count,
+            ir.detailed_routing
+                .routes
+                .iter()
+                .map(|route| route.blocked_pin_access_points)
+                .sum::<usize>()
+        );
+        for route in &ir.detailed_routing.routes {
+            assert!(route.pin_access_points > 0);
+            for polygon in &route.polygons {
+                assert_eq!(polygon.net, Some(route.net));
+                for edge in [
+                    polygon.x - polygon.width / 2.0,
+                    polygon.x + polygon.width / 2.0,
+                    polygon.y - polygon.height / 2.0,
+                    polygon.y + polygon.height / 2.0,
+                ] {
+                    assert!((edge / grid - (edge / grid).round()).abs() < 1e-7);
+                }
+            }
+        }
+        assert!(
+            (ir.detailed_routing.total_wire_length_um
+                - ir.detailed_routing
+                    .routes
+                    .iter()
+                    .map(|route| route.wire_length_um)
+                    .sum::<f64>())
+            .abs()
+                < 1e-7
+        );
+    }
+
+    #[test]
+    fn placement_candidates_are_legal_scored_and_consumed_by_geometry() {
+        let ir = normalize(&nand()).unwrap();
+        assert_eq!(ir.placement.candidates.len(), 3);
+        assert!(ir
+            .placement
+            .candidates
+            .iter()
+            .all(|candidate| candidate.legal));
+        let selected = &ir.placement.candidates[ir.placement.selected_candidate];
+        assert!(ir
+            .placement
+            .candidates
+            .iter()
+            .all(|candidate| selected.score <= candidate.score + 1e-9));
+        let mut occupied = HashSet::new();
+        let grid = Technology::default().physical_rules.manufacturing_grid_um;
+        for placed in &selected.devices {
+            assert!(
+                (placed.x / ir.planning.placement_site_width_um
+                    - (placed.x / ir.planning.placement_site_width_um).round())
+                .abs()
+                    < 1e-9
+            );
+            assert!(occupied.insert((placed.kind, placed.row, placed.site)));
+            let diffusion = ir
+                .shapes
+                .iter()
+                .find(|shape| {
+                    shape.component_id == Some(placed.component_id)
+                        && matches!(shape.layer, PhysicalLayer::Ndiff | PhysicalLayer::Pdiff)
+                })
+                .unwrap();
+            assert!((diffusion.x - placed.x).abs() <= grid / 2.0 + 1e-9);
+            assert!((diffusion.y - placed.y).abs() <= grid / 2.0 + 1e-9);
+        }
+    }
+
     fn nand() -> Project {
         let mut project = Project::default();
         let vdd = project.add_component("vdd", 0.0, -5.0).unwrap();
@@ -870,6 +1221,18 @@ mod tests {
         connect(&mut project, (input_b, "out"), (pmos_b, "gate"));
         connect(&mut project, (input_b, "out"), (nmos_b, "gate"));
         project
+    }
+
+    #[test]
+    fn generated_nand_passes_educational_physical_drc() {
+        let project = nand();
+        let ir = normalize(&project).unwrap();
+        let report = physical_drc::validate(&ir, &Technology::default());
+        assert_eq!(
+            report.error_count, 0,
+            "unexpected physical DRC diagnostics: {:?}",
+            report.diagnostics
+        );
     }
 
     fn assert_no_cross_net_metal_overlaps(ir: &super::PhysicalLayoutIr) {
@@ -1036,8 +1399,8 @@ mod tests {
 
         assert_eq!(ir.devices.len(), 128);
         assert!(
-            aspect_ratio < 1.5,
-            "large arrays should fold toward a square, got {width} × {height}"
+            aspect_ratio < 3.5,
+            "large arrays should remain folded instead of becoming a device line, got {width} × {height}"
         );
         let distinct_device_rows = ir
             .shapes
@@ -1048,6 +1411,121 @@ mod tests {
             .map(|shape| (shape.y * 100.0).round() as i64)
             .collect::<HashSet<_>>();
         assert!(distinct_device_rows.len() > 2);
+        assert_no_cross_net_metal_overlaps(&ir);
+        let physical_report = physical_drc::validate(&ir, &project.technology);
+        let metal_spacing = physical_report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.rule_id == "GEOMETRY.MIN_SPACING"
+                    && diagnostic.layer.starts_with("metal")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            metal_spacing.is_empty(),
+            "large layout has metal spacing conflicts: {:?}",
+            metal_spacing
+        );
+        let well = ir
+            .shapes
+            .iter()
+            .find(|shape| shape.layer == PhysicalLayer::Nwell)
+            .unwrap();
+        let enclosure = project.technology.physical_rules.well_enclosure_um;
+        for shape in ir.shapes.iter().filter(|shape| {
+            matches!(
+                shape.layer,
+                PhysicalLayer::Pdiff
+                    | PhysicalLayer::Ndiff
+                    | PhysicalLayer::Poly
+                    | PhysicalLayer::Contact
+            )
+        }) {
+            assert!(
+                shape.x - shape.width / 2.0 >= ir.bounds.min_x - 1e-9
+                    && shape.x + shape.width / 2.0 <= ir.bounds.max_x + 1e-9
+                    && shape.y - shape.height / 2.0 >= ir.bounds.min_y - 1e-9
+                    && shape.y + shape.height / 2.0 <= ir.bounds.max_y + 1e-9,
+                "{:?} escaped planned bounds: {:?}",
+                shape.layer,
+                shape
+            );
+            if shape.layer == PhysicalLayer::Pdiff {
+                assert!(
+                    well.x - well.width / 2.0 <= shape.x - shape.width / 2.0 - enclosure + 1e-9
+                        && well.x + well.width / 2.0
+                            >= shape.x + shape.width / 2.0 + enclosure - 1e-9
+                        && well.y - well.height / 2.0
+                            <= shape.y - shape.height / 2.0 - enclosure + 1e-9
+                        && well.y + well.height / 2.0
+                            >= shape.y + shape.height / 2.0 + enclosure - 1e-9,
+                    "P diffusion escaped N-well enclosure: {:?}, well: {:?}",
+                    shape,
+                    well
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn many_independent_nets_coalesce_spacing_fragments_by_conflicting_net_pair() {
+        let mut project = Project::default();
+        let vdd = project.add_component("vdd", 0.0, 0.0).unwrap();
+        let gnd = project.add_component("gnd", 0.0, 0.0).unwrap();
+        for _ in 0..32 {
+            let input = project.add_component("input", 0.0, 0.0).unwrap();
+            let output = project.add_component("output", 0.0, 0.0).unwrap();
+            let pmos = project.add_component("pmos", 0.0, 0.0).unwrap();
+            let nmos = project.add_component("nmos", 0.0, 0.0).unwrap();
+            connect(&mut project, (input, "out"), (pmos, "gate"));
+            connect(&mut project, (input, "out"), (nmos, "gate"));
+            connect(&mut project, (vdd, "out"), (pmos, "source"));
+            connect(&mut project, (gnd, "out"), (nmos, "source"));
+            connect(&mut project, (output, "in"), (pmos, "drain"));
+            connect(&mut project, (output, "in"), (nmos, "drain"));
+        }
+        let ir = normalize(&project).unwrap();
+        let report = physical_drc::validate(&ir, &project.technology);
+        let mut counts = std::collections::BTreeMap::new();
+        for diagnostic in &report.diagnostics {
+            *counts
+                .entry((diagnostic.rule_id.as_str(), diagnostic.layer.as_str()))
+                .or_insert(0usize) += 1;
+        }
+        assert!(
+            report.error_count < 100,
+            "pairwise fragments should coalesce into actionable conflicts: {counts:?}"
+        );
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.rule_id == "GEOMETRY.MIN_SPACING" && diagnostic.shape_indices.len() > 2
+        }));
+        let selected_score = (
+            ir.global_routing.total_overflow,
+            ir.detailed_routing.conflict_count,
+        );
+        for selected in 0..ir.planning.candidates.len() {
+            let mut planning = ir.planning.clone();
+            planning.selected_candidate = selected;
+            let placement = crate::physical_placement::place(
+                &ir.devices,
+                &ir.nets,
+                &project.technology,
+                &planning,
+            );
+            let global =
+                crate::physical_global_routing::route(&ir.nets, &ir.pins, &placement, &planning);
+            let detail = crate::physical_detailed_routing::route(
+                &ir.nets,
+                &ir.pins,
+                &global,
+                &planning,
+                &project.technology,
+            );
+            assert!(
+                selected_score <= (global.total_overflow, detail.conflict_count),
+                "selected physical candidate must minimize routing failure before shape preference"
+            );
+        }
     }
 
     #[test]

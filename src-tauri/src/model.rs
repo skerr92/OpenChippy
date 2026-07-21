@@ -93,6 +93,23 @@ pub struct BlockDefinition {
     pub pins: Vec<BlockPin>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WaveformRadix {
+    Binary,
+    Hex,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaveformGroup {
+    pub id: Uuid,
+    pub name: String,
+    pub signals: Vec<String>,
+    pub radix: WaveformRadix,
+    pub collapsed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Project {
@@ -105,6 +122,8 @@ pub struct Project {
     pub technology: Technology,
     #[serde(default)]
     pub block_definitions: Vec<BlockDefinition>,
+    #[serde(default)]
+    pub waveform_groups: Vec<WaveformGroup>,
 }
 
 fn terminal_offset(kind: &str, terminal: &str) -> (f64, f64) {
@@ -158,6 +177,7 @@ impl Default for Project {
             wires: Vec::new(),
             technology: Technology::default(),
             block_definitions: Vec::new(),
+            waveform_groups: Vec::new(),
         }
     }
 }
@@ -177,6 +197,54 @@ impl Project {
             return Err("circuit name cannot be empty".into());
         }
         self.name = name.into();
+        Ok(())
+    }
+
+    pub fn set_waveform_groups(&mut self, groups: Vec<WaveformGroup>) -> Result<(), String> {
+        let available = self
+            .components
+            .iter()
+            .filter(|component| matches!(component.kind.as_str(), "input" | "output"))
+            .map(|component| component.name.as_str())
+            .collect::<HashSet<_>>();
+        let mut ids = HashSet::new();
+        let mut names = HashSet::new();
+        let mut claimed_signals = HashSet::new();
+        for group in &groups {
+            let name = group.name.trim();
+            if name.is_empty() {
+                return Err("waveform group name cannot be empty".into());
+            }
+            if !ids.insert(group.id) || !names.insert(name.to_ascii_lowercase()) {
+                return Err("waveform group IDs and names must be unique".into());
+            }
+            if group.signals.len() < 2 {
+                return Err(format!("waveform group {name} needs at least two signals"));
+            }
+            let mut members = HashSet::new();
+            for signal in &group.signals {
+                if !available.contains(signal.as_str()) {
+                    return Err(format!(
+                        "waveform group {name} references missing signal {signal}"
+                    ));
+                }
+                if !members.insert(signal.as_str()) {
+                    return Err(format!("waveform group {name} repeats signal {signal}"));
+                }
+                if !claimed_signals.insert(signal.as_str()) {
+                    return Err(format!(
+                        "signal {signal} belongs to more than one waveform group"
+                    ));
+                }
+            }
+        }
+        self.waveform_groups = groups
+            .into_iter()
+            .map(|mut group| {
+                group.name = group.name.trim().into();
+                group
+            })
+            .collect();
         Ok(())
     }
 
@@ -352,7 +420,18 @@ impl Project {
             .iter_mut()
             .find(|component| component.id == id)
             .ok_or_else(|| "component not found".to_string())?;
+        let old_name = component.name.clone();
+        let waveform_signal = matches!(component.kind.as_str(), "input" | "output");
         component.name = name.into();
+        if waveform_signal {
+            for group in &mut self.waveform_groups {
+                for signal in &mut group.signals {
+                    if *signal == old_name {
+                        *signal = name.into();
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -422,6 +501,14 @@ impl Project {
         {
             return Err("component not found".into());
         }
+        let removed_signals = self
+            .components
+            .iter()
+            .filter(|component| {
+                ids.contains(&component.id) && matches!(component.kind.as_str(), "input" | "output")
+            })
+            .map(|component| component.name.clone())
+            .collect::<HashSet<_>>();
         self.components
             .retain(|component| !ids.contains(&component.id));
         self.wires.retain(|wire| {
@@ -431,6 +518,13 @@ impl Project {
                     .as_ref()
                     .is_none_or(|terminal| !ids.contains(&terminal.component_id))
         });
+        for group in &mut self.waveform_groups {
+            group
+                .signals
+                .retain(|signal| !removed_signals.contains(signal));
+        }
+        self.waveform_groups
+            .retain(|group| group.signals.len() >= 2);
         Ok(())
     }
 
@@ -776,6 +870,7 @@ impl Project {
             wires: Vec::new(),
             technology: self.technology.clone(),
             block_definitions: Vec::new(),
+            waveform_groups: self.waveform_groups.clone(),
         };
         let mut instance_terminals: HashMap<(Uuid, String), TerminalRef> = HashMap::new();
         for instance in self
@@ -957,7 +1052,7 @@ impl Project {
 
 #[cfg(test)]
 mod tests {
-    use super::{Component, Position, Project, TerminalRef};
+    use super::{Component, Position, Project, TerminalRef, WaveformGroup, WaveformRadix};
     use crate::technology::Technology;
     use uuid::Uuid;
 
@@ -967,6 +1062,39 @@ mod tests {
         project.rename("CMOS Inverter".into()).unwrap();
         assert_eq!(project.name, "CMOS Inverter");
         assert!(project.rename("  ".into()).is_err());
+    }
+
+    #[test]
+    fn waveform_groups_validate_order_and_round_trip() {
+        let mut project = Project::default();
+        let a = project.add_component("input", 0.0, 0.0).unwrap();
+        let b = project.add_component("input", 0.0, 2.0).unwrap();
+        let names = project
+            .components
+            .iter()
+            .filter(|component| component.id == a || component.id == b)
+            .map(|component| component.name.clone())
+            .collect::<Vec<_>>();
+        let group = WaveformGroup {
+            id: Uuid::new_v4(),
+            name: "DATA".into(),
+            signals: names.clone(),
+            radix: WaveformRadix::Hex,
+            collapsed: true,
+        };
+        project.set_waveform_groups(vec![group.clone()]).unwrap();
+        let mut restored: Project =
+            serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        assert_eq!(restored.waveform_groups, vec![group.clone()]);
+        assert_eq!(restored.waveform_groups[0].signals, names);
+        restored.rename_component(a, "D7".into()).unwrap();
+        assert_eq!(restored.waveform_groups[0].signals[0], "D7");
+        restored.delete_components(&[b]).unwrap();
+        assert!(restored.waveform_groups.is_empty());
+
+        let mut invalid = vec![group];
+        invalid[0].signals = vec!["MISSING".into(), "ALSO_MISSING".into()];
+        assert!(project.set_waveform_groups(invalid).is_err());
     }
 
     #[test]

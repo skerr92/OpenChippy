@@ -1,14 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import * as backend from "./backend";
-import type { ComponentKind, DeviceCharacteristics, LogicState, PhysicalLayoutIr, SimulationResult, TerminalRef, TruthTableResult, ValidationReport, WaveformConfig, WaveformResult, WorkspaceState } from "./types";
+import type { ComponentKind, DeviceCharacteristics, LogicState, PhysicalDrcReport, PhysicalLayoutIr, SimulationResult, TerminalRef, TruthTableResult, ValidationReport, WaveformConfig, WaveformGroup, WaveformResult, WorkspaceState } from "./types";
 import PhysicalViewport from "./PhysicalViewport";
 import SchematicViewport from "./SchematicViewport";
 import WaveformView from "./WaveformView";
+import { isEditableTarget, isEditingText } from "./dom";
 
 type ViewMode = "schematic" | "3d" | "waveform";
 
 export default function App() {
+  const editableFocusRef = useRef(false);
   const [workspace, setWorkspace] = useState<WorkspaceState | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [selectedWireId, setSelectedWireId] = useState<string | null>(null);
@@ -32,6 +34,7 @@ export default function App() {
   const [waveformRunning, setWaveformRunning] = useState(false);
   const [deviceCharacteristics, setDeviceCharacteristics] = useState<DeviceCharacteristics | null>(null);
   const [physicalIr, setPhysicalIr] = useState<PhysicalLayoutIr | null>(null);
+  const [physicalDrc, setPhysicalDrc] = useState<PhysicalDrcReport | null>(null);
   const [blockDialogOpen, setBlockDialogOpen] = useState(false);
   const [blockName, setBlockName] = useState("");
   const [blockDialogError, setBlockDialogError] = useState<string | null>(null);
@@ -76,13 +79,18 @@ export default function App() {
   useEffect(() => {
     if (viewMode !== "3d" || !project) {
       setPhysicalIr(null);
+      setPhysicalDrc(null);
       return;
     }
     setPhysicalIr(null);
+    setPhysicalDrc(null);
     let active = true;
-    backend.generatePhysicalIr()
-      .then((ir) => {
-        if (active) setPhysicalIr(ir);
+    backend.inspectPhysicalLayout()
+      .then(({ layout: ir, drc: report }) => {
+        if (active) {
+          setPhysicalIr(ir);
+          setPhysicalDrc(report);
+        }
       })
       .catch((reason) => {
         if (active) showError(reason);
@@ -91,6 +99,38 @@ export default function App() {
       active = false;
     };
   }, [viewMode, project]);
+
+  const savePhysicalReport = async () => {
+    if (!physicalIr || !physicalDrc) return;
+    try {
+      const destination = await save({
+        defaultPath: `${project?.name ?? "OpenChippy"}.physical-drc.json`,
+        filters: [{ name: "Physical DRC report", extensions: ["json"] }],
+      });
+      if (!destination) return;
+      const candidate = physicalIr.planning.candidates[physicalIr.planning.selectedCandidate];
+      const placement = physicalIr.placement.candidates[physicalIr.placement.selectedCandidate];
+      const artifact = {
+        formatVersion: 1,
+        generatedBy: "OpenChippy",
+        project: physicalIr.sourceProjectName,
+        technology: physicalIr.technologyName,
+        physicalIrVersion: physicalIr.formatVersion,
+        physicalIr,
+        selectedCandidate: {
+          planning: candidate,
+          placement,
+          globalRouting: physicalIr.globalRouting,
+          detailedRouting: physicalIr.detailedRouting,
+        },
+        report: physicalDrc,
+      };
+      await backend.savePhysicalDrcReport(destination, JSON.stringify(artifact, null, 2));
+      setStatus(`Saved physical DRC report to ${destination}`);
+    } catch (reason) {
+      showError(reason);
+    }
+  };
 
   useEffect(() => {
     backend.createProject()
@@ -323,9 +363,17 @@ export default function App() {
 
   const renameSelected = async (name: string) => {
     if (!selected || name.trim() === selected.name) return;
+    const componentId = selected.id;
+    const previousName = selected.name;
     try {
-      replaceWorkspace(await backend.renameComponent(selected.id, name), `Renamed ${selected.name} to ${name.trim()}`);
-      setSelectedIds([selected.id]);
+      const next = await backend.renameComponent(componentId, name);
+      setWorkspace(next);
+      setError(null);
+      setValidation(null);
+      setSimulation(null);
+      setTruthTable(null);
+      setWaveform(null);
+      setStatus(`Renamed ${previousName} to ${name.trim()}`);
     } catch (reason) {
       showError(reason);
     }
@@ -421,8 +469,20 @@ export default function App() {
     }
   };
 
+  const updateWaveformGroups = async (groups: WaveformGroup[]) => {
+    try {
+      const next = await backend.setWaveformGroups(groups);
+      setWorkspace(next);
+      setError(null);
+      setStatus("Updated waveform groups");
+    } catch (reason) {
+      showError(reason);
+    }
+  };
+
   useEffect(() => {
     const editSelection = (event: KeyboardEvent) => {
+      if (editableFocusRef.current || isEditingText(event)) return;
       if (event.key === "Delete" || event.key === "Backspace") {
         if (!selectedIds.length && !selectedWireId) return;
         event.preventDefault();
@@ -522,7 +582,28 @@ export default function App() {
   if (!project || !workspace) return <main className="loading">Preparing OpenChippy…</main>;
 
   return (
-    <main className="app-shell">
+    <main className="app-shell"
+      onPointerDownCapture={(event) => {
+        const active = document.activeElement;
+        if (
+          isEditableTarget(active)
+          && active instanceof HTMLElement
+          && !active.contains(event.target as Node)
+        ) {
+          active.blur();
+        }
+      }}
+      onFocusCapture={(event) => {
+        if (isEditableTarget(event.target)) editableFocusRef.current = true;
+      }}
+      onBlurCapture={() => {
+        queueMicrotask(() => {
+          editableFocusRef.current = isEditableTarget(document.activeElement);
+        });
+      }}
+      onKeyDown={(event) => {
+        if (editableFocusRef.current || isEditableTarget(event.target)) event.stopPropagation();
+      }}>
       <header>
         <div className="brand"><span className="mark">OC</span><div><strong>OpenChippy</strong><small>Silicon design studio</small></div></div>
         <nav>
@@ -632,10 +713,12 @@ export default function App() {
         ) : viewMode === "3d" ? (
           <PhysicalViewport
             layout={physicalIr}
+            drc={physicalDrc}
             selectedIds={selectedIds}
             projectName={project.name}
             technologyName={project.technology.name}
             onSelect={selectComponent}
+            onSaveDrc={savePhysicalReport}
             onView={(view) => {
               setViewMode(view);
               setPlacementKind(null);
@@ -643,6 +726,7 @@ export default function App() {
           />
         ) : (
           <WaveformView config={waveformConfig} result={waveform} running={waveformRunning}
+            groups={project.waveformGroups} onGroups={updateWaveformGroups}
             onConfig={setWaveformConfig} onRun={runWaveform} />
         )}
         {viewMode === "schematic" && (digitalInputs.length > 0 || simulation) && (
@@ -922,6 +1006,12 @@ export default function App() {
                 <dt>Format</dt><dd>v{project.technology.format_version}</dd>
                 <dt>Supply</dt><dd>{project.technology.supply_voltage} V</dd>
                 <dt>Routing metals</dt><dd>{project.technology.max_metal_layers}</dd>
+                <dt>Rule deck</dt><dd>v{project.technology.physical_rules.format_version}</dd>
+                <dt>Grid</dt><dd>{project.technology.physical_rules.manufacturing_grid_um} µm</dd>
+                <dt>Contact</dt><dd>{project.technology.physical_rules.contact.size_um} µm</dd>
+                <dt>Via</dt><dd>{project.technology.physical_rules.via.size_um} µm</dd>
+                <dt>Placement density</dt><dd>{Math.round(project.technology.physical_planning.target_device_density * 100)}%</dd>
+                <dt>Route utilization</dt><dd>{Math.round(project.technology.physical_planning.target_routing_utilization * 100)}%</dd>
                 <dt>NMOS Vt</dt><dd>{project.technology.nmos.threshold_voltage} V</dd>
                 <dt>NMOS Ron</dt><dd>{project.technology.nmos.nominal_on_resistance_ohms.toLocaleString()} Ω</dd>
                 <dt>PMOS Vt</dt><dd>{project.technology.pmos.threshold_voltage} V</dd>

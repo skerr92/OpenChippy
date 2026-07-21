@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { BlockDefinition, Component, ComponentKind, LogicState, SimulationResult, TerminalRef, Wire } from "./types";
+import { isEditingText } from "./dom";
 
 type Props = {
   fitRevision: number;
@@ -214,7 +215,7 @@ export default function SchematicViewport(props: Props) {
 
   useEffect(() => {
     const panWithArrows = (event: KeyboardEvent) => {
-      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
+      if (isEditingText(event)) return;
       if (event.key === "Home" || event.key.toLowerCase() === "f") {
         event.preventDefault();
         fitToDesign();
