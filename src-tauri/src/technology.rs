@@ -15,9 +15,59 @@ pub struct Technology {
     pub nmos: MosTechnology,
     pub pmos: MosTechnology,
     #[serde(default)]
+    pub physical_parasitics: PhysicalParasiticRules,
+    #[serde(default)]
+    pub tapeout_window: TapeoutWindow,
+    #[serde(default)]
     pub physical_rules: PhysicalRuleDeck,
     #[serde(default)]
     pub physical_planning: PhysicalPlanningRules,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct TapeoutWindow {
+    pub format_version: u32,
+    pub name: String,
+    pub width_um: f64,
+    pub height_um: f64,
+    pub edge_margin_um: f64,
+}
+
+impl Default for TapeoutWindow {
+    fn default() -> Self {
+        Self {
+            format_version: 1,
+            name: "Caravel SKY130 user area".into(),
+            width_um: 2_920.0,
+            height_um: 3_520.0,
+            edge_margin_um: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct PhysicalParasiticRules {
+    pub format_version: u32,
+    pub wire_capacitance_ff_per_um: f64,
+    pub via_capacitance_ff: f64,
+    #[serde(default)]
+    pub layer_capacitance_ff_per_um: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub via_capacitance_overrides_ff: BTreeMap<String, f64>,
+}
+
+impl Default for PhysicalParasiticRules {
+    fn default() -> Self {
+        Self {
+            format_version: 1,
+            wire_capacitance_ff_per_um: 0.16,
+            via_capacitance_ff: 0.05,
+            layer_capacitance_ff_per_um: BTreeMap::new(),
+            via_capacitance_overrides_ff: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -137,6 +187,8 @@ impl Default for Technology {
                 gate_capacitance_ff_per_um: 2.2,
                 diffusion_capacitance_ff_per_um: 1.2,
             },
+            physical_parasitics: PhysicalParasiticRules::default(),
+            tapeout_window: TapeoutWindow::default(),
             physical_rules: PhysicalRuleDeck::default(),
             physical_planning: PhysicalPlanningRules::educational(DEFAULT_MAX_METAL_LAYERS),
         }
@@ -292,6 +344,12 @@ impl Technology {
             self.max_metal_layers,
             &mut diagnostics,
         );
+        validate_physical_parasitics(
+            &self.physical_parasitics,
+            self.max_metal_layers,
+            &mut diagnostics,
+        );
+        validate_tapeout_window(&self.tapeout_window, &mut diagnostics);
         validate_physical_planning(
             &self.physical_planning,
             self.max_metal_layers,
@@ -322,6 +380,8 @@ impl Technology {
             max_metal_layers: file.technology.max_metal_layers,
             nmos: file.nmos,
             pmos: file.pmos,
+            physical_parasitics: file.physical_parasitics,
+            tapeout_window: file.tapeout_window,
             physical_rules: file.physical_rules,
             physical_planning: file.physical_planning,
         };
@@ -352,6 +412,8 @@ impl Technology {
             },
             nmos: self.nmos.clone(),
             pmos: self.pmos.clone(),
+            physical_parasitics: self.physical_parasitics.clone(),
+            tapeout_window: self.tapeout_window.clone(),
             physical_rules: self.physical_rules.clone(),
             physical_planning: self.physical_planning.clone(),
         })
@@ -365,6 +427,10 @@ struct TechnologyFile {
     technology: TechnologyHeader,
     nmos: MosTechnology,
     pmos: MosTechnology,
+    #[serde(default)]
+    physical_parasitics: PhysicalParasiticRules,
+    #[serde(default)]
+    tapeout_window: TapeoutWindow,
     #[serde(default)]
     physical_rules: PhysicalRuleDeck,
     #[serde(default)]
@@ -576,6 +642,114 @@ fn validate_physical_rules(
     }
 }
 
+fn validate_physical_parasitics(
+    parasitics: &PhysicalParasiticRules,
+    max_metal_layers: u16,
+    diagnostics: &mut Vec<TechnologyDiagnostic>,
+) {
+    if parasitics.format_version != 1 {
+        diagnostics.push(TechnologyDiagnostic {
+            code: "unsupported_parasitic_version",
+            field: "physical_parasitics.format_version".into(),
+            message: format!(
+                "Physical parasitic format {} is unsupported; expected 1.",
+                parasitics.format_version
+            ),
+        });
+    }
+    for (field, value) in [
+        (
+            "wire_capacitance_ff_per_um",
+            parasitics.wire_capacitance_ff_per_um,
+        ),
+        ("via_capacitance_ff", parasitics.via_capacitance_ff),
+    ] {
+        validate_non_negative(&format!("physical_parasitics.{field}"), value, diagnostics);
+    }
+    for (name, value) in &parasitics.layer_capacitance_ff_per_um {
+        let valid = name
+            .strip_prefix("metal")
+            .and_then(|index| index.parse::<u16>().ok())
+            .is_some_and(|index| (1..=max_metal_layers).contains(&index));
+        if !valid {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "invalid_parasitic_layer",
+                field: format!("physical_parasitics.layer_capacitance_ff_per_um.{name}"),
+                message: format!(
+                    "Parasitic layer must name metal1 through metal{max_metal_layers}."
+                ),
+            });
+        }
+        validate_non_negative(
+            &format!("physical_parasitics.layer_capacitance_ff_per_um.{name}"),
+            *value,
+            diagnostics,
+        );
+    }
+    for (name, value) in &parasitics.via_capacitance_overrides_ff {
+        let valid = (1..max_metal_layers)
+            .map(|lower| format!("via{lower}{}", lower + 1))
+            .any(|candidate| candidate == *name);
+        if !valid {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "invalid_parasitic_via",
+                field: format!("physical_parasitics.via_capacitance_overrides_ff.{name}"),
+                message: format!(
+                    "Parasitic via must identify adjacent metals within the {max_metal_layers}-layer process."
+                ),
+            });
+        }
+        validate_non_negative(
+            &format!("physical_parasitics.via_capacitance_overrides_ff.{name}"),
+            *value,
+            diagnostics,
+        );
+    }
+}
+
+fn validate_tapeout_window(window: &TapeoutWindow, diagnostics: &mut Vec<TechnologyDiagnostic>) {
+    if window.format_version != 1 {
+        diagnostics.push(TechnologyDiagnostic {
+            code: "unsupported_tapeout_window_version",
+            field: "tapeout_window.format_version".into(),
+            message: format!(
+                "Tapeout-window format {} is unsupported; expected 1.",
+                window.format_version
+            ),
+        });
+    }
+    if window.name.trim().is_empty() {
+        diagnostics.push(TechnologyDiagnostic {
+            code: "missing_tapeout_window_name",
+            field: "tapeout_window.name".into(),
+            message: "Tapeout window name cannot be blank.".into(),
+        });
+    }
+    for (field, value) in [
+        ("width_um", window.width_um),
+        ("height_um", window.height_um),
+    ] {
+        validate_positive(&format!("tapeout_window.{field}"), value, diagnostics);
+    }
+    validate_non_negative(
+        "tapeout_window.edge_margin_um",
+        window.edge_margin_um,
+        diagnostics,
+    );
+    if window.width_um.is_finite()
+        && window.height_um.is_finite()
+        && window.edge_margin_um.is_finite()
+        && (window.edge_margin_um * 2.0 >= window.width_um
+            || window.edge_margin_um * 2.0 >= window.height_um)
+    {
+        diagnostics.push(TechnologyDiagnostic {
+            code: "invalid_tapeout_window_margin",
+            field: "tapeout_window.edge_margin_um".into(),
+            message: "Tapeout edge margin must leave a positive usable width and height.".into(),
+        });
+    }
+}
+
 fn validate_physical_planning(
     planning: &PhysicalPlanningRules,
     max_metal_layers: u16,
@@ -714,6 +888,16 @@ fn validate_positive(field: &str, value: f64, diagnostics: &mut Vec<TechnologyDi
             code: "invalid_physical_rule",
             field: field.into(),
             message: "Physical rule must be a finite positive value.".into(),
+        });
+    }
+}
+
+fn validate_non_negative(field: &str, value: f64, diagnostics: &mut Vec<TechnologyDiagnostic>) {
+    if !value.is_finite() || value < 0.0 {
+        diagnostics.push(TechnologyDiagnostic {
+            code: "invalid_parasitic_parameter",
+            field: field.into(),
+            message: "Parasitic parameter must be finite and non-negative.".into(),
         });
     }
 }
@@ -911,6 +1095,66 @@ pmos:
             super::PhysicalRuleDeck::default()
         );
         assert!(technology.validate().is_ok());
+    }
+
+    #[test]
+    fn older_technology_receives_educational_parasitics() {
+        let mut serialized = serde_json::to_value(Technology::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("physical_parasitics");
+        let technology: Technology = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            technology.physical_parasitics,
+            super::PhysicalParasiticRules::default()
+        );
+        assert!(technology.validate().is_ok());
+    }
+
+    #[test]
+    fn older_technology_receives_the_educational_tapeout_window() {
+        let mut serialized = serde_json::to_value(Technology::default()).unwrap();
+        serialized.as_object_mut().unwrap().remove("tapeout_window");
+        let technology: Technology = serde_json::from_value(serialized).unwrap();
+        assert_eq!(technology.tapeout_window, super::TapeoutWindow::default());
+        assert!(technology.validate().is_ok());
+    }
+
+    #[test]
+    fn example_yaml_loads_and_parasitics_validate() {
+        let technology =
+            Technology::from_yaml(include_str!("../../docs/examples/openchippy-edu-5m.yaml"))
+                .unwrap();
+        assert_eq!(technology.name, "OpenChippy Example EDU 5M");
+        assert_eq!(technology.tapeout_window.width_um, 2_920.0);
+        assert_eq!(technology.tapeout_window.height_um, 3_520.0);
+        assert_eq!(
+            technology.physical_parasitics.layer_capacitance_ff_per_um["metal1"],
+            0.20
+        );
+        assert_eq!(
+            technology.physical_parasitics.via_capacitance_overrides_ff["via45"],
+            0.045
+        );
+
+        let mut invalid = technology;
+        invalid.physical_parasitics.wire_capacitance_ff_per_um = -0.1;
+        invalid
+            .physical_parasitics
+            .layer_capacitance_ff_per_um
+            .insert("metal6".into(), 0.1);
+        invalid.tapeout_window.edge_margin_um = 2_000.0;
+        let diagnostics = invalid.validate().unwrap_err();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "physical_parasitics.wire_capacitance_ff_per_um"
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "physical_parasitics.layer_capacitance_ff_per_um.metal6"
+        }));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.field == "tapeout_window.edge_margin_um" }));
     }
 
     #[test]

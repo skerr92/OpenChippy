@@ -1,5 +1,7 @@
 mod history;
 mod model;
+#[allow(dead_code)]
+mod physical_canvas;
 mod physical_detailed_routing;
 mod physical_drc;
 mod physical_global_routing;
@@ -8,6 +10,7 @@ mod physical_placement;
 mod physical_planning;
 #[allow(dead_code)]
 mod plugins;
+mod rtl;
 mod simulation;
 pub mod technology;
 mod validation;
@@ -18,27 +21,141 @@ use model::{
     CURRENT_FORMAT_VERSION,
 };
 use physical_drc::PhysicalDrcReport;
-use physical_layout::PhysicalLayoutIr;
-use serde::Serialize;
+use physical_layout::{PhysicalLayoutIr, CURRENT_PHYSICAL_IR_VERSION};
+use serde::{Deserialize, Serialize};
 use simulation::{LogicState, SimulationResult, TruthTableResult, WaveformConfig, WaveformResult};
 use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
+    time::Instant,
 };
 use technology::Technology;
 use thiserror::Error;
 use validation::ValidationReport;
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PhysicalInspection {
     layout: PhysicalLayoutIr,
     drc: PhysicalDrcReport,
+    build_report: PhysicalBuildReport,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PhysicalBuildReport {
+    elapsed_ms: u128,
+    stages: Vec<&'static str>,
+    global_routing_overflow: usize,
+    detailed_routing_conflicts: usize,
+    rejected_geometry_count: usize,
 }
 
 const BLOCK_LIBRARY_DIRECTORY: &str = "chippyblocks";
+const OCHIPPY_FORMAT_VERSION: u32 = 1;
+const PHYSICAL_ARTIFACT_FORMAT_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OchippyManifest {
+    format_version: u32,
+    project_name: String,
+    included_files: Vec<OchippyIncludedFile>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OchippyIncludedFile {
+    role: String,
+    path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PhysicalArtifact {
+    format_version: u32,
+    source_project_digest: String,
+    physical_ir: PhysicalLayoutIr,
+}
+
+fn project_digest(project: &Project) -> Result<String, ProjectError> {
+    let bytes = serde_json::to_vec(project)?;
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Ok(format!("fnv1a64:{hash:016x}"))
+}
+
+fn safe_included_path(root: &Path, relative: &str) -> Result<PathBuf, ProjectError> {
+    let path = Path::new(relative);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ProjectError::InvalidAction(
+            ".ochippy included files must stay inside the project directory".into(),
+        ));
+    }
+    Ok(root.join(path))
+}
+
+fn build_physical_artifact(project: &Project) -> Result<PhysicalArtifact, ProjectError> {
+    Ok(PhysicalArtifact {
+        format_version: PHYSICAL_ARTIFACT_FORMAT_VERSION,
+        source_project_digest: project_digest(project)?,
+        physical_ir: physical_layout::normalize_project(project)
+            .map_err(ProjectError::InvalidAction)?,
+    })
+}
+
+fn validate_physical_artifact(
+    artifact: PhysicalArtifact,
+    project: &Project,
+) -> Result<PhysicalArtifact, ProjectError> {
+    if artifact.format_version != PHYSICAL_ARTIFACT_FORMAT_VERSION {
+        return Err(ProjectError::InvalidAction(format!(
+            "unsupported .chippy_gds format version {}",
+            artifact.format_version
+        )));
+    }
+    if artifact.physical_ir.format_version != CURRENT_PHYSICAL_IR_VERSION {
+        return Err(ProjectError::InvalidAction(format!(
+            "cached physical IR version {} is not supported by this build",
+            artifact.physical_ir.format_version
+        )));
+    }
+    if artifact.source_project_digest != project_digest(project)? {
+        return Err(ProjectError::InvalidAction(
+            "cached .chippy_gds does not match the referenced circuit".into(),
+        ));
+    }
+    Ok(artifact)
+}
+
+fn matching_cached_layout(
+    cache: &Option<PhysicalArtifact>,
+    project: &Project,
+) -> Option<PhysicalLayoutIr> {
+    let digest = project_digest(project).ok()?;
+    cache
+        .as_ref()
+        .filter(|artifact| {
+            artifact.format_version == PHYSICAL_ARTIFACT_FORMAT_VERSION
+                && artifact.physical_ir.format_version == CURRENT_PHYSICAL_IR_VERSION
+                && artifact.source_project_digest == digest
+        })
+        .map(|artifact| artifact.physical_ir.clone())
+}
 
 fn block_library_directory(project_path: &Path) -> PathBuf {
     project_path
@@ -117,6 +234,7 @@ struct Workspace {
     history: ProjectHistory,
     path: Option<String>,
     saved: Project,
+    physical_cache: Option<PhysicalArtifact>,
 }
 
 impl Default for Workspace {
@@ -126,6 +244,7 @@ impl Default for Workspace {
             history: ProjectHistory::default(),
             path: None,
             saved: project,
+            physical_cache: None,
         }
     }
 }
@@ -145,6 +264,19 @@ impl Workspace {
         self.saved = project.clone();
         self.history.reset(project);
         self.path = path;
+        self.physical_cache = None;
+    }
+
+    fn reset_with_cache(
+        &mut self,
+        project: Project,
+        path: Option<String>,
+        physical_cache: Option<PhysicalArtifact>,
+    ) {
+        self.saved = project.clone();
+        self.history.reset(project);
+        self.path = path;
+        self.physical_cache = physical_cache;
     }
 }
 
@@ -496,6 +628,38 @@ fn rename_project(
 }
 
 #[tauri::command]
+fn set_timing_target(
+    target_ns: Option<f64>,
+    state: tauri::State<AppState>,
+) -> Result<WorkspaceState, ProjectError> {
+    let mut workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| ProjectError::StateUnavailable)?;
+    workspace
+        .history
+        .try_update(|project| project.set_timing_target(target_ns))
+        .map_err(ProjectError::InvalidAction)?;
+    Ok(workspace.state())
+}
+
+#[tauri::command]
+fn set_high_fanout_warning_threshold(
+    threshold: usize,
+    state: tauri::State<AppState>,
+) -> Result<WorkspaceState, ProjectError> {
+    let mut workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| ProjectError::StateUnavailable)?;
+    workspace
+        .history
+        .try_update(|project| project.set_high_fanout_warning_threshold(threshold))
+        .map_err(ProjectError::InvalidAction)?;
+    Ok(workspace.state())
+}
+
+#[tauri::command]
 fn set_waveform_groups(
     groups: Vec<WaveformGroup>,
     state: tauri::State<AppState>,
@@ -523,17 +687,64 @@ fn validate_project(state: tauri::State<AppState>) -> Result<ValidationReport, P
 }
 
 #[tauri::command]
+fn parse_verilog(source: String) -> Result<rtl::RtlModule, ProjectError> {
+    rtl::parse_structural_verilog(&source).map_err(ProjectError::InvalidAction)
+}
+
+#[tauri::command]
+fn read_verilog_source(path: String) -> Result<String, ProjectError> {
+    Ok(fs::read_to_string(Path::new(&path))?)
+}
+
+#[tauri::command]
+fn import_verilog(
+    source: String,
+    state: tauri::State<AppState>,
+) -> Result<WorkspaceState, ProjectError> {
+    let module = rtl::parse_structural_verilog(&source).map_err(ProjectError::InvalidAction)?;
+    let design = rtl::map_module(module);
+    let mut workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| ProjectError::StateUnavailable)?;
+    workspace
+        .history
+        .update(|project| project.set_rtl_design(design));
+    Ok(workspace.state())
+}
+
+#[tauri::command]
+fn export_verilog(state: tauri::State<AppState>) -> Result<String, ProjectError> {
+    let workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| ProjectError::StateUnavailable)?;
+    let project = workspace.history.current();
+    let design = project.rtl_design.as_ref().ok_or_else(|| {
+        ProjectError::InvalidAction(
+            "this project does not contain an imported logical RTL design".into(),
+        )
+    })?;
+    Ok(rtl::export_structural_verilog(&design.module))
+}
+
+#[tauri::command]
+fn save_text_file(path: String, data: String) -> Result<String, ProjectError> {
+    fs::write(Path::new(&path), data)?;
+    Ok(path)
+}
+
+#[tauri::command]
 fn generate_physical_ir(state: tauri::State<AppState>) -> Result<PhysicalLayoutIr, ProjectError> {
     let workspace = state
         .workspace
         .lock()
         .map_err(|_| ProjectError::StateUnavailable)?;
-    let flattened = workspace
-        .history
-        .current()
-        .flattened()
-        .map_err(ProjectError::InvalidAction)?;
-    physical_layout::normalize(&flattened).map_err(ProjectError::InvalidAction)
+    let project = workspace.history.current();
+    if let Some(layout) = matching_cached_layout(&workspace.physical_cache, &project) {
+        return Ok(layout);
+    }
+    physical_layout::normalize_project(&project).map_err(ProjectError::InvalidAction)
 }
 
 #[tauri::command]
@@ -544,31 +755,107 @@ fn validate_physical_layout(
         .workspace
         .lock()
         .map_err(|_| ProjectError::StateUnavailable)?;
-    let flattened = workspace
-        .history
-        .current()
-        .flattened()
-        .map_err(ProjectError::InvalidAction)?;
-    let layout = physical_layout::normalize(&flattened).map_err(ProjectError::InvalidAction)?;
-    Ok(physical_drc::validate(&layout, &flattened.technology))
+    let project = workspace.history.current();
+    let layout = matching_cached_layout(&workspace.physical_cache, &project)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            physical_layout::normalize_project(&project).map_err(ProjectError::InvalidAction)
+        })?;
+    Ok(physical_drc::validate(&layout, &project.technology))
 }
 
 #[tauri::command]
-fn inspect_physical_layout(
-    state: tauri::State<AppState>,
+async fn inspect_physical_layout(
+    state: tauri::State<'_, AppState>,
 ) -> Result<PhysicalInspection, ProjectError> {
-    let workspace = state
+    let (project, cached_layout) = {
+        let workspace = state
+            .workspace
+            .lock()
+            .map_err(|_| ProjectError::StateUnavailable)?;
+        let project = workspace.history.current();
+        let cached = matching_cached_layout(&workspace.physical_cache, &project);
+        (project, cached)
+    };
+    let source_digest = project_digest(&project)?;
+    let project_for_build = project.clone();
+    let inspection = tauri::async_runtime::spawn_blocking(
+        move || -> Result<PhysicalInspection, ProjectError> {
+            let started = Instant::now();
+            let from_cache = cached_layout.is_some();
+            let layout = cached_layout.map(Ok).unwrap_or_else(|| {
+                physical_layout::normalize_project(&project_for_build)
+                    .map_err(ProjectError::InvalidAction)
+            })?;
+            let drc = physical_drc::validate(&layout, &project_for_build.technology);
+            let build_report = PhysicalBuildReport {
+                elapsed_ms: started.elapsed().as_millis(),
+                stages: if from_cache {
+                    vec!["cachedPhysicalIr", "drc", "complete"]
+                } else {
+                    vec![
+                        "initializing",
+                        "placement",
+                        "deviceGeneration",
+                        "localRouting",
+                        "globalRouting",
+                        "physicalIr",
+                        "drc",
+                        "complete",
+                    ]
+                },
+                global_routing_overflow: layout.global_routing.total_overflow,
+                detailed_routing_conflicts: layout.detailed_routing.conflict_count,
+                rejected_geometry_count: layout.detailed_routing.rejected_geometry_count,
+            };
+            Ok(PhysicalInspection {
+                layout,
+                drc,
+                build_report,
+            })
+        },
+    )
+    .await
+    .map_err(|error| {
+        ProjectError::InvalidAction(format!("physical build task failed: {error}"))
+    })??;
+    {
+        let mut workspace = state
+            .workspace
+            .lock()
+            .map_err(|_| ProjectError::StateUnavailable)?;
+        if project_digest(&workspace.history.current())? == source_digest {
+            workspace.physical_cache = Some(PhysicalArtifact {
+                format_version: PHYSICAL_ARTIFACT_FORMAT_VERSION,
+                source_project_digest: source_digest,
+                physical_ir: inspection.layout.clone(),
+            });
+        }
+    }
+    Ok(inspection)
+}
+
+#[tauri::command]
+fn save_physical_layout(
+    path: String,
+    state: tauri::State<AppState>,
+) -> Result<String, ProjectError> {
+    let mut workspace = state
         .workspace
         .lock()
         .map_err(|_| ProjectError::StateUnavailable)?;
-    let flattened = workspace
-        .history
-        .current()
-        .flattened()
-        .map_err(ProjectError::InvalidAction)?;
-    let layout = physical_layout::normalize(&flattened).map_err(ProjectError::InvalidAction)?;
-    let drc = physical_drc::validate(&layout, &flattened.technology);
-    Ok(PhysicalInspection { layout, drc })
+    let project = workspace.history.current();
+    let artifact = match matching_cached_layout(&workspace.physical_cache, &project) {
+        Some(physical_ir) => PhysicalArtifact {
+            format_version: PHYSICAL_ARTIFACT_FORMAT_VERSION,
+            source_project_digest: project_digest(&project)?,
+            physical_ir,
+        },
+        None => build_physical_artifact(&project)?,
+    };
+    fs::write(&path, serde_json::to_string_pretty(&artifact)?)?;
+    workspace.physical_cache = Some(artifact);
+    Ok(path)
 }
 
 #[tauri::command]
@@ -701,6 +988,10 @@ fn generate_truth_table(state: tauri::State<AppState>) -> Result<TruthTableResul
         .workspace
         .lock()
         .map_err(|_| ProjectError::StateUnavailable)?;
+    let project = workspace.history.current();
+    if let Some(design) = &project.rtl_design {
+        return simulation::rtl_truth_table(&design.module).map_err(ProjectError::InvalidAction);
+    }
     let flattened = workspace
         .history
         .current()
@@ -718,6 +1009,11 @@ fn simulate_waveform(
         .workspace
         .lock()
         .map_err(|_| ProjectError::StateUnavailable)?;
+    let project = workspace.history.current();
+    if let Some(design) = &project.rtl_design {
+        return simulation::rtl_waveform(&design.module, config)
+            .map_err(ProjectError::InvalidAction);
+    }
     let flattened = workspace
         .history
         .current()
@@ -746,6 +1042,63 @@ fn redo(state: tauri::State<AppState>) -> Result<WorkspaceState, ProjectError> {
     Ok(workspace.state())
 }
 
+fn load_circuit_file(path: &Path) -> Result<Project, ProjectError> {
+    let mut project: Project = serde_json::from_str(&fs::read_to_string(path)?)?;
+    if project.format_version > CURRENT_FORMAT_VERSION {
+        return Err(ProjectError::UnsupportedVersion {
+            found: project.format_version,
+            supported: CURRENT_FORMAT_VERSION,
+        });
+    }
+    load_block_library(path, &mut project)?;
+    Ok(project)
+}
+
+fn load_project_files(path: &Path) -> Result<(Project, Option<PhysicalArtifact>), ProjectError> {
+    if path.extension().and_then(|extension| extension.to_str()) != Some("ochippy") {
+        return Ok((load_circuit_file(path)?, None));
+    }
+    let manifest: OchippyManifest = serde_json::from_str(&fs::read_to_string(path)?)?;
+    if manifest.format_version != OCHIPPY_FORMAT_VERSION {
+        return Err(ProjectError::InvalidAction(format!(
+            "unsupported .ochippy format version {}",
+            manifest.format_version
+        )));
+    }
+    let root = path.parent().unwrap_or_else(|| Path::new("."));
+    let circuits = manifest
+        .included_files
+        .iter()
+        .filter(|file| file.role == "circuit")
+        .collect::<Vec<_>>();
+    if circuits.len() != 1 {
+        return Err(ProjectError::InvalidAction(
+            ".ochippy must include exactly one circuit file".into(),
+        ));
+    }
+    let circuit_path = safe_included_path(root, &circuits[0].path)?;
+    let project = load_circuit_file(&circuit_path)?;
+    let physical_files = manifest
+        .included_files
+        .iter()
+        .filter(|file| file.role == "physical")
+        .collect::<Vec<_>>();
+    if physical_files.len() > 1 {
+        return Err(ProjectError::InvalidAction(
+            ".ochippy may include at most one physical file".into(),
+        ));
+    }
+    let physical_cache = physical_files
+        .first()
+        .map(|file| -> Result<PhysicalArtifact, ProjectError> {
+            let artifact_path = safe_included_path(root, &file.path)?;
+            let artifact = serde_json::from_str(&fs::read_to_string(artifact_path)?)?;
+            validate_physical_artifact(artifact, &project)
+        })
+        .transpose()?;
+    Ok((project, physical_cache))
+}
+
 #[tauri::command]
 fn save_project(
     path: Option<String>,
@@ -759,9 +1112,53 @@ fn save_project(
         .or_else(|| workspace.path.clone())
         .ok_or(ProjectError::MissingPath)?;
     let project = workspace.history.current();
-    let data = serde_json::to_string_pretty(&project)?;
-    fs::write(Path::new(&destination), data)?;
-    save_block_library(Path::new(&destination), &project.block_definitions)?;
+    let destination_path = Path::new(&destination);
+    if destination_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        == Some("ochippy")
+    {
+        let root = destination_path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = destination_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("project");
+        let circuit_name = format!("{stem}.chippy");
+        let physical_name = format!("{stem}.chippy_gds");
+        let circuit_path = root.join(&circuit_name);
+        let physical_path = root.join(&physical_name);
+        let artifact = match matching_cached_layout(&workspace.physical_cache, &project) {
+            Some(physical_ir) => PhysicalArtifact {
+                format_version: PHYSICAL_ARTIFACT_FORMAT_VERSION,
+                source_project_digest: project_digest(&project)?,
+                physical_ir,
+            },
+            None => build_physical_artifact(&project)?,
+        };
+        fs::write(&circuit_path, serde_json::to_string_pretty(&project)?)?;
+        fs::write(&physical_path, serde_json::to_string_pretty(&artifact)?)?;
+        let manifest = OchippyManifest {
+            format_version: OCHIPPY_FORMAT_VERSION,
+            project_name: project.name.clone(),
+            included_files: vec![
+                OchippyIncludedFile {
+                    role: "circuit".into(),
+                    path: circuit_name,
+                },
+                OchippyIncludedFile {
+                    role: "physical".into(),
+                    path: physical_name,
+                },
+            ],
+        };
+        fs::write(destination_path, serde_json::to_string_pretty(&manifest)?)?;
+        save_block_library(&circuit_path, &project.block_definitions)?;
+        workspace.physical_cache = Some(artifact);
+    } else {
+        fs::write(destination_path, serde_json::to_string_pretty(&project)?)?;
+        save_block_library(destination_path, &project.block_definitions)?;
+    }
     workspace.saved = project;
     workspace.path = Some(destination);
     Ok(workspace.state())
@@ -772,20 +1169,12 @@ fn load_project(
     path: String,
     state: tauri::State<AppState>,
 ) -> Result<WorkspaceState, ProjectError> {
-    let project_path = Path::new(&path);
-    let mut project: Project = serde_json::from_str(&fs::read_to_string(project_path)?)?;
-    if project.format_version > CURRENT_FORMAT_VERSION {
-        return Err(ProjectError::UnsupportedVersion {
-            found: project.format_version,
-            supported: CURRENT_FORMAT_VERSION,
-        });
-    }
-    load_block_library(project_path, &mut project)?;
+    let (project, physical_cache) = load_project_files(Path::new(&path))?;
     let mut workspace = state
         .workspace
         .lock()
         .map_err(|_| ProjectError::StateUnavailable)?;
-    workspace.reset(project, Some(path));
+    workspace.reset_with_cache(project, Some(path), physical_cache);
     Ok(workspace.state())
 }
 
@@ -819,11 +1208,19 @@ pub fn run() {
             set_device_geometry,
             device_characteristics,
             rename_project,
+            set_timing_target,
+            set_high_fanout_warning_threshold,
             set_waveform_groups,
             validate_project,
+            parse_verilog,
+            read_verilog_source,
+            import_verilog,
+            export_verilog,
+            save_text_file,
             generate_physical_ir,
             validate_physical_layout,
             inspect_physical_layout,
+            save_physical_layout,
             save_physical_drc_report,
             capture_block,
             place_block,
@@ -846,10 +1243,11 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_block_library, save_block_library, save_physical_drc_report, Workspace,
-        BLOCK_LIBRARY_DIRECTORY,
+        build_physical_artifact, load_block_library, load_project_files, save_block_library,
+        save_physical_drc_report, OchippyIncludedFile, OchippyManifest, Workspace,
+        BLOCK_LIBRARY_DIRECTORY, OCHIPPY_FORMAT_VERSION,
     };
-    use crate::model::Project;
+    use crate::model::{Project, TerminalRef};
     use std::fs;
 
     #[test]
@@ -914,6 +1312,121 @@ mod tests {
         load_block_library(&project_path, &mut loaded).unwrap();
         assert_eq!(loaded.block_definitions.len(), 1);
         assert_eq!(loaded.block_definitions[0].name, "Reusable Gate");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ochippy_manifest_loads_circuit_and_matching_physical_cache() {
+        let root =
+            std::env::temp_dir().join(format!("openchippy-project-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let circuit_path = root.join("inverter.chippy");
+        let physical_path = root.join("inverter.chippy_gds");
+        let manifest_path = root.join("inverter.ochippy");
+        let mut project = Project::default();
+        project.name = "Cached inverter".into();
+        let vdd = project.add_component("vdd", 0.0, -4.0).unwrap();
+        let gnd = project.add_component("gnd", 0.0, 4.0).unwrap();
+        let input = project.add_component("input", -4.0, 0.0).unwrap();
+        let output = project.add_component("output", 4.0, 0.0).unwrap();
+        let pmos = project.add_component("pmos", 0.0, -1.0).unwrap();
+        let nmos = project.add_component("nmos", 0.0, 1.0).unwrap();
+        let terminal = |component_id, terminal: &str| TerminalRef {
+            component_id,
+            terminal: terminal.into(),
+        };
+        project
+            .connect(terminal(input, "out"), terminal(pmos, "gate"))
+            .unwrap();
+        project
+            .connect(terminal(input, "out"), terminal(nmos, "gate"))
+            .unwrap();
+        project
+            .connect(terminal(vdd, "out"), terminal(pmos, "source"))
+            .unwrap();
+        project
+            .connect(terminal(gnd, "out"), terminal(nmos, "source"))
+            .unwrap();
+        project
+            .connect(terminal(pmos, "drain"), terminal(nmos, "drain"))
+            .unwrap();
+        project
+            .connect(terminal(pmos, "drain"), terminal(output, "in"))
+            .unwrap();
+        let artifact = build_physical_artifact(&project).unwrap();
+        fs::write(
+            &circuit_path,
+            serde_json::to_string_pretty(&project).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &physical_path,
+            serde_json::to_string_pretty(&artifact).unwrap(),
+        )
+        .unwrap();
+        let manifest = OchippyManifest {
+            format_version: OCHIPPY_FORMAT_VERSION,
+            project_name: project.name.clone(),
+            included_files: vec![
+                OchippyIncludedFile {
+                    role: "circuit".into(),
+                    path: "inverter.chippy".into(),
+                },
+                OchippyIncludedFile {
+                    role: "physical".into(),
+                    path: "inverter.chippy_gds".into(),
+                },
+            ],
+        };
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let (loaded, cache) = load_project_files(&manifest_path).unwrap();
+        assert_eq!(loaded.name, project.name);
+        let cached_layout = cache.unwrap().physical_ir;
+        assert_eq!(
+            cached_layout.format_version,
+            artifact.physical_ir.format_version
+        );
+        assert_eq!(cached_layout.devices, artifact.physical_ir.devices);
+        assert_eq!(cached_layout.nets, artifact.physical_ir.nets);
+        assert_eq!(
+            cached_layout.shapes.len(),
+            artifact.physical_ir.shapes.len()
+        );
+        project.name = "Edited after physical generation".into();
+        fs::write(
+            &circuit_path,
+            serde_json::to_string_pretty(&project).unwrap(),
+        )
+        .unwrap();
+        assert!(load_project_files(&manifest_path).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ochippy_manifest_rejects_paths_outside_its_directory() {
+        let root =
+            std::env::temp_dir().join(format!("openchippy-project-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join("unsafe.ochippy");
+        let manifest = OchippyManifest {
+            format_version: OCHIPPY_FORMAT_VERSION,
+            project_name: "Unsafe".into(),
+            included_files: vec![OchippyIncludedFile {
+                role: "circuit".into(),
+                path: "../outside.chippy".into(),
+            }],
+        };
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(load_project_files(&manifest_path).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,9 +1,10 @@
 use crate::{
+    physical_canvas::{ObstructionType, PhysicalCanvas},
     physical_layout::{PhysicalLayer, PhysicalLayoutIr, PhysicalShape},
     technology::{CutRule, LayerRule, Technology},
 };
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 const EPSILON: f64 = 1e-7;
 
@@ -13,6 +14,31 @@ const EPSILON: f64 = 1e-7;
 pub enum PhysicalDrcSeverity {
     Error,
     Warning,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub enum PhysicalDrcCategory {
+    DeviceOverlap,
+    MetalOverlap,
+    MinimumSpacing,
+    ViaEnclosure,
+    PowerCollision,
+    RoutingCongestion,
+    BoundaryViolation,
+    Geometry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub enum PhysicalDrcOrigin {
+    Placement,
+    PowerRouting,
+    SignalRouting,
+    GeometryGeneration,
+    Import,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -25,6 +51,8 @@ pub struct PhysicalDrcDiagnostic {
     pub shape_indices: Vec<usize>,
     pub measured: f64,
     pub required: f64,
+    pub category: PhysicalDrcCategory,
+    pub origin: PhysicalDrcOrigin,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -33,6 +61,8 @@ pub struct PhysicalDrcReport {
     pub diagnostics: Vec<PhysicalDrcDiagnostic>,
     pub error_count: usize,
     pub warning_count: usize,
+    pub by_category: BTreeMap<String, usize>,
+    pub by_origin: BTreeMap<String, usize>,
 }
 
 impl PhysicalDrcReport {
@@ -45,6 +75,7 @@ impl PhysicalDrcReport {
         measured: f64,
         required: f64,
     ) {
+        let (category, origin) = classify(rule_id, layer, measured);
         self.diagnostics.push(PhysicalDrcDiagnostic {
             rule_id: rule_id.into(),
             severity: PhysicalDrcSeverity::Error,
@@ -53,8 +84,90 @@ impl PhysicalDrcReport {
             shape_indices,
             measured,
             required,
+            category,
+            origin,
         });
+        *self
+            .by_category
+            .entry(category_key(category).into())
+            .or_default() += 1;
+        *self.by_origin.entry(origin_key(origin).into()).or_default() += 1;
         self.error_count += 1;
+    }
+}
+
+fn classify(
+    rule_id: &str,
+    layer: PhysicalLayer,
+    measured: f64,
+) -> (PhysicalDrcCategory, PhysicalDrcOrigin) {
+    if rule_id.contains("BOUNDARY") {
+        return (
+            PhysicalDrcCategory::BoundaryViolation,
+            PhysicalDrcOrigin::Placement,
+        );
+    }
+    if rule_id.contains("ENCLOSURE")
+        && matches!(layer, PhysicalLayer::Contact | PhysicalLayer::Via(_))
+    {
+        return (
+            PhysicalDrcCategory::ViaEnclosure,
+            PhysicalDrcOrigin::SignalRouting,
+        );
+    }
+    if rule_id.ends_with("MIN_SPACING") {
+        return match layer {
+            PhysicalLayer::Metal(_) if measured <= EPSILON => (
+                PhysicalDrcCategory::MetalOverlap,
+                PhysicalDrcOrigin::SignalRouting,
+            ),
+            PhysicalLayer::Metal(_) | PhysicalLayer::Via(_) | PhysicalLayer::Contact => (
+                PhysicalDrcCategory::MinimumSpacing,
+                PhysicalDrcOrigin::SignalRouting,
+            ),
+            _ if measured <= EPSILON => (
+                PhysicalDrcCategory::DeviceOverlap,
+                PhysicalDrcOrigin::Placement,
+            ),
+            _ => (
+                PhysicalDrcCategory::MinimumSpacing,
+                PhysicalDrcOrigin::Placement,
+            ),
+        };
+    }
+    let origin = match layer {
+        PhysicalLayer::Nwell
+        | PhysicalLayer::Ndiff
+        | PhysicalLayer::Pdiff
+        | PhysicalLayer::Poly => PhysicalDrcOrigin::Placement,
+        PhysicalLayer::Metal(_) | PhysicalLayer::Via(_) | PhysicalLayer::Contact => {
+            PhysicalDrcOrigin::SignalRouting
+        }
+        PhysicalLayer::Substrate => PhysicalDrcOrigin::GeometryGeneration,
+    };
+    (PhysicalDrcCategory::Geometry, origin)
+}
+
+fn category_key(category: PhysicalDrcCategory) -> &'static str {
+    match category {
+        PhysicalDrcCategory::DeviceOverlap => "deviceOverlap",
+        PhysicalDrcCategory::MetalOverlap => "metalOverlap",
+        PhysicalDrcCategory::MinimumSpacing => "minimumSpacing",
+        PhysicalDrcCategory::ViaEnclosure => "viaEnclosure",
+        PhysicalDrcCategory::PowerCollision => "powerCollision",
+        PhysicalDrcCategory::RoutingCongestion => "routingCongestion",
+        PhysicalDrcCategory::BoundaryViolation => "boundaryViolation",
+        PhysicalDrcCategory::Geometry => "geometry",
+    }
+}
+
+fn origin_key(origin: PhysicalDrcOrigin) -> &'static str {
+    match origin {
+        PhysicalDrcOrigin::Placement => "placement",
+        PhysicalDrcOrigin::PowerRouting => "powerRouting",
+        PhysicalDrcOrigin::SignalRouting => "signalRouting",
+        PhysicalDrcOrigin::GeometryGeneration => "geometryGeneration",
+        PhysicalDrcOrigin::Import => "import",
     }
 }
 
@@ -131,6 +244,17 @@ fn spacing(left: &PhysicalShape, right: &PhysicalShape) -> f64 {
 
 fn aligned(value: f64, grid: f64) -> bool {
     ((value / grid) - (value / grid).round()).abs() <= EPSILON
+}
+
+fn obstruction_type(layer: PhysicalLayer) -> ObstructionType {
+    match layer {
+        PhysicalLayer::Ndiff | PhysicalLayer::Pdiff => ObstructionType::Diffusion,
+        PhysicalLayer::Poly => ObstructionType::Poly,
+        PhysicalLayer::Contact => ObstructionType::Contact,
+        PhysicalLayer::Metal(_) => ObstructionType::Metal,
+        PhysicalLayer::Via(_) => ObstructionType::Via,
+        PhysicalLayer::Nwell | PhysicalLayer::Substrate => ObstructionType::Device,
+    }
 }
 
 pub fn validate(ir: &PhysicalLayoutIr, technology: &Technology) -> PhysicalDrcReport {
@@ -225,6 +349,17 @@ pub fn validate(ir: &PhysicalLayoutIr, technology: &Technology) -> PhysicalDrcRe
         }
     }
 
+    let mut spatial = PhysicalCanvas::new(&technology.physical_rules);
+    let mut shape_by_occupied_id = HashMap::with_capacity(ir.shapes.len());
+    for (shape_index, shape) in ir.shapes.iter().enumerate() {
+        let occupied_id = spatial.index_unchecked(
+            shape,
+            format!("drc-shape-{shape_index}"),
+            obstruction_type(shape.layer),
+        );
+        shape_by_occupied_id.insert(occupied_id, shape_index);
+    }
+
     for left_index in 0..ir.shapes.len() {
         let left = &ir.shapes[left_index];
         let required = layer_rule(left.layer, technology)
@@ -233,11 +368,12 @@ pub fn validate(ir: &PhysicalLayoutIr, technology: &Technology) -> PhysicalDrcRe
         let Some(required) = required else {
             continue;
         };
-        for right_index in (left_index + 1)..ir.shapes.len() {
-            let right = &ir.shapes[right_index];
-            if right.layer != left.layer {
+        for neighbor in spatial.query_neighbors(left) {
+            let right_index = shape_by_occupied_id[&neighbor.id];
+            if right_index <= left_index {
                 continue;
             }
+            let right = &ir.shapes[right_index];
             // Continuous same-net layers may merge into one conductor. Cuts
             // remain discrete manufactured features, so contact/via spacing
             // applies even when both cuts belong to the same electrical net.
@@ -416,6 +552,35 @@ fn coalesce_spacing_diagnostics(
             &right.shape_indices,
         ))
     });
+    for diagnostic in &mut result.diagnostics {
+        let power_related = diagnostic.shape_indices.iter().any(|index| {
+            let Some(net_id) = ir.shapes.get(*index).and_then(|shape| shape.net) else {
+                return false;
+            };
+            ir.nets.iter().any(|net| {
+                net.id == net_id
+                    && matches!(
+                        net.role,
+                        crate::physical_layout::NetRole::Power
+                            | crate::physical_layout::NetRole::Ground
+                    )
+            })
+        });
+        if power_related && matches!(diagnostic.origin, PhysicalDrcOrigin::SignalRouting) {
+            diagnostic.origin = PhysicalDrcOrigin::PowerRouting;
+            if matches!(diagnostic.category, PhysicalDrcCategory::MetalOverlap) {
+                diagnostic.category = PhysicalDrcCategory::PowerCollision;
+            }
+        }
+        *result
+            .by_category
+            .entry(category_key(diagnostic.category).into())
+            .or_default() += 1;
+        *result
+            .by_origin
+            .entry(origin_key(diagnostic.origin).into())
+            .or_default() += 1;
+    }
     result.error_count = result
         .diagnostics
         .iter()
@@ -449,6 +614,21 @@ mod tests {
             placement: Default::default(),
             global_routing: Default::default(),
             detailed_routing: Default::default(),
+            timing: Default::default(),
+            tapeout: crate::physical_layout::PhysicalTapeoutReport {
+                name: "fixture".into(),
+                width_um: 10.0,
+                height_um: 10.0,
+                edge_margin_um: 0.0,
+                usable_width_um: 10.0,
+                usable_height_um: 10.0,
+                geometry_width_um: 0.0,
+                geometry_height_um: 0.0,
+                area_utilization: 0.0,
+                fits: true,
+                shapes_outside_floorplan: 0,
+                shapes_outside_tapeout: 0,
+            },
             bounds: PhysicalBounds {
                 min_x: -2.0,
                 min_y: -2.0,
@@ -456,6 +636,7 @@ mod tests {
                 max_y: 2.0,
             },
             shapes,
+            physical_blocks: vec![],
         }
     }
 
@@ -487,6 +668,14 @@ mod tests {
         assert!(ids.contains(&"GEOMETRY.MIN_WIDTH"));
         assert!(ids.contains(&"GEOMETRY.MIN_AREA"));
         assert!(ids.contains(&"GEOMETRY.MIN_SPACING"));
+        assert_eq!(
+            report.by_category.values().sum::<usize>(),
+            report.diagnostics.len()
+        );
+        assert_eq!(
+            report.by_origin.values().sum::<usize>(),
+            report.diagnostics.len()
+        );
     }
 
     #[test]

@@ -1,16 +1,18 @@
 use crate::model::{Component, Project, TerminalRef};
+use crate::physical_canvas::{device_footprint, ObstructionType, PhysicalCanvas};
 use crate::physical_detailed_routing::{self, DetailedRoutingReport};
+use crate::physical_drc;
 use crate::physical_global_routing::{self, GlobalRoutingReport};
 use crate::physical_placement::{self, PhysicalPlacementReport};
 use crate::physical_planning::{self, PhysicalPlanningReport};
 use crate::technology::PhysicalRuleDeck;
-use serde::{Serialize, Serializer};
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize, Serializer};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
-pub const CURRENT_PHYSICAL_IR_VERSION: u32 = 1;
+pub const CURRENT_PHYSICAL_IR_VERSION: u32 = 2;
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhysicalLayoutIr {
     pub format_version: u32,
@@ -24,15 +26,462 @@ pub struct PhysicalLayoutIr {
     pub placement: PhysicalPlacementReport,
     pub global_routing: GlobalRoutingReport,
     pub detailed_routing: DetailedRoutingReport,
+    pub timing: PhysicalTimingReport,
+    pub tapeout: PhysicalTapeoutReport,
     pub bounds: PhysicalBounds,
     pub shapes: Vec<PhysicalShape>,
+    pub physical_blocks: Vec<PhysicalBlockImplementation>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalBlockImplementation {
+    pub instance_name: String,
+    pub bounds: PhysicalBounds,
+    pub device_ids: Vec<Uuid>,
+    pub local_nets: Vec<usize>,
+    pub interface_pins: Vec<PhysicalBlockPin>,
+    pub shape_indices: Vec<usize>,
+    pub local_drc_errors: usize,
+    pub verified: bool,
+    pub immutable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalBlockPin {
+    pub name: String,
+    pub net: usize,
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalTapeoutReport {
+    pub name: String,
+    pub width_um: f64,
+    pub height_um: f64,
+    pub edge_margin_um: f64,
+    pub usable_width_um: f64,
+    pub usable_height_um: f64,
+    pub geometry_width_um: f64,
+    pub geometry_height_um: f64,
+    pub area_utilization: f64,
+    pub fits: bool,
+    pub shapes_outside_floorplan: usize,
+    pub shapes_outside_tapeout: usize,
+}
+
+fn physical_tapeout(
+    shapes: &[PhysicalShape],
+    floorplan: &PhysicalBounds,
+    project: &Project,
+) -> PhysicalTapeoutReport {
+    let window = &project.technology.tapeout_window;
+    let usable_width = window.width_um - 2.0 * window.edge_margin_um;
+    let usable_height = window.height_um - 2.0 * window.edge_margin_um;
+    let usable_left = -usable_width / 2.0;
+    let usable_right = usable_width / 2.0;
+    let usable_top = -usable_height / 2.0;
+    let usable_bottom = usable_height / 2.0;
+    let outside = |shape: &PhysicalShape, left: f64, top: f64, right: f64, bottom: f64| {
+        shape.x - shape.width / 2.0 < left
+            || shape.x + shape.width / 2.0 > right
+            || shape.y - shape.height / 2.0 < top
+            || shape.y + shape.height / 2.0 > bottom
+    };
+    let shapes_outside_floorplan = shapes
+        .iter()
+        .filter(|shape| {
+            outside(
+                shape,
+                floorplan.min_x,
+                floorplan.min_y,
+                floorplan.max_x,
+                floorplan.max_y,
+            )
+        })
+        .count();
+    let shapes_outside_tapeout = shapes
+        .iter()
+        .filter(|shape| outside(shape, usable_left, usable_top, usable_right, usable_bottom))
+        .count();
+    let (geometry_left, geometry_top, geometry_right, geometry_bottom) = shapes.iter().fold(
+        (
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ),
+        |(left, top, right, bottom), shape| {
+            (
+                left.min(shape.x - shape.width / 2.0),
+                top.min(shape.y - shape.height / 2.0),
+                right.max(shape.x + shape.width / 2.0),
+                bottom.max(shape.y + shape.height / 2.0),
+            )
+        },
+    );
+    let geometry_width = if shapes.is_empty() {
+        0.0
+    } else {
+        geometry_right - geometry_left
+    };
+    let geometry_height = if shapes.is_empty() {
+        0.0
+    } else {
+        geometry_bottom - geometry_top
+    };
+    PhysicalTapeoutReport {
+        name: window.name.clone(),
+        width_um: window.width_um,
+        height_um: window.height_um,
+        edge_margin_um: window.edge_margin_um,
+        usable_width_um: usable_width,
+        usable_height_um: usable_height,
+        geometry_width_um: geometry_width,
+        geometry_height_um: geometry_height,
+        area_utilization: geometry_width * geometry_height / (usable_width * usable_height),
+        fits: shapes_outside_tapeout == 0,
+        shapes_outside_floorplan,
+        shapes_outside_tapeout,
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalTimingReport {
+    pub nets: Vec<PhysicalNetTiming>,
+    pub paths: Vec<PhysicalTimingPath>,
+    pub candidates: Vec<PhysicalCandidateTiming>,
+    pub selected_candidate: Option<usize>,
+    pub critical_path: Option<usize>,
+    pub timing_target_ns: Option<f64>,
+    pub worst_slack_ns: Option<f64>,
+    pub critical_net: Option<usize>,
+    pub critical_net_name: Option<String>,
+    pub estimated_worst_delay_ns: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalCandidateTiming {
+    pub candidate: usize,
+    pub floorplan_candidate: usize,
+    pub placement_candidate: usize,
+    pub strategy: crate::physical_planning::FloorplanStrategy,
+    pub timing_driven: bool,
+    pub area_um2: f64,
+    pub total_wire_length_um: f64,
+    pub total_via_count: usize,
+    pub routing_overflow: usize,
+    pub detail_conflicts: usize,
+    pub estimated_worst_delay_ns: f64,
+    pub slack_ns: Option<f64>,
+    pub meets_timing: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalTimingPath {
+    pub input_pin: String,
+    pub output_pin: String,
+    pub nets: Vec<usize>,
+    pub net_names: Vec<String>,
+    pub device_ids: Vec<Uuid>,
+    pub device_names: Vec<String>,
+    pub estimated_delay_ns: f64,
+    pub required_time_ns: Option<f64>,
+    pub slack_ns: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalNetTiming {
+    pub net: usize,
+    pub name: String,
+    pub fanout: usize,
+    pub wire_length_um: f64,
+    pub via_count: usize,
+    pub routed_capacitance_ff: f64,
+    pub device_capacitance_ff: f64,
+    pub total_capacitance_ff: f64,
+    pub estimated_delay_ns: f64,
+}
+
+fn physical_timing(
+    nets: &[PhysicalNet],
+    devices: &[PhysicalDevice],
+    pins: &[PhysicalPin],
+    detailed: &DetailedRoutingReport,
+    project: &Project,
+) -> PhysicalTimingReport {
+    let routes = detailed
+        .routes
+        .iter()
+        .map(|route| (route.net, route))
+        .collect::<HashMap<_, _>>();
+    let mut metrics = nets
+        .iter()
+        .map(|net| {
+            let route = routes.get(&net.id).copied();
+            let wire_length_um = route.map_or(0.0, |route| route.wire_length_um);
+            let via_count = route.map_or(0, |route| route.via_count);
+            let routed_capacitance_ff = route.map_or(0.0, |route| {
+                let wire = route
+                    .layer_wire_lengths_um
+                    .iter()
+                    .map(|(layer, length)| {
+                        let coefficient = project
+                            .technology
+                            .physical_parasitics
+                            .layer_capacitance_ff_per_um
+                            .get(layer)
+                            .copied()
+                            .unwrap_or(
+                                project
+                                    .technology
+                                    .physical_parasitics
+                                    .wire_capacitance_ff_per_um,
+                            );
+                        length * coefficient
+                    })
+                    .sum::<f64>();
+                let vias = route
+                    .via_counts
+                    .iter()
+                    .map(|(via, count)| {
+                        let coefficient = project
+                            .technology
+                            .physical_parasitics
+                            .via_capacitance_overrides_ff
+                            .get(via)
+                            .copied()
+                            .unwrap_or(project.technology.physical_parasitics.via_capacitance_ff);
+                        *count as f64 * coefficient
+                    })
+                    .sum::<f64>();
+                wire + vias
+            });
+            let mut device_capacitance_ff = 0.0;
+            let mut fanout = 0;
+            let mut driver_resistance_ohms = f64::INFINITY;
+            for device in devices {
+                let process = match device.kind {
+                    DeviceKind::Nmos => &project.technology.nmos,
+                    DeviceKind::Pmos => &project.technology.pmos,
+                };
+                if device.gate_net == net.id {
+                    fanout += 1;
+                    device_capacitance_ff += process.gate_capacitance_ff_per_um * device.width_um;
+                }
+                if device.drain_net == net.id || device.source_net == net.id {
+                    device_capacitance_ff +=
+                        process.diffusion_capacitance_ff_per_um * device.width_um;
+                    let resistance = process.nominal_on_resistance_ohms
+                        * (device.length_um / process.reference_length_um)
+                        * (process.reference_width_um / device.width_um);
+                    driver_resistance_ohms = driver_resistance_ohms.min(resistance);
+                }
+            }
+            let total_capacitance_ff = routed_capacitance_ff + device_capacitance_ff;
+            let estimated_delay_ns = if driver_resistance_ohms.is_finite() {
+                0.69 * driver_resistance_ohms * total_capacitance_ff * 1e-6
+            } else {
+                0.0
+            };
+            PhysicalNetTiming {
+                net: net.id,
+                name: net.name.clone(),
+                fanout,
+                wire_length_um,
+                via_count,
+                routed_capacitance_ff,
+                device_capacitance_ff,
+                total_capacitance_ff,
+                estimated_delay_ns,
+            }
+        })
+        .collect::<Vec<_>>();
+    metrics.sort_by_key(|metric| metric.net);
+    let critical = metrics
+        .iter()
+        .filter(|metric| !matches!(nets[metric.net].role, NetRole::Power | NetRole::Ground))
+        .max_by(|left, right| left.estimated_delay_ns.total_cmp(&right.estimated_delay_ns));
+    let mut edge_devices = BTreeMap::<(usize, usize), Vec<(Uuid, String)>>::new();
+    for device in devices {
+        for target in [device.drain_net, device.source_net] {
+            if target == device.gate_net
+                || matches!(nets[target].role, NetRole::Power | NetRole::Ground)
+            {
+                continue;
+            }
+            edge_devices
+                .entry((device.gate_net, target))
+                .or_default()
+                .push((device.component_id, device.name.clone()));
+        }
+    }
+    for edge in edge_devices.values_mut() {
+        edge.sort_by(|left, right| (&left.1, left.0).cmp(&(&right.1, right.0)));
+        edge.dedup_by_key(|device| device.0);
+    }
+    let mut adjacency = BTreeMap::<usize, Vec<(usize, Vec<(Uuid, String)>)>>::new();
+    for ((from, to), edge) in edge_devices {
+        adjacency.entry(from).or_default().push((to, edge));
+    }
+    let outputs = pins
+        .iter()
+        .filter(|pin| pin.role == NetRole::Output)
+        .map(|pin| (pin.net, pin.name.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut paths = Vec::new();
+    for input in pins.iter().filter(|pin| pin.role == NetRole::Input) {
+        let mut stack = vec![(
+            input.net,
+            vec![input.net],
+            Vec::<Uuid>::new(),
+            Vec::<String>::new(),
+            HashSet::from([input.net]),
+        )];
+        while let Some((net, path_nets, device_ids, device_names, visited)) = stack.pop() {
+            if let Some(output_pin) = outputs.get(&net) {
+                let estimated_delay_ns = path_nets
+                    .iter()
+                    .skip(1)
+                    .map(|net| metrics[*net].estimated_delay_ns)
+                    .sum();
+                paths.push(PhysicalTimingPath {
+                    input_pin: input.name.clone(),
+                    output_pin: output_pin.clone(),
+                    net_names: path_nets
+                        .iter()
+                        .map(|net| nets[*net].name.clone())
+                        .collect(),
+                    estimated_delay_ns,
+                    required_time_ns: project.timing_target_ns,
+                    slack_ns: project
+                        .timing_target_ns
+                        .map(|target| target - estimated_delay_ns),
+                    nets: path_nets.clone(),
+                    device_ids: device_ids.clone(),
+                    device_names: device_names.clone(),
+                });
+            }
+            if path_nets.len() >= nets.len() || paths.len() >= 4096 {
+                continue;
+            }
+            let Some(edges) = adjacency.get(&net) else {
+                continue;
+            };
+            for (next, edge) in edges.iter().rev() {
+                if visited.contains(next) {
+                    continue;
+                }
+                let mut next_nets = path_nets.clone();
+                next_nets.push(*next);
+                let mut next_ids = device_ids.clone();
+                next_ids.extend(edge.iter().map(|device| device.0));
+                let mut next_names = device_names.clone();
+                next_names.extend(edge.iter().map(|device| device.1.clone()));
+                let mut next_visited = visited.clone();
+                next_visited.insert(*next);
+                stack.push((*next, next_nets, next_ids, next_names, next_visited));
+            }
+        }
+    }
+    paths.sort_by(|left, right| {
+        (&left.input_pin, &left.output_pin, &left.nets).cmp(&(
+            &right.input_pin,
+            &right.output_pin,
+            &right.nets,
+        ))
+    });
+    let critical_path = paths
+        .iter()
+        .enumerate()
+        .max_by(|(left_index, left), (right_index, right)| {
+            left.estimated_delay_ns
+                .total_cmp(&right.estimated_delay_ns)
+                .then_with(|| right_index.cmp(left_index))
+        })
+        .map(|(index, _)| index);
+    let estimated_worst_delay_ns = critical_path
+        .map(|index| paths[index].estimated_delay_ns)
+        .unwrap_or_else(|| critical.map_or(0.0, |metric| metric.estimated_delay_ns));
+    PhysicalTimingReport {
+        critical_path,
+        timing_target_ns: project.timing_target_ns,
+        worst_slack_ns: critical_path.and_then(|index| paths[index].slack_ns),
+        paths,
+        candidates: Vec::new(),
+        selected_candidate: None,
+        critical_net: critical.map(|metric| metric.net),
+        critical_net_name: critical.map(|metric| metric.name.clone()),
+        estimated_worst_delay_ns,
+        nets: metrics,
+    }
+}
+
+struct CandidateEvaluation {
+    candidate: usize,
+    placement: PhysicalPlacementReport,
+    global: GlobalRoutingReport,
+    detailed: DetailedRoutingReport,
+    timing: PhysicalTimingReport,
+    summary: PhysicalCandidateTiming,
+}
+
+fn candidate_is_better(left: &CandidateEvaluation, right: &CandidateEvaluation) -> bool {
+    if left.global.total_overflow != right.global.total_overflow {
+        return left.global.total_overflow < right.global.total_overflow;
+    }
+    if left.detailed.conflict_count != right.detailed.conflict_count {
+        return left.detailed.conflict_count < right.detailed.conflict_count;
+    }
+    if let (Some(left_met), Some(right_met)) =
+        (left.summary.meets_timing, right.summary.meets_timing)
+    {
+        if left_met != right_met {
+            return left_met;
+        }
+        if !left_met
+            && left
+                .timing
+                .estimated_worst_delay_ns
+                .total_cmp(&right.timing.estimated_worst_delay_ns)
+                != std::cmp::Ordering::Equal
+        {
+            return left.timing.estimated_worst_delay_ns < right.timing.estimated_worst_delay_ns;
+        }
+    }
+    if left.summary.area_um2.total_cmp(&right.summary.area_um2) != std::cmp::Ordering::Equal {
+        return left.summary.area_um2 < right.summary.area_um2;
+    }
+    if left
+        .detailed
+        .total_wire_length_um
+        .total_cmp(&right.detailed.total_wire_length_um)
+        != std::cmp::Ordering::Equal
+    {
+        return left.detailed.total_wire_length_um < right.detailed.total_wire_length_um;
+    }
+    if left.detailed.total_via_count != right.detailed.total_via_count {
+        return left.detailed.total_via_count < right.detailed.total_via_count;
+    }
+    let left_score = left.placement.candidates[left.placement.selected_candidate].score;
+    let right_score = right.placement.candidates[right.placement.selected_candidate].score;
+    left_score < right_score || (left_score == right_score && left.candidate < right.candidate)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhysicalDevice {
     pub component_id: Uuid,
     pub name: String,
+    /// Largest reusable instance that owns this device after hierarchy flattening.
+    pub physical_group: Option<String>,
     pub kind: DeviceKind,
     pub gate_net: usize,
     pub drain_net: usize,
@@ -41,14 +490,14 @@ pub struct PhysicalDevice {
     pub length_um: f64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeviceKind {
     Nmos,
     Pmos,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhysicalNet {
     pub id: usize,
@@ -57,7 +506,7 @@ pub struct PhysicalNet {
     pub terminals: Vec<PhysicalTerminal>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NetRole {
     Power,
@@ -67,7 +516,7 @@ pub enum NetRole {
     Internal,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhysicalTerminal {
     pub component_id: Uuid,
@@ -75,7 +524,7 @@ pub struct PhysicalTerminal {
     pub terminal: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhysicalPin {
     pub component_id: Uuid,
@@ -84,7 +533,7 @@ pub struct PhysicalPin {
     pub net: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhysicalBounds {
     pub min_x: f64,
@@ -93,7 +542,7 @@ pub struct PhysicalBounds {
     pub max_y: f64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhysicalShape {
     pub layer: PhysicalLayer,
@@ -133,6 +582,42 @@ impl Serialize for PhysicalLayer {
             Self::Via(lower) => format!("via{lower}{}", lower + 1),
         };
         serializer.serialize_str(&name)
+    }
+}
+
+impl<'de> Deserialize<'de> for PhysicalLayer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let name = String::deserialize(deserializer)?;
+        match name.as_str() {
+            "substrate" => Ok(Self::Substrate),
+            "nwell" => Ok(Self::Nwell),
+            "ndiff" => Ok(Self::Ndiff),
+            "pdiff" => Ok(Self::Pdiff),
+            "poly" => Ok(Self::Poly),
+            "contact" => Ok(Self::Contact),
+            _ if name.starts_with("metal") => name[5..]
+                .parse::<u16>()
+                .map(Self::Metal)
+                .map_err(serde::de::Error::custom),
+            _ if name.starts_with("via") => {
+                let digits = &name[3..];
+                (1..digits.len())
+                    .find_map(|split| {
+                        let lower = digits[..split].parse::<u16>().ok()?;
+                        (digits[split..].parse::<u16>().ok()? == lower + 1)
+                            .then_some(Self::Via(lower))
+                    })
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("physical via layer must join adjacent metals")
+                    })
+            }
+            _ => Err(serde::de::Error::custom(format!(
+                "unknown physical layer {name}"
+            ))),
+        }
     }
 }
 
@@ -251,12 +736,14 @@ fn line_shape(
 struct RouteAnchor {
     point: (f64, f64),
     layer: PhysicalLayer,
+    access_bounds: Option<(f64, f64)>,
 }
 
 const ROUTING_LANDING_SIZE: f64 = 0.28;
 const ROUTING_VIA_SIZE: f64 = 0.24;
 const ROUTING_CLEARANCE: f64 = 0.04;
-const TRACK_SPACING: f64 = ROUTING_LANDING_SIZE + ROUTING_CLEARANCE;
+const ROUTING_SNAP_GUARD: f64 = 0.02;
+const TRACK_SPACING: f64 = ROUTING_LANDING_SIZE + ROUTING_CLEARANCE + ROUTING_SNAP_GUARD;
 
 fn add_via_stack(
     shapes: &mut Vec<PhysicalShape>,
@@ -303,9 +790,9 @@ fn route_shape_conflicts(
         let right = shape.x + shape.width / 2.0;
         let bottom = shape.y + shape.height / 2.0;
         let clearance = if matches!(shape.layer, PhysicalLayer::Via(_)) {
-            0.08
+            0.08 + ROUTING_SNAP_GUARD
         } else {
-            ROUTING_CLEARANCE
+            ROUTING_CLEARANCE + ROUTING_SNAP_GUARD
         };
         for other in existing {
             if other.layer != shape.layer || other.net == Some(net) || other.net.is_none() {
@@ -327,42 +814,92 @@ fn route_shape_conflicts(
     conflicting_nets.len()
 }
 
-fn preview_spacing_conflicts(shapes: &[PhysicalShape]) -> usize {
+fn commit_preview_routing(
+    shapes: Vec<PhysicalShape>,
+    rules: &PhysicalRuleDeck,
+) -> (Vec<PhysicalShape>, usize) {
+    let mut canvas = PhysicalCanvas::new(rules);
     let mut conflicts = std::collections::HashSet::new();
-    for (left_index, left) in shapes.iter().enumerate() {
-        let Some(left_net) = left.net else { continue };
-        let clearance = match left.layer {
-            PhysicalLayer::Metal(_) => ROUTING_CLEARANCE,
-            PhysicalLayer::Via(_) => 0.08,
-            _ => continue,
+    let mut accepted = vec![None; shapes.len()];
+    for (shape_index, shape) in shapes.iter().enumerate() {
+        let obstruction = match shape.layer {
+            PhysicalLayer::Ndiff | PhysicalLayer::Pdiff => ObstructionType::Diffusion,
+            PhysicalLayer::Poly => ObstructionType::Poly,
+            PhysicalLayer::Contact => ObstructionType::Contact,
+            PhysicalLayer::Nwell | PhysicalLayer::Substrate => ObstructionType::Device,
+            PhysicalLayer::Metal(_) | PhysicalLayer::Via(_) => continue,
         };
-        let left_edges = (
-            left.x - left.width / 2.0,
-            left.y - left.height / 2.0,
-            left.x + left.width / 2.0,
-            left.y + left.height / 2.0,
-        );
-        for right in shapes.iter().skip(left_index + 1) {
-            let Some(right_net) = right.net else { continue };
-            if right.layer != left.layer || right_net == left_net {
-                continue;
-            }
-            let right_edges = (
-                right.x - right.width / 2.0,
-                right.y - right.height / 2.0,
-                right.x + right.width / 2.0,
-                right.y + right.height / 2.0,
-            );
-            if left_edges.0 < right_edges.2 + clearance
-                && left_edges.2 + clearance > right_edges.0
-                && left_edges.1 < right_edges.3 + clearance
-                && left_edges.3 + clearance > right_edges.1
-            {
-                conflicts.insert((left.layer, left_net.min(right_net), left_net.max(right_net)));
-            }
+        if canvas
+            .commit(shape, format!("preview-fixed-{shape_index}"), obstruction)
+            .is_ok()
+        {
+            accepted[shape_index] = Some(shape.clone());
         }
     }
-    conflicts.len()
+    for (shape_index, shape) in shapes.iter().enumerate() {
+        if !matches!(shape.layer, PhysicalLayer::Metal(_)) {
+            continue;
+        }
+        let net = shape.net.unwrap_or(usize::MAX);
+        if let Err(collisions) = canvas.commit_routing_geometry(
+            std::slice::from_ref(shape),
+            format!("preview-shape-{shape_index}"),
+        ) {
+            for collision in collisions {
+                let other_net = collision.net.unwrap_or(net);
+                conflicts.insert((shape.layer, net.min(other_net), net.max(other_net)));
+            }
+        } else {
+            accepted[shape_index] = Some(shape.clone());
+        }
+    }
+    for (shape_index, shape) in shapes.iter().enumerate() {
+        let PhysicalLayer::Via(lower) = shape.layer else {
+            continue;
+        };
+        let cut = rules
+            .via_overrides
+            .get(&format!("via{lower}{}", lower + 1))
+            .unwrap_or(&rules.via);
+        let enclosed = [PhysicalLayer::Metal(lower), PhysicalLayer::Metal(lower + 1)]
+            .into_iter()
+            .all(|required_layer| {
+                accepted.iter().flatten().any(|metal| {
+                    if metal.layer != required_layer || metal.net != shape.net {
+                        return false;
+                    }
+                    let metal_left = metal.x - metal.width / 2.0;
+                    let metal_top = metal.y - metal.height / 2.0;
+                    let metal_right = metal.x + metal.width / 2.0;
+                    let metal_bottom = metal.y + metal.height / 2.0;
+                    let via_left = shape.x - shape.width / 2.0;
+                    let via_top = shape.y - shape.height / 2.0;
+                    let via_right = shape.x + shape.width / 2.0;
+                    let via_bottom = shape.y + shape.height / 2.0;
+                    metal_left <= via_left - cut.enclosure_um + 1e-9
+                        && metal_top <= via_top - cut.enclosure_um + 1e-9
+                        && metal_right >= via_right + cut.enclosure_um - 1e-9
+                        && metal_bottom >= via_bottom + cut.enclosure_um - 1e-9
+                })
+            });
+        let net = shape.net.unwrap_or(usize::MAX);
+        if !enclosed {
+            conflicts.insert((shape.layer, net, net));
+            continue;
+        }
+        if let Err(collisions) = canvas.commit_routing_geometry(
+            std::slice::from_ref(shape),
+            format!("preview-via-{shape_index}"),
+        ) {
+            for collision in collisions {
+                let other_net = collision.net.unwrap_or(net);
+                conflicts.insert((shape.layer, net.min(other_net), net.max(other_net)));
+            }
+        } else {
+            accepted[shape_index] = Some(shape.clone());
+        }
+    }
+    (accepted.into_iter().flatten().collect(), conflicts.len())
 }
 
 fn compact_preview(
@@ -377,9 +914,10 @@ fn compact_preview(
     let signal_net_count = nets
         .iter()
         .filter(|net| {
-            net.role == NetRole::Input
-                || net.role == NetRole::Output
-                || net.role == NetRole::Internal
+            matches!(
+                net.role,
+                NetRole::Input | NetRole::Output | NetRole::Internal
+            )
         })
         .count();
     let first_horizontal_layer = max_metal_layers.max(2);
@@ -387,9 +925,14 @@ fn compact_preview(
     // Tracks keep distinct Y coordinates even when their horizontal metals differ:
     // a via stack crosses every intermediate metal and would otherwise land on
     // another net sharing the same coordinate.
-    let center_channel = (signal_net_count.max(1) as f64 * TRACK_SPACING + 0.9).max(1.4);
     let selected = &planning.candidates[planning.selected_candidate];
     let selected_placement = &placement.candidates[placement.selected_candidate];
+    let hierarchical = selected_placement.block_regions.len() >= 2;
+    let region_by_group = selected_placement
+        .block_regions
+        .iter()
+        .map(|region| (region.name.as_str(), (region.min_x, region.max_x)))
+        .collect::<HashMap<_, _>>();
     let placed_by_id = selected_placement
         .devices
         .iter()
@@ -405,6 +948,7 @@ fn compact_preview(
         max_x: cell_width / 2.0,
         max_y: cell_height / 2.0,
     };
+    let center_channel = (signal_net_count.max(1) as f64 * TRACK_SPACING + 0.9).max(1.4);
     const DEVICE_BANK_EDGE_MARGIN: f64 = 1.25;
     let pmos_last_y = selected_placement
         .devices
@@ -442,23 +986,48 @@ fn compact_preview(
             component_id: None,
             net: None,
         },
-        line_shape(
+    ];
+    let power_net = nets
+        .iter()
+        .find(|net| net.role == NetRole::Power)
+        .map(|net| net.id);
+    let ground_net = nets
+        .iter()
+        .find(|net| net.role == NetRole::Ground)
+        .map(|net| net.id);
+    if hierarchical {
+        for region in &selected_placement.block_regions {
+            let left = region.min_x + 0.12;
+            let right = region.max_x - 0.12;
+            if left < right {
+                shapes.push(line_shape(
+                    (left, vdd_y),
+                    (right, vdd_y),
+                    PhysicalLayer::Metal(1),
+                    power_net,
+                ));
+                shapes.push(line_shape(
+                    (left, gnd_y),
+                    (right, gnd_y),
+                    PhysicalLayer::Metal(1),
+                    ground_net,
+                ));
+            }
+        }
+    } else {
+        shapes.push(line_shape(
             (bounds.min_x + 0.25, vdd_y),
             (bounds.max_x - 0.25, vdd_y),
             PhysicalLayer::Metal(1),
-            nets.iter()
-                .find(|net| net.role == NetRole::Power)
-                .map(|net| net.id),
-        ),
-        line_shape(
+            power_net,
+        ));
+        shapes.push(line_shape(
             (bounds.min_x + 0.25, gnd_y),
             (bounds.max_x - 0.25, gnd_y),
             PhysicalLayer::Metal(1),
-            nets.iter()
-                .find(|net| net.role == NetRole::Ground)
-                .map(|net| net.id),
-        ),
-    ];
+            ground_net,
+        ));
+    }
 
     let mut anchors: HashMap<usize, Vec<RouteAnchor>> = HashMap::new();
     for kind in [DeviceKind::Pmos, DeviceKind::Nmos] {
@@ -468,44 +1037,22 @@ fn compact_preview(
             .collect::<Vec<_>>();
         for device in row {
             let placed = placed_by_id[&device.component_id];
+            let access_bounds = device
+                .physical_group
+                .as_deref()
+                .and_then(|group| region_by_group.get(group).copied());
             let x = placed.x;
             let y = placed.y;
-            let diffusion_height = 0.55 + device.width_um.min(4.0) * 0.12;
-            shapes.push(PhysicalShape {
-                layer: if kind == DeviceKind::Pmos {
-                    PhysicalLayer::Pdiff
-                } else {
-                    PhysicalLayer::Ndiff
-                },
-                x,
-                y,
-                width: 1.55,
-                height: diffusion_height,
-                component_id: Some(device.component_id),
-                net: None,
-            });
-            shapes.push(PhysicalShape {
-                layer: PhysicalLayer::Poly,
-                x,
-                y,
-                width: 0.22_f64.max(device.length_um * 0.22),
-                height: 1.25_f64.max(diffusion_height + rules.gate_extension_um * 2.0),
-                component_id: Some(device.component_id),
-                net: Some(device.gate_net),
-            });
+            shapes.extend(
+                device_footprint(device, x, y, rules)
+                    .into_iter()
+                    .map(|(shape, _)| shape),
+            );
             for (terminal_x, net) in [(x - 0.58, device.drain_net), (x + 0.58, device.source_net)] {
                 anchors.entry(net).or_default().push(RouteAnchor {
                     point: (terminal_x, y),
                     layer: PhysicalLayer::Metal(1),
-                });
-                shapes.push(PhysicalShape {
-                    layer: PhysicalLayer::Contact,
-                    x: terminal_x,
-                    y,
-                    width: 0.22,
-                    height: 0.22,
-                    component_id: Some(device.component_id),
-                    net: Some(net),
+                    access_bounds,
                 });
             }
             anchors
@@ -514,6 +1061,7 @@ fn compact_preview(
                 .push(RouteAnchor {
                     point: (x, y),
                     layer: PhysicalLayer::Metal(1),
+                    access_bounds,
                 });
         }
     }
@@ -567,6 +1115,7 @@ fn compact_preview(
         anchors.entry(pin.net).or_default().push(RouteAnchor {
             point: (x, y),
             layer,
+            access_bounds: None,
         });
         shapes.push(PhysicalShape {
             layer,
@@ -579,7 +1128,36 @@ fn compact_preview(
         });
     }
 
-    for net in nets {
+    let device_group = devices
+        .iter()
+        .filter_map(|device| {
+            device
+                .physical_group
+                .as_deref()
+                .map(|group| (device.component_id, group))
+        })
+        .collect::<HashMap<_, _>>();
+    let net_group_count = nets
+        .iter()
+        .map(|net| {
+            let groups = net
+                .terminals
+                .iter()
+                .filter_map(|terminal| device_group.get(&terminal.component_id).copied())
+                .collect::<HashSet<_>>();
+            (net.id, groups.len())
+        })
+        .collect::<HashMap<_, _>>();
+    let mut routed_nets = nets.iter().collect::<Vec<_>>();
+    if hierarchical {
+        routed_nets.sort_by_key(|net| match net.role {
+            NetRole::Internal if net_group_count[&net.id] == 1 => 0,
+            NetRole::Internal if net_group_count[&net.id] > 1 => 1,
+            NetRole::Input | NetRole::Output | NetRole::Internal => 2,
+            NetRole::Power | NetRole::Ground => 3,
+        });
+    }
+    for net in routed_nets {
         let Some(points) = anchors.get(&net.id) else {
             continue;
         };
@@ -602,12 +1180,14 @@ fn compact_preview(
         } else {
             PhysicalLayer::Metal(1)
         };
-        shapes.push(line_shape(
-            (min_x, track_y),
-            (max_x, track_y),
-            route_layer,
-            Some(net.id),
-        ));
+        if !hierarchical || signal {
+            shapes.push(line_shape(
+                (min_x, track_y),
+                (max_x, track_y),
+                route_layer,
+                Some(net.id),
+            ));
+        }
         for anchor in points {
             let preferred_drop = if !signal {
                 2
@@ -616,59 +1196,119 @@ fn compact_preview(
             } else {
                 max_metal_layers.saturating_sub(2).max(1)
             };
-            let drop_x = anchor.point.0;
-            let candidate_layers = if max_metal_layers < 3 {
+            let mut candidate_layers = if max_metal_layers < 3 {
                 vec![1]
             } else {
                 (2..max_metal_layers).collect::<Vec<_>>()
             };
-            let mut candidates = Vec::new();
-            for drop_layer_index in candidate_layers {
-                let mut candidate = Vec::new();
-                if (anchor.point.1 - track_y).abs() > f64::EPSILON {
-                    candidate.push(line_shape(
-                        (drop_x, anchor.point.1),
-                        (drop_x, track_y),
-                        if anchor.layer == PhysicalLayer::Metal(1) {
-                            PhysicalLayer::Metal(drop_layer_index)
-                        } else {
-                            anchor.layer
-                        },
-                        Some(net.id),
-                    ));
+            candidate_layers.sort_by_key(|layer| layer.abs_diff(preferred_drop));
+            // Search the complete synthesized width. The first-zero early exit
+            // keeps ordinary cases cheap while dense cells can reach a legal
+            // column instead of accepting a colliding nearby candidate.
+            let (access_min_x, access_max_x) =
+                if hierarchical && (!signal || net_group_count[&net.id] == 1) {
+                    anchor.access_bounds.unwrap_or((bounds.min_x, bounds.max_x))
+                } else {
+                    (bounds.min_x, bounds.max_x)
+                };
+            let max_jog_steps =
+                (((access_max_x - access_min_x) / TRACK_SPACING).ceil() as usize).max(1);
+            let mut drop_columns = vec![(0usize, anchor.point.0)];
+            for step in 1..=max_jog_steps {
+                for direction in [-1.0, 1.0] {
+                    let x = anchor.point.0 + direction * step as f64 * TRACK_SPACING;
+                    if x >= access_min_x + ROUTING_LANDING_SIZE
+                        && x <= access_max_x - ROUTING_LANDING_SIZE
+                    {
+                        drop_columns.push((step, x));
+                    }
                 }
-                if signal && anchor.layer == PhysicalLayer::Metal(1) {
-                    let target_layer = signal_layer[&net.id];
-                    add_via_stack(&mut candidate, anchor.point, 1, drop_layer_index, net.id);
-                    add_via_stack(
-                        &mut candidate,
-                        (drop_x, track_y),
-                        drop_layer_index,
-                        target_layer,
-                        net.id,
-                    );
-                } else if !signal && drop_layer_index > 1 {
-                    add_via_stack(&mut candidate, anchor.point, 1, drop_layer_index, net.id);
-                    add_via_stack(
-                        &mut candidate,
-                        (drop_x, track_y),
-                        1,
-                        drop_layer_index,
-                        net.id,
-                    );
-                }
-                let conflicts = route_shape_conflicts(&shapes, &candidate, net.id);
-                candidates.push((
-                    conflicts,
-                    drop_layer_index.abs_diff(preferred_drop),
-                    candidate,
-                ));
             }
-            if let Some((_, _, candidate)) = candidates
-                .into_iter()
-                .min_by_key(|(conflicts, preference, _)| (*conflicts, *preference))
-            {
+            let mut best_candidate = None;
+            'access_search: for drop_layer_index in candidate_layers {
+                for (jog_steps, drop_x) in &drop_columns {
+                    let mut candidate = Vec::new();
+                    let drop_layer = if anchor.layer == PhysicalLayer::Metal(1) {
+                        PhysicalLayer::Metal(drop_layer_index)
+                    } else {
+                        anchor.layer
+                    };
+                    if anchor.layer == PhysicalLayer::Metal(1) {
+                        if (anchor.point.0 - *drop_x).abs() > f64::EPSILON {
+                            candidate.push(line_shape(
+                                anchor.point,
+                                (*drop_x, anchor.point.1),
+                                drop_layer,
+                                Some(net.id),
+                            ));
+                        }
+                    }
+                    if (anchor.point.1 - track_y).abs() > f64::EPSILON {
+                        candidate.push(line_shape(
+                            (*drop_x, anchor.point.1),
+                            (*drop_x, track_y),
+                            drop_layer,
+                            Some(net.id),
+                        ));
+                    }
+                    if signal && anchor.layer == PhysicalLayer::Metal(1) {
+                        let target_layer = signal_layer[&net.id];
+                        add_via_stack(&mut candidate, anchor.point, 1, drop_layer_index, net.id);
+                        add_via_stack(
+                            &mut candidate,
+                            (*drop_x, track_y),
+                            drop_layer_index,
+                            target_layer,
+                            net.id,
+                        );
+                    } else if !signal && drop_layer_index > 1 {
+                        add_via_stack(&mut candidate, anchor.point, 1, drop_layer_index, net.id);
+                        add_via_stack(
+                            &mut candidate,
+                            (*drop_x, track_y),
+                            1,
+                            drop_layer_index,
+                            net.id,
+                        );
+                    }
+                    let conflicts = route_shape_conflicts(&shapes, &candidate, net.id);
+                    let routed = (
+                        conflicts,
+                        drop_layer_index.abs_diff(preferred_drop),
+                        *jog_steps,
+                        candidate,
+                    );
+                    let replace = best_candidate.as_ref().is_none_or(
+                        |(best_conflicts, best_preference, best_jog, _)| {
+                            (routed.0, routed.1, routed.2)
+                                < (*best_conflicts, *best_preference, *best_jog)
+                        },
+                    );
+                    if replace {
+                        best_candidate = Some(routed);
+                    }
+                    if conflicts == 0 {
+                        break 'access_search;
+                    }
+                }
+            }
+            if let Some((_, _, _, candidate)) = best_candidate {
                 shapes.extend(candidate);
+            }
+        }
+    }
+    if hierarchical && max_metal_layers >= 2 {
+        for (y, net) in [(vdd_y, power_net), (gnd_y, ground_net)] {
+            let Some(net) = net else { continue };
+            shapes.push(line_shape(
+                (bounds.min_x + 0.25, y),
+                (bounds.max_x - 0.25, y),
+                PhysicalLayer::Metal(2),
+                Some(net),
+            ));
+            for region in &selected_placement.block_regions {
+                let x = (region.min_x + region.max_x) / 2.0;
+                add_via_stack(&mut shapes, (x, y), 1, 2, net);
             }
         }
     }
@@ -705,6 +1345,159 @@ fn deduplicate_exact_vias(shapes: &mut Vec<PhysicalShape>, grid: f64) {
             (shape.height / grid).round() as i64,
         ))
     });
+}
+
+fn physical_blocks(
+    ir: &PhysicalLayoutIr,
+    drc: &physical_drc::PhysicalDrcReport,
+) -> Vec<PhysicalBlockImplementation> {
+    let selected = &ir.placement.candidates[ir.placement.selected_candidate];
+    let group_by_device = ir
+        .devices
+        .iter()
+        .filter_map(|device| {
+            device
+                .physical_group
+                .as_ref()
+                .map(|group| (device.component_id, group.as_str()))
+        })
+        .collect::<HashMap<_, _>>();
+    selected
+        .block_regions
+        .iter()
+        .map(|region| {
+            let mut device_ids = group_by_device
+                .iter()
+                .filter_map(|(id, group)| (*group == region.name).then_some(*id))
+                .collect::<Vec<_>>();
+            device_ids.sort_unstable();
+            let device_set = device_ids.iter().copied().collect::<HashSet<_>>();
+            let touched = ir
+                .devices
+                .iter()
+                .filter(|device| device_set.contains(&device.component_id))
+                .flat_map(|device| [device.gate_net, device.drain_net, device.source_net])
+                .collect::<HashSet<_>>();
+            let mut local_nets = touched
+                .iter()
+                .copied()
+                .filter(|net| {
+                    let physical_net = &ir.nets[*net];
+                    physical_net.role == NetRole::Internal
+                        && physical_net.terminals.iter().all(|terminal| {
+                            group_by_device.get(&terminal.component_id).copied()
+                                == Some(region.name.as_str())
+                        })
+                })
+                .collect::<Vec<_>>();
+            local_nets.sort_unstable();
+            let local_set = local_nets.iter().copied().collect::<HashSet<_>>();
+            let mut interface_nets = touched.difference(&local_set).copied().collect::<Vec<_>>();
+            interface_nets.sort_unstable();
+            let interface_pins = interface_nets
+                .iter()
+                .enumerate()
+                .map(|(index, net)| {
+                    let physical_net = &ir.nets[*net];
+                    let fraction = (index + 1) as f64 / (interface_nets.len() + 1) as f64;
+                    let (x, y) = match physical_net.role {
+                        NetRole::Power => (
+                            region.min_x + fraction * (region.max_x - region.min_x),
+                            region.min_y,
+                        ),
+                        NetRole::Ground => (
+                            region.min_x + fraction * (region.max_x - region.min_x),
+                            region.max_y,
+                        ),
+                        NetRole::Output => (
+                            region.max_x,
+                            region.min_y + fraction * (region.max_y - region.min_y),
+                        ),
+                        NetRole::Input | NetRole::Internal => (
+                            region.min_x,
+                            region.min_y + fraction * (region.max_y - region.min_y),
+                        ),
+                    };
+                    PhysicalBlockPin {
+                        name: physical_net.name.clone(),
+                        net: *net,
+                        x,
+                        y,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let shape_indices = ir
+                .shapes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, shape)| {
+                    (shape
+                        .component_id
+                        .is_some_and(|id| device_set.contains(&id))
+                        || shape.net.is_some_and(|net| local_set.contains(&net)))
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let shape_set = shape_indices.iter().copied().collect::<HashSet<_>>();
+            let local_drc_errors = drc
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    !diagnostic.shape_indices.is_empty()
+                        && diagnostic
+                            .shape_indices
+                            .iter()
+                            .all(|index| shape_set.contains(index))
+                })
+                .count();
+            PhysicalBlockImplementation {
+                instance_name: region.name.clone(),
+                bounds: PhysicalBounds {
+                    min_x: region.min_x,
+                    min_y: region.min_y,
+                    max_x: region.max_x,
+                    max_y: region.max_y,
+                },
+                device_ids,
+                local_nets,
+                interface_pins,
+                shape_indices,
+                local_drc_errors,
+                verified: local_drc_errors == 0,
+                immutable: region.immutable,
+            }
+        })
+        .collect()
+}
+
+fn top_level_routing_nets(nets: &[PhysicalNet], devices: &[PhysicalDevice]) -> Vec<PhysicalNet> {
+    let group_by_device = devices
+        .iter()
+        .filter_map(|device| {
+            device
+                .physical_group
+                .as_deref()
+                .map(|group| (device.component_id, group))
+        })
+        .collect::<HashMap<_, _>>();
+    nets.iter()
+        .filter(|net| {
+            if net.role != NetRole::Internal {
+                return true;
+            }
+            let groups = net
+                .terminals
+                .iter()
+                .filter_map(|terminal| group_by_device.get(&terminal.component_id).copied())
+                .collect::<HashSet<_>>();
+            let all_grouped = net
+                .terminals
+                .iter()
+                .all(|terminal| group_by_device.contains_key(&terminal.component_id));
+            !(all_grouped && groups.len() == 1)
+        })
+        .cloned()
+        .collect()
 }
 
 pub fn normalize(project: &Project) -> Result<PhysicalLayoutIr, String> {
@@ -824,6 +1617,10 @@ pub fn normalize(project: &Project) -> Result<PhysicalLayoutIr, String> {
             Ok(PhysicalDevice {
                 component_id: component.id,
                 name: component.name.clone(),
+                physical_group: component
+                    .name
+                    .split_once('·')
+                    .map(|(instance, _)| instance.to_string()),
                 kind: if component.kind == "pmos" {
                     DeviceKind::Pmos
                 } else {
@@ -838,6 +1635,7 @@ pub fn normalize(project: &Project) -> Result<PhysicalLayoutIr, String> {
         })
         .collect::<Result<Vec<_>, String>>()?;
     devices.sort_by(|left, right| (&left.kind, &left.name).cmp(&(&right.kind, &right.name)));
+    let top_level_nets = top_level_routing_nets(&nets, &devices);
 
     let mut pins = physical_components
         .iter()
@@ -863,7 +1661,8 @@ pub fn normalize(project: &Project) -> Result<PhysicalLayoutIr, String> {
         .candidates
         .iter()
         .any(|candidate| candidate.feasible);
-    let mut best = None;
+    let mut best: Option<CandidateEvaluation> = None;
+    let mut candidate_summaries = Vec::new();
     for candidate_index in 0..planning.candidates.len() {
         // A deliberately constrained rule deck can mark every floorplan as
         // over-utilized. Still route those candidates so negotiation can
@@ -875,43 +1674,155 @@ pub fn normalize(project: &Project) -> Result<PhysicalLayoutIr, String> {
         candidate_plan.selected_candidate = candidate_index;
         let candidate_placement =
             physical_placement::place(&devices, &nets, &project.technology, &candidate_plan);
-        let candidate_global =
-            physical_global_routing::route(&nets, &pins, &candidate_placement, &candidate_plan);
+        let top_level_net_ids = top_level_nets
+            .iter()
+            .map(|net| net.id)
+            .collect::<HashSet<_>>();
+        let mut routing_plan = candidate_plan.clone();
+        routing_plan
+            .nets
+            .retain(|net| top_level_net_ids.contains(&net.net));
+        let candidate_global = physical_global_routing::route(
+            &top_level_nets,
+            &pins,
+            &candidate_placement,
+            &routing_plan,
+        );
         let candidate_detailed = physical_detailed_routing::route(
+            &devices,
             &nets,
             &pins,
             &candidate_global,
             &candidate_plan,
             &project.technology,
+            &candidate_placement,
         );
-        let placement_score =
-            candidate_placement.candidates[candidate_placement.selected_candidate].score;
-        let better = best.as_ref().is_none_or(
-            |(_, placement, global, detailed): &(
-                usize,
-                PhysicalPlacementReport,
-                GlobalRoutingReport,
-                DetailedRoutingReport,
-            )| {
-                let best_score = placement.candidates[placement.selected_candidate].score;
-                candidate_global.total_overflow < global.total_overflow
-                    || (candidate_global.total_overflow == global.total_overflow
-                        && (candidate_detailed.conflict_count < detailed.conflict_count
-                            || (candidate_detailed.conflict_count == detailed.conflict_count
-                                && placement_score < best_score)))
-            },
-        );
+        let candidate_timing =
+            physical_timing(&nets, &devices, &pins, &candidate_detailed, project);
+        let floorplan = &candidate_plan.candidates[candidate_index];
+        let summary = PhysicalCandidateTiming {
+            candidate: candidate_summaries.len(),
+            floorplan_candidate: candidate_index,
+            placement_candidate: candidate_placement.selected_candidate,
+            strategy: floorplan.strategy,
+            timing_driven: false,
+            area_um2: floorplan.width_um * floorplan.height_um,
+            total_wire_length_um: candidate_detailed.total_wire_length_um,
+            total_via_count: candidate_detailed.total_via_count,
+            routing_overflow: candidate_global.total_overflow,
+            detail_conflicts: candidate_detailed.conflict_count,
+            estimated_worst_delay_ns: candidate_timing.estimated_worst_delay_ns,
+            slack_ns: candidate_timing.worst_slack_ns,
+            meets_timing: candidate_timing.worst_slack_ns.map(|slack| slack >= 0.0),
+        };
+        let mut evaluation = CandidateEvaluation {
+            candidate: candidate_index,
+            placement: candidate_placement,
+            global: candidate_global,
+            detailed: candidate_detailed,
+            timing: candidate_timing,
+            summary,
+        };
+        candidate_summaries.push(evaluation.summary.clone());
+        if project.timing_target_ns.is_some() {
+            if let Some(path_index) = evaluation.timing.critical_path {
+                let critical_path = &evaluation.timing.paths[path_index];
+                let critical_nets = critical_path.nets.iter().copied().collect::<HashSet<_>>();
+                let mut timing_plan = candidate_plan.clone();
+                for net in &mut timing_plan.nets {
+                    if net.class != crate::physical_planning::PhysicalNetClass::Power
+                        && critical_nets.contains(&net.net)
+                    {
+                        net.priority = 10;
+                        net.estimated_demand *= 2.0;
+                    }
+                }
+                timing_plan.nets.sort_by_key(|net| {
+                    (net.priority, std::cmp::Reverse(net.terminal_count), net.net)
+                });
+                let mut timing_placement =
+                    physical_placement::place(&devices, &nets, &project.technology, &timing_plan);
+                physical_placement::add_timing_candidate(
+                    &mut timing_placement,
+                    &devices,
+                    &nets,
+                    &timing_plan,
+                    &project.technology,
+                    &critical_path.device_ids,
+                );
+                for placement_index in 0..timing_placement.candidates.len() {
+                    if !timing_placement.candidates[placement_index].legal {
+                        continue;
+                    }
+                    let mut routed_placement = timing_placement.clone();
+                    routed_placement.selected_candidate = placement_index;
+                    let timing_global = physical_global_routing::route(
+                        &top_level_nets,
+                        &pins,
+                        &routed_placement,
+                        &{
+                            let mut routing_plan = timing_plan.clone();
+                            routing_plan
+                                .nets
+                                .retain(|net| top_level_net_ids.contains(&net.net));
+                            routing_plan
+                        },
+                    );
+                    let timing_detailed = physical_detailed_routing::route(
+                        &devices,
+                        &nets,
+                        &pins,
+                        &timing_global,
+                        &timing_plan,
+                        &project.technology,
+                        &routed_placement,
+                    );
+                    let timing_report =
+                        physical_timing(&nets, &devices, &pins, &timing_detailed, project);
+                    let timing_summary = PhysicalCandidateTiming {
+                        candidate: candidate_summaries.len(),
+                        floorplan_candidate: candidate_index,
+                        placement_candidate: placement_index,
+                        strategy: floorplan.strategy,
+                        timing_driven: true,
+                        area_um2: floorplan.width_um * floorplan.height_um,
+                        total_wire_length_um: timing_detailed.total_wire_length_um,
+                        total_via_count: timing_detailed.total_via_count,
+                        routing_overflow: timing_global.total_overflow,
+                        detail_conflicts: timing_detailed.conflict_count,
+                        estimated_worst_delay_ns: timing_report.estimated_worst_delay_ns,
+                        slack_ns: timing_report.worst_slack_ns,
+                        meets_timing: timing_report.worst_slack_ns.map(|slack| slack >= 0.0),
+                    };
+                    let timing_evaluation = CandidateEvaluation {
+                        candidate: candidate_index,
+                        placement: routed_placement,
+                        global: timing_global,
+                        detailed: timing_detailed,
+                        timing: timing_report,
+                        summary: timing_summary,
+                    };
+                    candidate_summaries.push(timing_evaluation.summary.clone());
+                    if candidate_is_better(&timing_evaluation, &evaluation) {
+                        evaluation = timing_evaluation;
+                    }
+                }
+            }
+        }
+        let better = best
+            .as_ref()
+            .is_none_or(|current| candidate_is_better(&evaluation, current));
         if better {
-            best = Some((
-                candidate_index,
-                candidate_placement,
-                candidate_global,
-                candidate_detailed,
-            ));
+            best = Some(evaluation);
         }
     }
-    let (selected_candidate, placement, global_routing, detailed_routing) =
+    let selected =
         best.ok_or_else(|| "Physical planning produced no feasible candidate.".to_string())?;
+    let selected_candidate = selected.candidate;
+    let selected_timing_candidate = selected.summary.candidate;
+    let placement = selected.placement;
+    let global_routing = selected.global;
+    let detailed_routing = selected.detailed;
     planning.selected_candidate = selected_candidate;
     let grid = project.technology.physical_rules.manufacturing_grid_um;
     let mut route_orders = vec![nets.clone()];
@@ -936,7 +1847,9 @@ pub fn normalize(project: &Project) -> Result<PhysicalLayoutIr, String> {
             snap_shape_to_grid(shape, grid);
         }
         deduplicate_exact_vias(&mut shapes, grid);
-        preview_candidates.push((preview_spacing_conflicts(&shapes), bounds, shapes));
+        let (shapes, rejected_conflicts) =
+            commit_preview_routing(shapes, &project.technology.physical_rules);
+        preview_candidates.push((rejected_conflicts, bounds, shapes));
     }
     let (_, mut bounds, shapes) = preview_candidates
         .into_iter()
@@ -946,8 +1859,13 @@ pub fn normalize(project: &Project) -> Result<PhysicalLayoutIr, String> {
     bounds.min_y = snap_to_grid(bounds.min_y, grid);
     bounds.max_x = snap_to_grid(bounds.max_x, grid);
     bounds.max_y = snap_to_grid(bounds.max_y, grid);
+    candidate_summaries.sort_by_key(|candidate| candidate.candidate);
+    let mut timing = physical_timing(&nets, &devices, &pins, &detailed_routing, project);
+    timing.candidates = candidate_summaries;
+    timing.selected_candidate = Some(selected_timing_candidate);
+    let tapeout = physical_tapeout(&shapes, &bounds, project);
 
-    Ok(PhysicalLayoutIr {
+    let mut ir = PhysicalLayoutIr {
         format_version: CURRENT_PHYSICAL_IR_VERSION,
         source_project_name: project.name.clone(),
         technology_name: project.technology.name.clone(),
@@ -959,9 +1877,28 @@ pub fn normalize(project: &Project) -> Result<PhysicalLayoutIr, String> {
         placement,
         global_routing,
         detailed_routing,
+        timing,
+        tapeout,
         bounds,
         shapes,
-    })
+        physical_blocks: Vec::new(),
+    };
+    let block_drc = physical_drc::validate(&ir, &project.technology);
+    ir.physical_blocks = physical_blocks(&ir, &block_drc);
+    Ok(ir)
+}
+
+pub fn normalize_project(project: &Project) -> Result<PhysicalLayoutIr, String> {
+    let implementation = if project
+        .components
+        .iter()
+        .any(|component| component.block_definition_id.is_some())
+    {
+        project.flattened()?
+    } else {
+        project.clone()
+    };
+    normalize(&implementation)
 }
 
 #[cfg(test)]
@@ -970,6 +1907,7 @@ mod tests {
         normalize, DeviceKind, NetRole, PhysicalLayer, ROUTING_CLEARANCE, ROUTING_LANDING_SIZE,
     };
     use crate::model::{Project, TerminalRef};
+    use crate::physical_canvas::PhysicalCanvas;
     use crate::{physical_drc, technology::Technology};
     use std::collections::HashSet;
     use uuid::Uuid;
@@ -1005,15 +1943,376 @@ mod tests {
         project
     }
 
+    fn two_stage_inverter() -> Project {
+        let mut project = Project::default();
+        project.rename("Two stage inverter".into()).unwrap();
+        let vdd = project.add_component("vdd", 0.0, -20.0).unwrap();
+        let gnd = project.add_component("gnd", 0.0, 20.0).unwrap();
+        let input = project.add_component("input", -20.0, 0.0).unwrap();
+        let output = project.add_component("output", 20.0, 0.0).unwrap();
+        let p1 = project.add_component("pmos", -5.0, -5.0).unwrap();
+        let n1 = project.add_component("nmos", -5.0, 5.0).unwrap();
+        let p2 = project.add_component("pmos", 5.0, -5.0).unwrap();
+        let n2 = project.add_component("nmos", 5.0, 5.0).unwrap();
+        for pmos in [p1, p2] {
+            connect(&mut project, (vdd, "out"), (pmos, "source"));
+        }
+        for nmos in [n1, n2] {
+            connect(&mut project, (gnd, "out"), (nmos, "source"));
+        }
+        connect(&mut project, (input, "out"), (p1, "gate"));
+        connect(&mut project, (input, "out"), (n1, "gate"));
+        connect(&mut project, (p1, "drain"), (n1, "drain"));
+        connect(&mut project, (p1, "drain"), (p2, "gate"));
+        connect(&mut project, (p1, "drain"), (n2, "gate"));
+        connect(&mut project, (p2, "drain"), (n2, "drain"));
+        connect(&mut project, (p2, "drain"), (output, "in"));
+        project
+    }
+
+    fn timing_acceptance_fixture() -> Project {
+        let mut project = Project::default();
+        project.rename("Timing acceptance".into()).unwrap();
+        let vdd = project.add_component("vdd", 0.0, -20.0).unwrap();
+        let gnd = project.add_component("gnd", 0.0, 20.0).unwrap();
+
+        // Independent loads make a compact baseline non-trivial while the
+        // four-stage path below remains the unique timing-critical path.
+        for _ in 0..12 {
+            let input = project.add_component("input", 0.0, 0.0).unwrap();
+            let output = project.add_component("output", 0.0, 0.0).unwrap();
+            let pmos = project.add_component("pmos", 0.0, 0.0).unwrap();
+            let nmos = project.add_component("nmos", 0.0, 0.0).unwrap();
+            connect(&mut project, (vdd, "out"), (pmos, "source"));
+            connect(&mut project, (gnd, "out"), (nmos, "source"));
+            connect(&mut project, (input, "out"), (pmos, "gate"));
+            connect(&mut project, (input, "out"), (nmos, "gate"));
+            connect(&mut project, (pmos, "drain"), (nmos, "drain"));
+            connect(&mut project, (pmos, "drain"), (output, "in"));
+        }
+
+        let input = project.add_component("input", 0.0, 0.0).unwrap();
+        let output = project.add_component("output", 0.0, 0.0).unwrap();
+        let mut stages = Vec::new();
+        for _ in 0..4 {
+            let pmos = project.add_component("pmos", 0.0, 0.0).unwrap();
+            let nmos = project.add_component("nmos", 0.0, 0.0).unwrap();
+            connect(&mut project, (vdd, "out"), (pmos, "source"));
+            connect(&mut project, (gnd, "out"), (nmos, "source"));
+            connect(&mut project, (pmos, "drain"), (nmos, "drain"));
+            stages.push((pmos, nmos));
+        }
+        connect(&mut project, (input, "out"), (stages[0].0, "gate"));
+        connect(&mut project, (input, "out"), (stages[0].1, "gate"));
+        for pair in stages.windows(2) {
+            connect(&mut project, (pair[0].0, "drain"), (pair[1].0, "gate"));
+            connect(&mut project, (pair[0].0, "drain"), (pair[1].1, "gate"));
+        }
+        connect(
+            &mut project,
+            (stages.last().unwrap().0, "drain"),
+            (output, "in"),
+        );
+        project
+    }
+
+    fn hierarchical_inverter() -> Project {
+        let mut leaf = inverter();
+        let definition = leaf.capture_block("INV".into()).unwrap();
+        let mut parent = Project::default();
+        parent.block_definitions = leaf.block_definitions;
+        let vdd = parent.add_component("vdd", 0.0, -10.0).unwrap();
+        let gnd = parent.add_component("gnd", 0.0, 10.0).unwrap();
+        let input = parent.add_component("input", -10.0, 0.0).unwrap();
+        let output = parent.add_component("output", 10.0, 0.0).unwrap();
+        let instance = parent.place_block(definition, 0.0, 0.0).unwrap();
+        connect(&mut parent, (vdd, "out"), (instance, "VDD1"));
+        connect(&mut parent, (gnd, "out"), (instance, "GND1"));
+        connect(&mut parent, (input, "out"), (instance, "IN1"));
+        connect(&mut parent, (instance, "OUT1"), (output, "in"));
+        parent
+    }
+
+    fn hierarchical_inverter_pair() -> Project {
+        let mut leaf = inverter();
+        let definition = leaf.capture_block("INV".into()).unwrap();
+        let mut parent = Project::default();
+        parent.block_definitions = leaf.block_definitions;
+        let vdd = parent.add_component("vdd", 0.0, -10.0).unwrap();
+        let gnd = parent.add_component("gnd", 0.0, 10.0).unwrap();
+        let input = parent.add_component("input", -10.0, 0.0).unwrap();
+        let output = parent.add_component("output", 10.0, 0.0).unwrap();
+        let first = parent.place_block(definition, -5.0, 0.0).unwrap();
+        let second = parent.place_block(definition, 5.0, 0.0).unwrap();
+        for instance in [first, second] {
+            connect(&mut parent, (vdd, "out"), (instance, "VDD1"));
+            connect(&mut parent, (gnd, "out"), (instance, "GND1"));
+        }
+        connect(&mut parent, (input, "out"), (first, "IN1"));
+        connect(&mut parent, (first, "OUT1"), (second, "IN1"));
+        connect(&mut parent, (second, "OUT1"), (output, "in"));
+        parent
+    }
+
     #[test]
     fn generated_inverter_passes_educational_physical_drc() {
         let project = inverter();
         let ir = normalize(&project).unwrap();
+        assert!(ir.tapeout.fits);
+        assert_eq!(ir.tapeout.shapes_outside_tapeout, 0);
+        assert_eq!(
+            (ir.tapeout.width_um, ir.tapeout.height_um),
+            (2_920.0, 3_520.0)
+        );
         let report = physical_drc::validate(&ir, &Technology::default());
         assert_eq!(
             report.error_count, 0,
             "unexpected physical DRC diagnostics: {:?}",
             report.diagnostics
+        );
+    }
+
+    #[test]
+    fn tapeout_report_distinguishes_floorplan_escape_from_window_escape() {
+        let project = inverter();
+        let normal = normalize(&project).unwrap();
+        assert!(normal.tapeout.fits);
+
+        let mut tiny = project;
+        tiny.technology.tapeout_window.width_um = 1.0;
+        tiny.technology.tapeout_window.height_um = 1.0;
+        let report = normalize(&tiny).unwrap().tapeout;
+        assert!(!report.fits);
+        assert!(report.shapes_outside_tapeout > 0);
+        assert!(report.geometry_width_um > report.usable_width_um);
+        assert!(report.geometry_height_um > report.usable_height_um);
+    }
+
+    #[test]
+    fn physical_timing_exposes_routed_parasitics_and_a_deterministic_critical_net() {
+        let project = inverter();
+        let ir = normalize(&project).unwrap();
+        assert_eq!(ir.timing.nets.len(), ir.nets.len());
+        assert!(ir.timing.critical_net.is_some());
+        assert!(ir.timing.critical_net_name.is_some());
+        assert_eq!(ir.timing.paths.len(), 1);
+        assert_eq!(ir.timing.paths[0].input_pin, "IN1");
+        assert_eq!(ir.timing.paths[0].output_pin, "OUT1");
+        assert_eq!(ir.timing.paths[0].nets.len(), 2);
+        assert_eq!(ir.timing.paths[0].device_names.len(), 2);
+        assert_eq!(ir.timing.critical_path, Some(0));
+        assert!(ir.timing.estimated_worst_delay_ns.is_finite());
+        assert!(ir.timing.estimated_worst_delay_ns >= 0.0);
+        assert!(ir
+            .timing
+            .nets
+            .windows(2)
+            .all(|pair| pair[0].net < pair[1].net));
+        assert!(ir.timing.nets.iter().any(|metric| {
+            metric.wire_length_um > 0.0
+                && metric.routed_capacitance_ff > 0.0
+                && metric.total_capacitance_ff >= metric.routed_capacitance_ff
+        }));
+        assert_eq!(ir, normalize(&project).unwrap());
+
+        let mut higher_capacitance = project.clone();
+        higher_capacitance
+            .technology
+            .physical_parasitics
+            .wire_capacitance_ff_per_um *= 2.0;
+        higher_capacitance
+            .technology
+            .physical_parasitics
+            .layer_capacitance_ff_per_um
+            .clear();
+        let higher = normalize(&higher_capacitance).unwrap();
+        assert!(higher
+            .timing
+            .nets
+            .iter()
+            .zip(&ir.timing.nets)
+            .any(|(high, base)| { high.routed_capacitance_ff > base.routed_capacitance_ff }));
+    }
+
+    #[test]
+    fn timing_path_graph_accumulates_cascaded_stage_delays() {
+        let project = two_stage_inverter();
+        let ir = normalize(&project).unwrap();
+        assert_eq!(ir.timing.paths.len(), 1);
+        let path = &ir.timing.paths[0];
+        assert_eq!(
+            (path.input_pin.as_str(), path.output_pin.as_str()),
+            ("IN1", "OUT1")
+        );
+        assert_eq!(path.nets.len(), 3);
+        assert_eq!(path.device_ids.len(), 4);
+        let expected = path
+            .nets
+            .iter()
+            .skip(1)
+            .map(|net| ir.timing.nets[*net].estimated_delay_ns)
+            .sum::<f64>();
+        assert!((path.estimated_delay_ns - expected).abs() < 1e-12);
+        assert_eq!(ir.timing.critical_path, Some(0));
+        assert_eq!(ir.timing.timing_target_ns, None);
+        assert_eq!(ir.timing.worst_slack_ns, None);
+        assert_eq!(ir, normalize(&project).unwrap());
+
+        let mut constrained = project.clone();
+        constrained
+            .set_timing_target(Some(path.estimated_delay_ns + 0.1))
+            .unwrap();
+        let met = normalize(&constrained).unwrap();
+        assert!(met.timing.worst_slack_ns.unwrap() > 0.0);
+        assert_eq!(
+            met.timing.paths[0].required_time_ns,
+            constrained.timing_target_ns
+        );
+        constrained
+            .set_timing_target(Some(path.estimated_delay_ns / 2.0))
+            .unwrap();
+        assert!(
+            normalize(&constrained)
+                .unwrap()
+                .timing
+                .worst_slack_ns
+                .unwrap()
+                < 0.0
+        );
+    }
+
+    #[test]
+    fn routed_floorplan_candidates_publish_deterministic_timing_scores() {
+        let ir = normalize(&nand()).unwrap();
+        assert_eq!(ir.timing.candidates.len(), 3);
+        assert!(ir
+            .timing
+            .candidates
+            .windows(2)
+            .all(|pair| pair[0].candidate < pair[1].candidate));
+        assert!(ir.timing.candidates.iter().all(|candidate| {
+            candidate.estimated_worst_delay_ns.is_finite()
+                && candidate.area_um2 > 0.0
+                && candidate.total_wire_length_um >= 0.0
+                && candidate.slack_ns.is_none()
+                && candidate.meets_timing.is_none()
+        }));
+        let selected = ir
+            .timing
+            .candidates
+            .iter()
+            .find(|candidate| Some(candidate.candidate) == ir.timing.selected_candidate)
+            .unwrap();
+        assert_eq!(selected.floorplan_candidate, ir.planning.selected_candidate);
+        assert_eq!(
+            selected.placement_candidate,
+            ir.placement.selected_candidate
+        );
+        assert_eq!(selected.routing_overflow, ir.global_routing.total_overflow);
+        assert_eq!(
+            selected.detail_conflicts,
+            ir.detailed_routing.conflict_count
+        );
+        assert_eq!(
+            selected.total_via_count,
+            ir.detailed_routing.total_via_count
+        );
+        assert!(
+            (selected.total_wire_length_um - ir.detailed_routing.total_wire_length_um).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn violated_timing_target_preserves_legality_before_delay() {
+        let mut project = timing_acceptance_fixture();
+        project.set_timing_target(Some(1e-12)).unwrap();
+        let ir = normalize(&project).unwrap();
+        assert_no_cross_net_metal_overlaps(&ir);
+        let metal_spacing = physical_drc::validate(&ir, &project.technology)
+            .diagnostics
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.rule_id == "GEOMETRY.MIN_SPACING"
+                    && diagnostic.layer.starts_with("metal")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            metal_spacing.is_empty(),
+            "timing-driven preview has same-layer spacing conflicts: {metal_spacing:?}"
+        );
+        assert!(
+            ir.timing
+                .candidates
+                .iter()
+                .any(|candidate| candidate.timing_driven),
+            "a constrained fixture should retain at least one legal timing-driven candidate: {:?}",
+            ir.timing.candidates
+        );
+        let selected = ir
+            .timing
+            .candidates
+            .iter()
+            .find(|candidate| Some(candidate.candidate) == ir.timing.selected_candidate)
+            .unwrap();
+        let best_baseline = ir
+            .timing
+            .candidates
+            .iter()
+            .filter(|candidate| !candidate.timing_driven)
+            .min_by(|left, right| {
+                (left.routing_overflow, left.detail_conflicts)
+                    .cmp(&(right.routing_overflow, right.detail_conflicts))
+                    .then_with(|| {
+                        left.estimated_worst_delay_ns
+                            .total_cmp(&right.estimated_worst_delay_ns)
+                    })
+            })
+            .unwrap();
+        assert!(
+            (selected.routing_overflow, selected.detail_conflicts)
+                <= (
+                    best_baseline.routing_overflow,
+                    best_baseline.detail_conflicts
+                )
+        );
+        assert_eq!(selected.meets_timing, Some(false));
+        assert!(ir.timing.candidates.iter().all(|candidate| {
+            candidate.routing_overflow > selected.routing_overflow
+                || (candidate.routing_overflow == selected.routing_overflow
+                    && candidate.detail_conflicts > selected.detail_conflicts)
+                || (candidate.routing_overflow == selected.routing_overflow
+                    && candidate.detail_conflicts == selected.detail_conflicts
+                    && selected.estimated_worst_delay_ns
+                        <= candidate.estimated_worst_delay_ns + 1e-12)
+        }));
+    }
+
+    #[test]
+    fn relaxed_and_hierarchical_timing_acceptance_is_compact_and_deterministic() {
+        let relaxed = timing_acceptance_fixture();
+        let first = normalize(&relaxed).unwrap();
+        assert_eq!(first.timing.candidates.len(), 3);
+        assert!(first
+            .timing
+            .candidates
+            .iter()
+            .all(|candidate| !candidate.timing_driven));
+        assert_eq!(first, normalize(&relaxed).unwrap());
+
+        let mut hierarchical = hierarchical_inverter();
+        hierarchical.set_timing_target(Some(0.2)).unwrap();
+        let restored: Project =
+            serde_json::from_str(&serde_json::to_string(&hierarchical).unwrap()).unwrap();
+        let hierarchical_ir = normalize(&hierarchical.flattened().unwrap()).unwrap();
+        assert_eq!(hierarchical_ir.devices.len(), 2);
+        assert!(hierarchical_ir
+            .timing
+            .candidates
+            .iter()
+            .any(|candidate| candidate.timing_driven));
+        assert_eq!(
+            hierarchical_ir,
+            normalize(&restored.flattened().unwrap()).unwrap()
         );
     }
 
@@ -1134,10 +2433,65 @@ mod tests {
                 .map(|route| route.blocked_pin_access_points)
                 .sum::<usize>()
         );
+        let selected_placement = &ir.placement.candidates[ir.placement.selected_candidate];
+        assert_eq!(
+            ir.detailed_routing.seeded_device_shape_count,
+            selected_placement.reserved_device_shapes
+        );
+        assert_eq!(
+            ir.detailed_routing.track_retry_count,
+            ir.detailed_routing
+                .routes
+                .iter()
+                .map(|route| route.track_retry_count)
+                .sum::<usize>()
+        );
+        assert_eq!(
+            ir.detailed_routing.layer_escalation_count,
+            ir.detailed_routing
+                .routes
+                .iter()
+                .map(|route| route.layer_escalation_count)
+                .sum::<usize>()
+        );
+        let detailed_shapes = ir
+            .detailed_routing
+            .routes
+            .iter()
+            .flat_map(|route| route.polygons.iter())
+            .collect::<Vec<_>>();
+        let mut canvas = PhysicalCanvas::new(&technology.physical_rules);
         for route in &ir.detailed_routing.routes {
             assert!(route.pin_access_points > 0);
-            for polygon in &route.polygons {
+            for (shape_index, polygon) in route.polygons.iter().enumerate() {
                 assert_eq!(polygon.net, Some(route.net));
+                if let PhysicalLayer::Via(lower) = polygon.layer {
+                    let enclosure = technology.physical_rules.via.enclosure_um;
+                    for layer in [PhysicalLayer::Metal(lower), PhysicalLayer::Metal(lower + 1)] {
+                        assert!(
+                            detailed_shapes.iter().any(|metal| {
+                                metal.layer == layer
+                                    && metal.net == polygon.net
+                                    && metal.x - metal.width / 2.0
+                                        <= polygon.x - polygon.width / 2.0 - enclosure + 1e-9
+                                    && metal.x + metal.width / 2.0
+                                        >= polygon.x + polygon.width / 2.0 + enclosure - 1e-9
+                                    && metal.y - metal.height / 2.0
+                                        <= polygon.y - polygon.height / 2.0 - enclosure + 1e-9
+                                    && metal.y + metal.height / 2.0
+                                        >= polygon.y + polygon.height / 2.0 + enclosure - 1e-9
+                            }),
+                            "accepted via lacks its atomic landing on {:?}",
+                            layer
+                        );
+                    }
+                }
+                canvas
+                    .commit_routing_geometry(
+                        std::slice::from_ref(polygon),
+                        format!("accepted-net-{}-shape-{shape_index}", route.net),
+                    )
+                    .expect("detailed IR contains only canvas-accepted routing geometry");
                 for edge in [
                     polygon.x - polygon.width / 2.0,
                     polygon.x + polygon.width / 2.0,
@@ -1399,6 +2753,11 @@ mod tests {
 
         assert_eq!(ir.devices.len(), 128);
         assert!(
+            ir.detailed_routing.track_retry_count > 0
+                || ir.detailed_routing.layer_escalation_count > 0,
+            "dense routing should exercise indexed track or layer alternatives"
+        );
+        assert!(
             aspect_ratio < 3.5,
             "large arrays should remain folded instead of becoming a device line, got {width} × {height}"
         );
@@ -1425,6 +2784,22 @@ mod tests {
             metal_spacing.is_empty(),
             "large layout has metal spacing conflicts: {:?}",
             metal_spacing
+        );
+        let device_spacing = physical_report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.rule_id == "GEOMETRY.MIN_SPACING"
+                    && matches!(
+                        diagnostic.layer.as_str(),
+                        "ndiff" | "pdiff" | "poly" | "contact"
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            device_spacing.is_empty(),
+            "reserved device footprints reached physical IR with spacing conflicts: {:?}",
+            device_spacing
         );
         let well = ir
             .shapes
@@ -1496,8 +2871,9 @@ mod tests {
             report.error_count < 100,
             "pairwise fragments should coalesce into actionable conflicts: {counts:?}"
         );
-        assert!(report.diagnostics.iter().any(|diagnostic| {
-            diagnostic.rule_id == "GEOMETRY.MIN_SPACING" && diagnostic.shape_indices.len() > 2
+        assert_no_cross_net_metal_overlaps(&ir);
+        assert!(report.diagnostics.iter().all(|diagnostic| {
+            diagnostic.rule_id != "GEOMETRY.MIN_SPACING" || !diagnostic.layer.starts_with("metal")
         }));
         let selected_score = (
             ir.global_routing.total_overflow,
@@ -1515,17 +2891,77 @@ mod tests {
             let global =
                 crate::physical_global_routing::route(&ir.nets, &ir.pins, &placement, &planning);
             let detail = crate::physical_detailed_routing::route(
+                &ir.devices,
                 &ir.nets,
                 &ir.pins,
                 &global,
                 &planning,
                 &project.technology,
+                &placement,
             );
             assert!(
                 selected_score <= (global.total_overflow, detail.conflict_count),
                 "selected physical candidate must minimize routing failure before shape preference"
             );
         }
+    }
+
+    #[test]
+    fn hierarchy_candidate_freezes_reusable_instances_into_regions() {
+        let project = hierarchical_inverter_pair();
+        let flattened = project.flattened().unwrap();
+        let ir = normalize(&flattened).unwrap();
+        assert!(ir
+            .devices
+            .iter()
+            .all(|device| device.physical_group.is_some()));
+        let selected = &ir.placement.candidates[ir.placement.selected_candidate];
+        assert_eq!(
+            selected.strategy,
+            crate::physical_placement::PlacementStrategy::Hierarchy
+        );
+        assert_eq!(selected.block_regions.len(), 2);
+        assert!(selected.block_regions.iter().all(|region| region.immutable));
+        assert!(selected
+            .block_regions
+            .iter()
+            .all(|region| region.device_count == 2));
+        assert_eq!(ir.physical_blocks.len(), 2);
+        assert!(ir.physical_blocks.iter().all(|block| {
+            block.immutable
+                && block.verified
+                && block.device_ids.len() == 2
+                && !block.interface_pins.is_empty()
+                && !block.shape_indices.is_empty()
+        }));
+        let private_nets = ir
+            .physical_blocks
+            .iter()
+            .flat_map(|block| block.local_nets.iter().copied())
+            .collect::<HashSet<_>>();
+        assert!(ir
+            .global_routing
+            .routes
+            .iter()
+            .all(|route| !private_nets.contains(&route.net)));
+        let power = ir
+            .nets
+            .iter()
+            .find(|net| net.role == NetRole::Power)
+            .unwrap()
+            .id;
+        assert!(
+            ir.shapes
+                .iter()
+                .filter(|shape| shape.net == Some(power) && shape.layer == PhysicalLayer::Metal(1))
+                .count()
+                >= 2,
+            "each reusable block should retain a local M1 power rail"
+        );
+        assert!(ir
+            .shapes
+            .iter()
+            .any(|shape| { shape.net == Some(power) && shape.layer == PhysicalLayer::Metal(2) }));
     }
 
     #[test]

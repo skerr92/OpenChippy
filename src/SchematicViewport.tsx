@@ -59,6 +59,40 @@ const terminalsFor = (kind: string) =>
 const blockFor = (component: Component, definitions: BlockDefinition[]) =>
   definitions.find((definition) => definition.id === component.blockDefinitionId);
 
+type SymbolBounds = { x: number; y: number; width: number; height: number };
+
+const blockGeometry = (definition?: BlockDefinition) => {
+  const pins = definition?.pins ?? [];
+  const sideCount = Math.max(
+    pins.filter(({ role }) => role === "input").length,
+    pins.filter(({ role }) => role === "output").length,
+    1,
+  );
+  const verticalCount = Math.max(
+    pins.filter(({ role }) => role === "power").length,
+    pins.filter(({ role }) => role === "ground").length,
+    1,
+  );
+  return {
+    height: Math.max(2.3, 1.1 + (sideCount - 1) * .72),
+    width: Math.max(2.9, 1.5 + (verticalCount - 1) * .72, (definition?.name.length ?? 7) * .32 + .8),
+    pinGap: .36,
+  };
+};
+
+const symbolBounds = (component: Component, definition?: BlockDefinition): SymbolBounds => {
+  if (component.kind === "block") {
+    const { width, height } = blockGeometry(definition);
+    return { x: -width / 2 - .12, y: -height / 2 - .12, width: width + .24, height: height + .24 };
+  }
+  if (component.kind === "nmos" || component.kind === "pmos") return { x: -1.65, y: -1.55, width: 2.6, height: 3.1 };
+  if (component.kind === "vdd" || component.kind === "gnd") return { x: -.78, y: -1.48, width: 1.56, height: 2.96 };
+  if (component.kind === "input" || component.kind === "output") return { x: -1.65, y: -.85, width: 3.3, height: 1.7 };
+  if (component.kind === "net_label") return { x: -1.65, y: -.68, width: 3.05, height: 1.36 };
+  if (component.kind === "junction") return { x: -.42, y: -.42, width: .84, height: .84 };
+  return { x: -2.55, y: -.72, width: 5.1, height: 1.44 };
+};
+
 const componentTerminals = (component: Component, definitions: BlockDefinition[]) =>
   component.kind === "block"
     ? blockFor(component, definitions)?.pins.map((pin) => pin.name) ?? []
@@ -70,16 +104,18 @@ const componentTerminalOffset = (
   definitions: BlockDefinition[],
 ): [number, number] => {
   if (component.kind !== "block") return terminalOffset(component.kind, terminal);
-  const pins = blockFor(component, definitions)?.pins ?? [];
+  const definition = blockFor(component, definitions);
+  const pins = definition?.pins ?? [];
+  const { width, height, pinGap } = blockGeometry(definition);
   const pin = pins.find((candidate) => candidate.name === terminal);
   if (!pin) return [-1.8, 0];
   const rolePins = pins.filter((candidate) => candidate.role === pin.role);
   const index = Math.max(0, rolePins.findIndex((candidate) => candidate.name === terminal));
-  const offset = (index - (rolePins.length - 1) / 2) * .7;
-  if (pin.role === "input") return [-1.8, offset];
-  if (pin.role === "output") return [1.8, offset];
-  if (pin.role === "power") return [offset, -1.45];
-  return [offset, 1.45];
+  const offset = (index - (rolePins.length - 1) / 2) * .72;
+  if (pin.role === "input") return [-width / 2 - pinGap, offset];
+  if (pin.role === "output") return [width / 2 + pinGap, offset];
+  if (pin.role === "power") return [offset, -height / 2 - pinGap];
+  return [offset, height / 2 + pinGap];
 };
 
 function DeviceShape({ component, definition }: { component: Component; definition?: BlockDefinition }) {
@@ -99,7 +135,10 @@ function DeviceShape({ component, definition }: { component: Component; definiti
   if (component.kind === "junction") return <circle className="junction-dot" cx="0" cy="0" r=".28" />;
   if (component.kind === "block") return (
     <>
-      <rect className="symbol-body block-body" x="-1.45" y="-1.15" width="2.9" height="2.3" rx=".18" />
+      {(() => {
+        const { width, height } = blockGeometry(definition);
+        return <rect className="symbol-body block-body" x={-width / 2} y={-height / 2} width={width} height={height} rx=".18" />;
+      })()}
       <text className="block-kind-label" x="0" y=".15" textAnchor="middle">{definition?.name ?? "Missing"}</text>
     </>
   );
@@ -118,11 +157,13 @@ function Symbol({ component, definition, blockDefinitions, selected, pendingTerm
   onDragStart: (event: React.PointerEvent) => void;
   onTerminal: (name: string) => void;
 }) {
+  const bounds = symbolBounds(component, definition);
+  const nameY = component.kind === "block" ? bounds.y - .32 : bounds.y - .25;
   return (
     <g className={`schematic-component device-${component.kind} ${selected ? "selected" : ""} ${logicState ? `logic-${logicState.toLowerCase()}` : ""} ${switchState ? `switch-${switchState}` : ""}`}
       transform={`translate(${component.position.x} ${component.position.y}) rotate(${component.rotation * 180 / Math.PI})`}
       onPointerDown={onDragStart}>
-      <rect className="symbol-hitbox" x="-1.8" y="-1.55" width="3.6" height="3.1" rx=".18" />
+      <rect className="symbol-hitbox" {...bounds} rx=".14" />
       <DeviceShape component={component} definition={definition} />
       {componentTerminals(component, blockDefinitions).map((terminal) => {
         const [x, y] = componentTerminalOffset(component, terminal, blockDefinitions);
@@ -142,7 +183,7 @@ function Symbol({ component, definition, blockDefinitions, selected, pendingTerm
             x={label.x} y={label.y} textAnchor={label.anchor}>{terminal}</text>}
         </g>;
       })}
-      <text x="0" y={component.kind === "block" ? "-2.08" : "-1.8"} textAnchor="middle">{component.name}</text>
+      <text x="0" y={nameY} textAnchor="middle">{component.name}</text>
       {logicState && <text className="simulation-state-label" x="0" y="2.05" textAnchor="middle">{logicState}</text>}
       {switchState && <text className="simulation-state-label" x="0" y="2.05" textAnchor="middle">{switchState.toUpperCase()}</text>}
     </g>
@@ -328,11 +369,15 @@ export default function SchematicViewport(props: Props) {
             ? `M ${x1} ${y1} ${waypoints.map((point) => `H ${point.x} V ${point.y}`).join(" ")}${wire.to ? ` H ${x2} V ${y2}` : ""}`
             : `M ${x1} ${y1} H ${wire.routeX ?? (x1 + x2) / 2} V ${y2} H ${x2}`;
           const logicState = wireStates.get(wire.id);
-          return <g key={wire.id} className={`${wire.id === props.selectedWireId ? "selected" : ""} ${logicState ? `logic-${logicState.toLowerCase()}` : ""}`}>
+          return <g key={wire.id} className={`${wire.id === props.selectedWireId ? "selected" : ""} ${!wire.to ? "extendable" : ""} ${logicState ? `logic-${logicState.toLowerCase()}` : ""}`}>
             <path className="wire-hitbox" d={path} onPointerDown={(event) => {
               event.stopPropagation();
               props.onSelect(null);
               props.onWireSelect(wire.id);
+              if (!wire.to) {
+                props.onDanglingEnd(wire.id);
+                return;
+              }
               if (!waypoints.length) {
                 wireDrag.current = { id: wire.id, moved: false };
                 event.currentTarget.setPointerCapture(event.pointerId);

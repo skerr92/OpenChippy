@@ -1065,6 +1065,33 @@ Future additions:
 * RC delay
 * Dynamic power estimation
 
+Milestone 5 is divided into independently testable inchstones:
+
+1. **5.1 — Routed parasitics and timing-aware physical selection.** Extract
+   per-net wire/via/device capacitance, rank critical nets and paths, then add a
+   timing-weighted physical candidate without weakening connectivity or DRC
+   precedence.
+2. **5.2 — Fanout analysis.** Build a hierarchy-flattened driver/load graph,
+   report scalar and grouped-signal fanout, flag undriven/multiply-driven and
+   configurable high-fanout nets, and cross-link results to the schematic.
+3. **5.3 — Switching activity.** Derive transition count, toggle rate, duty
+   cycle, and unresolved-state coverage from the exact waveform sample stream;
+   results must be invariant to waveform zoom and display grouping.
+4. **5.4 — Timing paths and constraints.** Traverse input-to-output and
+   combinational internal paths, accept a project timing target, report
+   arrival/required/slack, and identify the deterministic worst path with
+   schematic/waveform cross-probing.
+5. **5.5 — Educational dynamic power.** Combine process voltage, extracted
+   capacitance, and measured activity (`C × V² × f`) with clearly separated
+   internal, routed-net, and unresolved estimates; no signoff accuracy claim.
+6. **5.6 — Analysis workspace and export.** Present truth-table, fanout,
+   activity, timing, and power summaries in one scrollable view and export a
+   versioned machine-readable report whose values match the Rust backend.
+
+Each inchstone must include a small known-answer fixture, a hierarchical fixture,
+determinism coverage, Rust/TypeScript contract coverage, and a visible UI result
+before it is marked complete.
+
 ## Milestone 5.1 — Timing-Aware Physical Candidate Selection
 
 Extend the Milestone 4 multi-pass placer/router with simulation-derived timing,
@@ -1097,17 +1124,413 @@ Acceptance:
 * Selection remains deterministic for identical project, technology, and timing
   constraints
 
+Implementation slices:
+
+* **5.1.1 — Routed-net extraction:** report detailed wire length, via count,
+  educational routed capacitance, device load capacitance, fanout, and a
+  first-order delay for every normalized physical net. Expose the worst net in
+  the physical sidebar and physical-report JSON.
+* **5.1.2 — Process parasitic configuration:** move wire and via capacitance
+  coefficients into the versioned technology YAML with backward-compatible
+  educational defaults and strict validation.
+* **5.1.3 — Path graph:** convert per-net estimates into deterministic
+  input-to-output path arrival times, retaining the devices and nets that form
+  the critical path.
+* **5.1.4 — Timing constraints:** persist an optional project target and report
+  candidate worst delay and slack without treating an absent target as zero.
+* **5.1.5 — Timing candidate:** add a criticality-weighted placement/routing
+  strategy and apply the documented legality/timing/area/congestion ordering.
+* **5.1.6 — Acceptance:** prove a critical fixture can select a faster legal
+  layout, a relaxed repeated fixture stays compact, and all metrics and choices
+  are deterministic through save/load and hierarchy flattening.
+
+Current implementation:
+
+* 5.1.1 is complete: physical IR v2 includes a deterministic per-net timing
+  report derived from detailed-route length/vias and MOS gate/diffusion loads.
+  The physical sidebar exposes the estimated worst routed-net delay and critical
+  net.
+* 5.1.2 is complete: technology snapshots and YAML own validated default wire
+  and via capacitance plus optional `metalN` and adjacent `viaNN` overrides.
+  Detailed routes retain per-layer length and per-via counts, so extraction uses
+  the appropriate process coefficient. Older projects receive educational
+  defaults. `docs/examples/openchippy-edu-5m.yaml` is a directly loadable,
+  commented five-metal test process.
+* 5.1.3 is complete: Rust builds a bounded, cycle-safe dependency graph from
+  normalized CMOS gate-to-channel influence, enumerates deterministic
+  input-to-output paths, retains each path's ordered nets and contributing MOS
+  devices, accumulates extracted net delays, and selects the worst path with a
+  stable tie-break. The physical sidebar shows its endpoints and net sequence.
+* 5.1.4 is complete: projects persist an optional positive timing target with
+  undo/redo and backward-compatible unconstrained defaults. Every path reports
+  required time and slack when constrained; the physical sidebar identifies
+  MET versus VIOLATED worst slack, while a blank target remains unconstrained
+  instead of being interpreted as zero.
+* 5.1.5 is complete: normalization extracts timing independently for every
+  feasible fully routed floorplan. Constrained designs also generate a second
+  criticality-weighted attempt per floorplan: critical-path devices are
+  clustered in path order and critical nets are promoted ahead of ordinary
+  global/signal routing. The IR retains accepted and rejected attempts with
+  floorplan/placement provenance, strategy, area, wire length, vias, routing
+  failures, worst delay, and slack. Selection is lexicographic: global overflow
+  and detailed conflicts remain correctness gates; a timing-met candidate then
+  beats a violating one; equally violating candidates prefer lower worst delay;
+  and area, wire length, vias, placement score, then stable candidate ID break
+  remaining ties. Unconstrained designs do not generate timing-driven attempts,
+  so already-fast designs remain compact. The critical-vs-relaxed end-to-end
+  acceptance fixtures are covered by 5.1.6.
+* 5.1.6 is complete: a congested four-stage critical fixture proves that the
+  constrained flow can select a timing-driven result with strictly lower worst
+  delay than every equally legal baseline. The identical unconstrained fixture
+  emits only the three compact baseline floorplans. A reusable hierarchical
+  inverter proves that timing candidates and selected metrics remain identical
+  after flattening and JSON save/load, while repeated normalization verifies
+  deterministic candidate ordering and selection. Milestone 5.1 acceptance is
+  complete; fanout analysis is next in 5.2.
+* Hierarchy-preserving physical-placement metadata foundation: flattened MOS
+  devices retain their largest top-level reusable-instance owner. Designs with
+  at least two instances add a hierarchy ordering candidate and emit proposed
+  per-instance bounds. This does **not** yet constitute macro generation: the
+  renderer still synthesizes one flat shape set, so the regions are neither
+  locally routed templates nor copied immutable geometry. The exact
+  `4B_ADDER` experiment measured 115 metal diagnostics versus the current flat
+  result of 113. A follow-up attempt to constrain the same greedy renderer to
+  those regions and reserve M1/M2 for power regressed to 268 and was rejected.
+* Hierarchical physical synthesis is split into explicit acceptance slices:
+  1. normalize each largest block definition independently and classify local
+     versus boundary-crossing nets without losing top-level net identity;
+  2. place, locally route, and DRC one canonical template per unique block
+     definition, publishing explicit boundary pins and rejecting dirty macros;
+  3. pack immutable macro rectangles, cloning identical template geometry by
+     translation into non-overlapping legal regions rather than re-placing MOS;
+  4. route cross-macro signals on upper metals beginning at M3, then stitch the
+     already-placed local M1/M2 power rails as the final global routing class;
+  5. prove copied instances have identical relative shapes/pins and require the
+     hierarchical `4B_ADDER` to beat the 113-diagnostic flat baseline before it
+     becomes the default rendered/GDS path.
+* Pragmatic staged-routing slice: hierarchical previews now instantiate a
+  separate unconnected M1 VDD/GND rail pair inside every placed block region.
+  Routing order is private single-block nets, shared cross-block nets, remaining
+  external signals, and power/ground last. Private-net access searches are
+  bounded to their owning region; shared nets may span only the blocks they
+  actually touch. Once signal routing is present, an M2 power stitch connects
+  the already-placed local rails, allowing multiple rail segments instead of
+  forcing one early chip-wide rail. Flat designs retain their existing flow.
+  The exact saved `4B_ADDER` improves from 113 to 98 metal diagnostics (M2 63,
+  M3 35), while the UI headline is 137 total after including 39 via diagnostics.
+  The 3D sidebar reports the staged order and local/global power policy, and a
+  default-on colored region overlay makes the four block bounds directly
+  visible. This is accepted incremental progress; canonical copied macro
+  templates remain the stronger end-state above.
+* Tapeout containment prerequisite: the technology schema now declares a
+  versioned tapeout window. The educational default uses the documented
+  Caravel SKY130 user-project allocation of 2920 × 3520 µm (a harness/shuttle
+  allocation, not an intrinsic SKY130 process limit). Physical IR separately
+  reports shapes outside the synthesized floorplan and shapes outside the
+  usable tapeout window, bounding-box dimensions, fit status, and area usage.
+  This makes the visible routing escape in large layouts measurable without
+  automatically classifying every floorplan overhang as a tapeout failure.
+
 ---
 
-# Milestone 6 — RTL Integration
+## Milestone 5.2 — Fanout Analysis
 
-Introduce HDL support.
+Build one hierarchy-flattened driver/load graph shared with simulation rather
+than deriving fanout from rendered wires. Fanout counts unique receiving pins,
+retains source/load component provenance for schematic cross-selection, and
+aggregates persisted waveform groups without changing scalar results.
 
-Initial goals:
+Implementation slices:
 
-* Verilog import
-* Verilog export
-* Gate-level viewer
+* **5.2.1 — Scalar graph and visible diagnostics:** classify input/supply and
+  CMOS channel drivers, MOS gate/output loads, scalar fanout, high-fanout,
+  undriven, and multiple-explicit-driver conditions. Return the report with
+  simulation and expose selectable rows in the inspector.
+* **5.2.2 — Project policy:** persist an undoable positive high-fanout warning
+  threshold instead of relying on the initial educational default of eight.
+* **5.2.3 — Group and hierarchy acceptance:** prove aggregate bus totals and
+  maximum member fanout, nested block flattening, save/load determinism, and
+  stable schematic endpoint cross-links.
+
+Current implementation:
+
+* 5.2.1 is complete: the Rust solver returns sorted nets with aliases, explicit
+  driver/load endpoints, fanout, and high/undriven/multiple flags. CMOS
+  drain/source devices on one net are represented as one channel-network driver
+  so a valid complementary pull-up/pull-down network is not mislabeled as
+  multiple drivers. Persisted waveform groups receive total and maximum member
+  fanout summaries. The simulation inspector displays report totals and net
+  rows; clicking a row selects its first concrete load or driver component.
+  Known-answer coverage includes a ten-load high-fanout output, two shorted
+  explicit inputs, and an undriven output probe.
+* 5.2.2 is complete: `.chippy` projects persist a validated positive high-fanout
+  warning threshold; legacy files default to eight. The circuit inspector edits
+  it, simulation consumes it directly, changes invalidate stale results, and
+  history supports undo/redo. Round-trip, legacy-default, validation, history,
+  and changed-classification regressions cover the policy.
+* 5.2.3 is complete: an end-to-end two-level nested reusable-block fixture
+  proves grouped total/max fanout, deterministic flattening, identical fanout
+  JSON after project save/load, and concrete endpoint provenance. Direct
+  endpoints select their schematic component; flattened internal endpoints map
+  back to their owning top-level block instance using the deterministic
+  hierarchy name path. The acceptance group combines two inputs and two outputs
+  and verifies total fanout six with maximum member fanout two. Milestone 5.2 is
+  complete.
+* Physical closure remains a cross-milestone acceptance constraint: metal and
+  via diagnostics must continue trending toward zero and may not be hidden by
+  coalescing or layer visibility. When otherwise equally legal, routed physical
+  candidates should prefer greater bounded power-rail coverage: at least one
+  local VDD/GND pair per macro, with additional rails driven by region span and
+  load/current demand. Rail count is capped by process spacing and utilization
+  so candidate scoring cannot improve merely by adding unused conductors.
+* Physical-routing regression work before 5.2.2: renderer geometry now
+  searches the complete floorplan width for access columns on preferred drop layers
+  and inserts short same-net jogs from fixed device terminals. It accepts the
+  first zero-conflict access in deterministic layer/distance order rather than
+  silently choosing a nearby least-bad colliding vertical column. Dense baseline and
+  timing-driven fixtures require both zero cross-net rectangle overlap and zero
+  process metal-spacing diagnostics; a first-zero early exit preserves ordinary
+  generation time. On the saved `4B_ADDER` acceptance design this reduces the
+  observed 154 metal diagnostics to 113. The remaining M2/M3 violations are
+  explicitly deferred to two-dimensional escape routing; the greedy preview is
+  improved but not sign-off clean.
+
+---
+
+# Milestone 6 — RTL Integration (complete, bounded subset)
+
+Introduce HDL support through a small, deterministic Rust-owned RTL boundary before
+integrating external synthesis.
+
+### 6.1 — Structural Verilog IR and parser (complete)
+
+* Define a serializable module/port/net/primitive-instance IR in Rust.
+* Parse one scalar structural Verilog module with ANSI or classic port declarations.
+* Accept built-in `and`, `or`, `xor`, `nand`, `nor`, `xnor`, `not`, and `buf`
+  primitives plus simple direct or inverted `assign` statements.
+* Reject undeclared signals, duplicate declarations/instances, behavioral syntax, and
+  unsupported constructs with actionable errors.
+* Expose the parser through the typed desktop backend API.
+
+Acceptance: representative ANSI and classic modules parse deterministically, comments
+are harmless, and malformed/behavioral input fails without changing a project.
+
+### 6.2 — Verilog import workflow and diagnostics (complete)
+
+* Add file selection, source preview, parse diagnostics, and an explicit import action.
+* Keep parsing non-mutating until the user accepts a valid preview.
+* Report unsupported vectors, parameters, named connections, and multi-module sources
+  without silently changing their meaning.
+
+Current implementation: **Import RTL** opens a non-mutating desktop workflow with
+`.v`/`.sv` selection, an editable source preview, explicit validation, actionable
+unsupported-scope diagnostics, and a typed module summary. Accepting a valid preview
+records the workflow boundary but deliberately does not change the schematic; logical
+project mapping begins in 6.3.
+
+### 6.3 — Logical mapping and project integration (complete)
+
+* Map supported primitives and nets into OpenChippy's logical project representation.
+* Preserve stable instance, port, and net names across save/load and undo/redo.
+* Define deterministic placement for imported gates without pretending they are already
+  transistor-level standard cells.
+
+Current implementation: accepting a validated preview stores a first-class logical RTL
+design in the project. Primitive/net/port names remain unchanged, gate positions are
+deterministically layered by driver topology, legacy projects default to no RTL design,
+and import participates in dirty tracking, save/load, undo, and redo. The circuit
+inspector reports the imported module and makes its logical-only status explicit.
+
+### 6.3.1 — Packed vector foundation (complete)
+
+* Parse fixed packed ranges such as `[7:0]` on ports and wires.
+* Preserve declared direction and bit ordering rather than silently flattening bus intent.
+* Support constant bit selects with deterministic scalar expansion for logical mapping.
+* Diagnose width mismatches; defer part selects, concatenation, signed arithmetic,
+  multidimensional arrays, and parameter-derived widths until their semantics are modeled.
+
+This slice should precede deterministic export so ordinary RTL buses round-trip as buses.
+
+Current implementation: ANSI and classic fixed packed ranges persist on port/net IR,
+including ascending or descending declared order. Constant bit selects become canonical
+scalar connections used by logical topology mapping. Whole-bus primitive connections,
+out-of-range indices, and part selects fail with distinct width/scope diagnostics. Bus
+metadata remains intact for 6.4 export rather than being discarded during import.
+
+### 6.3.2 — Parameters and elaborated instances (complete foundation)
+
+* Parse typed integer parameter declarations with deterministic defaults.
+* Accept named and positional parameter overrides on structural instances.
+* Evaluate the bounded constant-expression subset required for packed ranges and widths.
+* Elaborate effective parameter values before width checking and logical mapping.
+* Persist source defaults and per-instance overrides so export can reproduce intent.
+* Diagnose unknown parameters, duplicate overrides, invalid expressions, non-positive
+  widths, and elaboration cycles without guessing a value.
+
+Initial scope excludes real/time/string parameters, generate loops, defparam, arbitrary
+constant functions, and full SystemVerilog type elaboration. This slice precedes 6.4
+because parameter-derived ranges must be resolved and preserved before round-trip export.
+
+Current implementation: one module may declare ordered integer parameters whose defaults
+use bounded `+`, `-`, `*`, `/`, unary minus, parentheses, and earlier parameters. Packed
+ranges elaborate from effective defaults. Generic structural cell instances retain named
+or positional overrides, their source expressions, and evaluated values; built-in gate
+primitives reject overrides. Duplicate declarations/overrides, mixed override styles,
+unknown or forward/cyclic expressions, division by zero, overflow, and negative range
+bounds fail explicitly. Override-name validation for external cells occurs when a matching
+library/module definition is linked; unresolved library references are preserved rather
+than guessed. Multi-module source linking and per-instance child-width elaboration remain
+the hierarchy portion of 6.5.
+
+### 6.4 — Deterministic Verilog export (complete foundation)
+
+* Export supported flat and reusable-block logic as stable structural Verilog.
+* Preserve port direction, hierarchy boundaries, and legal escaped identifiers.
+* Add parse/export/parse equivalence fixtures.
+
+Current implementation: Rust emits stable ANSI structural Verilog from the persisted
+logical design. Output preserves port directions, fixed or parameter-expression packed
+ranges, integer defaults, internal nets, primitive and generic-cell hierarchy references,
+named/positional parameter overrides, bit selects, scalar constants, and instance/net
+names. Non-standard identifiers are emitted using legal Verilog escaped syntax. The
+circuit inspector provides **Export Verilog…**, and a parameterized vector/generic-cell
+fixture proves deterministic parse → export → parse IR equality. Export is read-only.
+Bundling definitions for unresolved external cells and translating transistor-only
+`.chippyblock` implementations into behavioral/library HDL remain 6.5/library-linking
+work rather than fabricating unsupported logic semantics.
+
+Import compatibility refinement: ANSI ports accept explicit `wire`, `logic`, or `reg`
+net/variable types plus optional signedness. Combinational continuous expressions such as
+`assign sum = a + b;` persist as logical assignment IR with a target, deterministic source
+expression, and referenced-signal set; they round-trip through export without pretending
+that synthesis has already selected an adder gate network.
+
+### 6.5 — Gate-level viewer and hierarchy navigation (complete foundation)
+
+* Add a dedicated gate-level view with selection and cross-probing to source instances,
+  simulation signals, and reusable blocks.
+* Fit, pan, zoom, and descend through hierarchy without expanding large designs into one
+  unreadable canvas.
+* Validate import, export, simulation, and saved-project behavior with known circuits.
+
+Current implementation: a persisted logical RTL design now enables a dedicated **RTL
+View** alongside the schematic, physical, and waveform workspaces. The renderer draws
+ports, primitive or library-cell instances, continuous assignments, and their orthogonal
+net connections from the Rust-owned logical IR. Cells and assignments are selectable for
+source-identity, connection, expression, and parameter inspection; a hierarchy sidebar
+identifies unresolved external definitions without flattening or inventing their contents.
+The canvas supports independent drag-pan, wheel/pinch zoom, and fit-to-module behavior.
+Imported RTL continues to round-trip through project save/load and deterministic Verilog
+export. Accepting an import verifies that the backend returned a persisted logical design
+and opens that design directly in the RTL canvas, so logical-only imports cannot appear to
+be no-op schematic changes.
+
+Linked multi-module source bundles, reusable-block HDL definitions, and hierarchy descent
+now belong to Milestone 7, where imported definitions can be resolved alongside the
+synthesis library rather than through a second, importer-only linking system.
+
+### 6.5.2 — Imported RTL waveform simulation (complete foundation)
+
+* Drive imported scalar and packed-vector inputs with the existing timed waveform controls.
+* Evaluate built-in primitives and bounded continuous arithmetic/bitwise expressions.
+* Emit scalar bit lanes for packed ports so the existing waveform bus grouping, radix,
+  cursor, and zoom tools remain reusable.
+
+Current implementation: when a project owns an imported logical design, **Waveforms**
+runs the Rust RTL evaluator instead of the transistor switch solver. Clock-named inputs use
+the configured clock period, other input bits use the configured change interval, and
+primitive gates plus bounded `+`, `-`, `&`, `|`, `^`, and `~` continuous expressions settle
+before output samples are emitted. Unknown or unsupported values remain explicit rather
+than being coerced. Stateful procedural simulation is the 6.6 closeout work below.
+
+### 6.5.3 — Imported RTL truth tables (complete)
+
+The existing **Truth Table** action now detects an imported logical design, scalarizes
+packed input and output ports in declared MSB-to-LSB order, enumerates up to eight input
+bits, and evaluates every row through the same Rust RTL engine used by waveforms. Unknown
+outputs mark a row non-converged. Projects without imported RTL retain the transistor-level
+truth-table path unchanged.
+
+### 6.6 — Bounded behavioral RTL semantics
+
+Behavioral syntax is split from structural import so accepting syntax never implies that
+OpenChippy already models its scheduling semantics.
+
+#### 6.6.1 — Combinational procedural blocks (complete foundation)
+
+* Add a statement/expression AST for `always @*` and `always_comb`.
+* Support ordered `begin`/`end`, blocking `=`, `if`/`else`, and bounded `case` statements.
+* Perform definite-assignment and combinational-loop checks; diagnose inferred latches
+  rather than silently changing behavior.
+* Lower the validated combinational process into logical assignment/mux IR for the RTL
+  viewer and later synthesis.
+
+Current implementation: `always_comb` and `always @*`/`always @(*)` accept ordered blocking
+assignments, including `begin`/`end`. Bounded `if`/`else` branches must each assign the same
+target exactly once; they lower into a deterministic mux expression consumed identically
+by the logical viewer, equivalent continuous-form export, and waveform evaluator. A
+missing `else` reports the inferred latch instead of silently creating state. Bounded
+`case` statements similarly require at least one value item, one `default`, and the same
+target in every item; they lower to a priority mux chain with sized binary-value matching.
+Empty blocks, nested/multi-assignment branches, and nonblocking assignments remain explicit
+diagnostics. Broader definite-assignment analysis can expand later without blocking 6.6.2
+state semantics.
+
+#### 6.6.2 — Clocked procedural blocks (complete foundation)
+
+* Model `always @(posedge/negedge ...)` and `always_ff` event controls.
+* Add register state, clock/reset edges, and nonblocking `<=` update scheduling to the
+  simulator and waveform engine.
+* Distinguish blocking and nonblocking assignment rules and report unsafe mixed usage.
+
+Milestone 6 closeout requires this slice to be operational—not merely parsed—including a
+regression fixture whose `always_ff @(posedge clk)` nonblocking assignment produces the
+expected registered output transitions in the waveform viewer.
+
+Current implementation: `always_ff @(posedge/negedge clock)` and equivalent classic
+edge-triggered `always` blocks persist as first-class sequential-process IR. The bounded
+slice requires exactly one nonblocking assignment per process. Export preserves the clock
+edge and `<=`, declares sequential outputs as `logic`, and round-trips into equivalent IR.
+Waveform simulation initializes register state as unknown, detects clock edges, evaluates
+all triggered right-hand sides from the pre-edge state, commits their updates together,
+then re-settles combinational logic. The RTL canvas renders selectable register nodes with
+clock/data connectivity. Truth tables explicitly redirect sequential designs to Waveforms.
+Conditional resets, enables, multiple statements, and mixed blocking/nonblocking processes
+remain follow-up expansions rather than receiving guessed scheduling semantics.
+
+#### 6.6.2.1 — Practical RTL expression compatibility (complete foundation)
+
+* Lex quoted string literals without treating `"` as an unknown character.
+* Consume `(* ... *)` synthesis attributes as non-semantic metadata, including escaped
+  quoted values, without claiming the simulator implements vendor synthesis directives.
+* Preserve and evaluate concatenation (`{a, b}`) and constant/parameter replication
+  (`{WIDTH{1'b0}}`) in continuous, blocking-lowered, and nonblocking expressions.
+
+Current implementation round-trips braced expressions through deterministic export and
+evaluates up to 128 result bits in truth tables and waveforms. Invalid or unknown repeat
+counts remain unknown rather than being coerced. General string-valued parameters,
+`localparam`, shifts, unpacked arrays/memories, and attribute-driven synthesis behavior are
+separate language features; accepting their punctuation does not imply their semantics.
+
+The remaining RTL language and testbench work has moved into Milestone 7 so it can share
+one definition, elaboration, and synthesis boundary. Milestone 6 continues to reject those
+constructs explicitly rather than guessing at their behavior.
+
+Closeout UI validation: schematic library and inspector chrome are scoped to the 2D
+schematic workspace; physical, waveform, and RTL workspaces use the full editor width.
+The physical viewer preserves its camera while selections and layer visibility change and
+provides explicit top/isometric/front/right orientation plus fit controls. RTL designs fit
+their measured logical bounds into the center of the available canvas on open and resize.
+
+Closeout project packaging: new saves default to a versioned `.ochippy` manifest whose
+`includedFiles` list identifies one sibling `.chippy` circuit and its `.chippy_gds`
+physical artifact. The artifact contains deserializable, version-checked physical IR and a
+stable digest of the source circuit. Opening either `.chippy` or `.ochippy` is supported;
+matching cached IR bypasses placement and routing on later 3D visits, while mismatched or
+unsupported artifacts are rejected rather than silently displayed. The physical workspace
+also exposes direct `.chippy_gds` export. Included paths are constrained to the manifest
+directory, and physical DRC is intentionally recalculated from cached IR plus the active
+technology rather than trusted as stale cached output.
 
 Future:
 
@@ -1118,19 +1541,50 @@ Future:
 
 # Milestone 7 — Synthesis Integration
 
-Rather than reimplement synthesis, integrate existing tools.
+Rather than reimplement synthesis, integrate existing tools while completing the RTL
+features that require real module linking, elaboration, or synthesis semantics.
 
-Initial adapters:
+### 7.1 — Tool discovery and reproducible synthesis jobs
 
-* Yosys
-* ABC
+* Detect and validate compatible Yosys and ABC installations.
+* Run synthesis outside the UI thread with visible progress, captured versions, logs, and
+  actionable failures.
+* Keep the source RTL and imported logical design unchanged until the user accepts a
+  successful result.
 
-Display:
+### 7.2 — Linked modules, libraries, and parameterized hierarchy
 
-* Synthesized netlist
+* Accept multi-module source bundles and resolve child-module definitions deterministically.
+* Link reusable OpenChippy blocks to explicit HDL/library definitions where available.
+* Validate child parameters and port widths after elaboration, then allow hierarchy descent
+  and cross-probing in the RTL viewer.
+* Add the bounded language pieces needed by ordinary synthesizable designs, including
+  `localparam`, part selects, shifts, and carefully scoped array or memory declarations.
+
+### 7.3 — Practical sequential RTL and simulation setup
+
+* Expand clocked blocks to bounded reset and enable branches, multiple nonblocking
+  assignments, and clear diagnostics for unsafe blocking/nonblocking mixtures.
+* Define `initial` as simulation-only unless the selected target explicitly supports
+  synthesizable initialization.
+* Begin with constant initialization and bounded statements. Delay controls, tasks,
+  `force`, and unrestricted testbench language remain outside the supported subset.
+* Preserve or reject unsupported behavior explicitly during import and export.
+
+### 7.4 — Synthesis results and logical inspection
+
+Display and persist:
+
+* Synthesized netlist and hierarchy
 * Cell usage
 * Logic depth
-* Fanout
+* Fanout and high-fanout paths
+* Source-to-netlist cross-probing
+
+Acceptance: known combinational and sequential examples synthesize reproducibly; unsupported
+RTL fails with a useful source-level diagnostic; imported multi-module hierarchy can be
+navigated; and the generated netlist survives save/load without being mistaken for a
+transistor-level or physical implementation.
 
 ---
 

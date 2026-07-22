@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DeviceCharacteristics, LogicState, PhysicalDrcReport, PhysicalLayoutIr, Project, SimulationResult, TruthTableResult, ValidationReport, WaveformConfig, WaveformGroup, WaveformResult, WorkspaceState } from "./types";
+import type { DeviceCharacteristics, LogicState, PhysicalDrcReport, PhysicalLayoutIr, Project, RtlModule, SimulationResult, TruthTableResult, ValidationReport, WaveformConfig, WaveformGroup, WaveformResult, WorkspaceState } from "./types";
 
 const browserFallback = (): WorkspaceState => ({
   project: {
@@ -9,6 +9,9 @@ const browserFallback = (): WorkspaceState => ({
     wires: [],
     blockDefinitions: [],
     waveformGroups: [],
+    timingTargetNs: null,
+    highFanoutWarningThreshold: 8,
+    rtlDesign: null,
     technology: {
       format_version: 1,
       name: "OpenChippy EDU CMOS",
@@ -29,6 +32,20 @@ const browserFallback = (): WorkspaceState => ({
         reference_length_um: 1,
         gate_capacitance_ff_per_um: 2.2,
         diffusion_capacitance_ff_per_um: 1.2,
+      },
+      physical_parasitics: {
+        format_version: 1,
+        wire_capacitance_ff_per_um: .16,
+        via_capacitance_ff: .05,
+        layer_capacitance_ff_per_um: {},
+        via_capacitance_overrides_ff: {},
+      },
+      tapeout_window: {
+        format_version: 1,
+        name: "Caravel SKY130 user area",
+        width_um: 2920,
+        height_um: 3520,
+        edge_margin_um: 0,
       },
       physical_rules: {
         format_version: 1,
@@ -162,8 +179,36 @@ export async function renameProject(name: string): Promise<WorkspaceState> {
   return invoke("rename_project", { name });
 }
 
+export async function setTimingTarget(targetNs: number | null): Promise<WorkspaceState> {
+  return invoke("set_timing_target", { targetNs });
+}
+
+export async function setHighFanoutWarningThreshold(threshold: number): Promise<WorkspaceState> {
+  return invoke("set_high_fanout_warning_threshold", { threshold });
+}
+
 export async function validateProject(): Promise<ValidationReport> {
   return invoke("validate_project");
+}
+
+export async function parseVerilog(source: string): Promise<RtlModule> {
+  return invoke("parse_verilog", { source });
+}
+
+export async function readVerilogSource(path: string): Promise<string> {
+  return invoke("read_verilog_source", { path });
+}
+
+export async function importVerilog(source: string): Promise<WorkspaceState> {
+  return invoke("import_verilog", { source });
+}
+
+export async function exportVerilog(): Promise<string> {
+  return invoke("export_verilog");
+}
+
+export async function saveTextFile(path: string, data: string): Promise<string> {
+  return invoke("save_text_file", { path, data });
 }
 
 export async function generatePhysicalIr(): Promise<PhysicalLayoutIr> {
@@ -174,8 +219,12 @@ export async function validatePhysicalLayout(): Promise<PhysicalDrcReport> {
   return invoke("validate_physical_layout");
 }
 
-export async function inspectPhysicalLayout(): Promise<{ layout: PhysicalLayoutIr; drc: PhysicalDrcReport }> {
+export async function inspectPhysicalLayout(): Promise<{ layout: PhysicalLayoutIr; drc: PhysicalDrcReport; buildReport: import("./types").PhysicalBuildReport }> {
   return invoke("inspect_physical_layout");
+}
+
+export async function savePhysicalLayout(path: string): Promise<string> {
+  return invoke("save_physical_layout", { path });
 }
 
 export async function savePhysicalDrcReport(path: string, data: string): Promise<string> {

@@ -58,6 +58,47 @@ export type Project = {
   technology: Technology;
   blockDefinitions: BlockDefinition[];
   waveformGroups: WaveformGroup[];
+  timingTargetNs: number | null;
+  highFanoutWarningThreshold: number;
+  rtlDesign: RtlDesign | null;
+};
+
+export type RtlModule = {
+  name: string;
+  parameters: Array<{ name: string; defaultExpression: string; defaultValue: number }>;
+  ports: Array<{ name: string; direction: "input" | "output"; range: RtlRange | null }>;
+  nets: Array<{ name: string; range: RtlRange | null }>;
+  instances: Array<{
+    name: string;
+    cell: string;
+    primitive: "and" | "or" | "xor" | "nand" | "nor" | "xnor" | "not" | "buf" | null;
+    parameterOverrides: Array<{ name: string | null; expression: string; value: number }>;
+    connections: string[];
+  }>;
+  assignments: Array<{
+    target: string;
+    expression: string;
+    referencedSignals: string[];
+  }>;
+  sequentialProcesses: Array<{
+    edge: "posedge" | "negedge";
+    clock: string;
+    target: string;
+    expression: string;
+    referencedSignals: string[];
+  }>;
+};
+
+export type RtlRange = { msb: number; lsb: number; msbExpression: string | null; lsbExpression: string | null };
+
+export type RtlDesign = {
+  module: RtlModule;
+  placements: Array<{
+    instanceName: string;
+    x: number;
+    y: number;
+    level: number;
+  }>;
 };
 
 export type WaveformGroup = {
@@ -99,8 +140,26 @@ export type Technology = {
   max_metal_layers: number;
   nmos: MosTechnology;
   pmos: MosTechnology;
+  physical_parasitics: PhysicalParasiticRules;
+  tapeout_window: TapeoutWindow;
   physical_rules: PhysicalRuleDeck;
   physical_planning: PhysicalPlanningRules;
+};
+
+export type TapeoutWindow = {
+  format_version: number;
+  name: string;
+  width_um: number;
+  height_um: number;
+  edge_margin_um: number;
+};
+
+export type PhysicalParasiticRules = {
+  format_version: number;
+  wire_capacitance_ff_per_um: number;
+  via_capacitance_ff: number;
+  layer_capacitance_ff_per_um: Record<string, number>;
+  via_capacitance_overrides_ff: Record<string, number>;
 };
 
 export type LayerRule = {
@@ -260,7 +319,7 @@ export type PhysicalLayoutIr = {
     devicePitchUm: number;
     candidates: Array<{
       id: number;
-      strategy: "topology" | "diffusion" | "congestion";
+      strategy: "hierarchy" | "topology" | "diffusion" | "congestion" | "timing";
       devices: Array<{
         componentId: string;
         name: string;
@@ -271,10 +330,21 @@ export type PhysicalLayoutIr = {
         column: number;
         site: number;
       }>;
+      blockRegions: Array<{
+        name: string;
+        minX: number;
+        minY: number;
+        maxX: number;
+        maxY: number;
+        deviceCount: number;
+        immutable: boolean;
+      }>;
       legal: boolean;
       estimatedWireLengthUm: number;
       peakBinUtilization: number;
       diffusionSharingPairs: number;
+      occupancyRetries: number;
+      reservedDeviceShapes: number;
       score: number;
     }>;
     selectedCandidate: number;
@@ -318,8 +388,13 @@ export type PhysicalLayoutIr = {
       pinAccessPoints: number;
       blockedPinAccessPoints: number;
       wireLengthUm: number;
+      layerWireLengthsUm: Record<string, number>;
       viaCount: number;
+      viaCounts: Record<string, number>;
       repairCount: number;
+      rejectedGeometryCount: number;
+      trackRetryCount: number;
+      layerEscalationCount: number;
     }>;
     iterations: Array<{
       iteration: number;
@@ -333,6 +408,70 @@ export type PhysicalLayoutIr = {
     maxIterations: number;
     totalWireLengthUm: number;
     totalViaCount: number;
+    rejectedGeometryCount: number;
+    seededDeviceShapeCount: number;
+    trackRetryCount: number;
+    layerEscalationCount: number;
+  };
+  timing: {
+    nets: Array<{
+      net: number;
+      name: string;
+      fanout: number;
+      wireLengthUm: number;
+      viaCount: number;
+      routedCapacitanceFf: number;
+      deviceCapacitanceFf: number;
+      totalCapacitanceFf: number;
+      estimatedDelayNs: number;
+    }>;
+    paths: Array<{
+      inputPin: string;
+      outputPin: string;
+      nets: number[];
+      netNames: string[];
+      deviceIds: string[];
+      deviceNames: string[];
+      estimatedDelayNs: number;
+      requiredTimeNs: number | null;
+      slackNs: number | null;
+    }>;
+    candidates: Array<{
+      candidate: number;
+      floorplanCandidate: number;
+      placementCandidate: number;
+      strategy: "square" | "balanced" | "topology";
+      timingDriven: boolean;
+      areaUm2: number;
+      totalWireLengthUm: number;
+      totalViaCount: number;
+      routingOverflow: number;
+      detailConflicts: number;
+      estimatedWorstDelayNs: number;
+      slackNs: number | null;
+      meetsTiming: boolean | null;
+    }>;
+    selectedCandidate: number | null;
+    criticalPath: number | null;
+    timingTargetNs: number | null;
+    worstSlackNs: number | null;
+    criticalNet: number | null;
+    criticalNetName: string | null;
+    estimatedWorstDelayNs: number;
+  };
+  tapeout: {
+    name: string;
+    widthUm: number;
+    heightUm: number;
+    edgeMarginUm: number;
+    usableWidthUm: number;
+    usableHeightUm: number;
+    geometryWidthUm: number;
+    geometryHeightUm: number;
+    areaUtilization: number;
+    fits: boolean;
+    shapesOutsideFloorplan: number;
+    shapesOutsideTapeout: number;
   };
   bounds: {
     minX: number;
@@ -349,6 +488,17 @@ export type PhysicalLayoutIr = {
     componentId: string | null;
     net: number | null;
   }>;
+  physicalBlocks: Array<{
+    instanceName: string;
+    bounds: { minX: number; minY: number; maxX: number; maxY: number };
+    deviceIds: string[];
+    localNets: number[];
+    interfacePins: Array<{ name: string; net: number; x: number; y: number }>;
+    shapeIndices: number[];
+    localDrcErrors: number;
+    verified: boolean;
+    immutable: boolean;
+  }>;
 };
 
 export type PhysicalDrcDiagnostic = {
@@ -359,12 +509,24 @@ export type PhysicalDrcDiagnostic = {
   shapeIndices: number[];
   measured: number;
   required: number;
+  category: "deviceOverlap" | "metalOverlap" | "minimumSpacing" | "viaEnclosure" | "powerCollision" | "routingCongestion" | "boundaryViolation" | "geometry";
+  origin: "placement" | "powerRouting" | "signalRouting" | "geometryGeneration" | "import";
 };
 
 export type PhysicalDrcReport = {
   diagnostics: PhysicalDrcDiagnostic[];
   errorCount: number;
   warningCount: number;
+  byCategory: Record<string, number>;
+  byOrigin: Record<string, number>;
+};
+
+export type PhysicalBuildReport = {
+  elapsedMs: number;
+  stages: string[];
+  globalRoutingOverflow: number;
+  detailedRoutingConflicts: number;
+  rejectedGeometryCount: number;
 };
 
 export type Diagnostic = {
@@ -408,6 +570,35 @@ export type SimulationResult = {
   wires: Array<{ wireId: string; state: LogicState }>;
   converged: boolean;
   supplyVoltage: number;
+  fanout: {
+    highFanoutThreshold: number;
+    highFanoutCount: number;
+    undrivenCount: number;
+    multiplyDrivenCount: number;
+    nets: Array<{
+      name: string;
+      aliases: string[];
+      drivers: FanoutEndpoint[];
+      loads: FanoutEndpoint[];
+      fanout: number;
+      highFanout: boolean;
+      undriven: boolean;
+      multiplyDriven: boolean;
+    }>;
+    groups: Array<{
+      name: string;
+      signals: string[];
+      totalFanout: number;
+      maxFanout: number;
+    }>;
+  };
+};
+
+export type FanoutEndpoint = {
+  componentId: string | null;
+  name: string;
+  kind: string;
+  terminal: string;
 };
 
 export type TruthTableResult = {

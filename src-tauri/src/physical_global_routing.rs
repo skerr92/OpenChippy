@@ -3,10 +3,10 @@ use crate::{
     physical_placement::PhysicalPlacementReport,
     physical_planning::{PhysicalNetClass, PhysicalPlanningReport, PlannedNet},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GlobalRouteSegment {
     pub from_bin: usize,
@@ -14,7 +14,7 @@ pub struct GlobalRouteSegment {
     pub layer: u16,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GlobalNetRoute {
     pub net: usize,
@@ -27,7 +27,7 @@ pub struct GlobalNetRoute {
     pub rip_up_count: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GlobalRoutingIteration {
     pub iteration: u16,
@@ -36,7 +36,7 @@ pub struct GlobalRoutingIteration {
     pub best_so_far: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GlobalRoutingReport {
     pub routes: Vec<GlobalNetRoute>,

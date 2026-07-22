@@ -1,0 +1,81 @@
+# Load this file from Circuit > Active technology > Load YAML.
+# Values are educational examples, not a foundry-qualified PDK.
+technology:
+  format_version: 1
+  name: OpenChippy Example EDU 5M
+  supply_voltage: 1.8
+  max_metal_layers: 5
+
+# Caravel's documented SKY130 user-project region is 2.92 mm x 3.52 mm:
+# https://caravel-harness.readthedocs.io/en/latest/getting-started.html#user-project-area
+# This is a shuttle/harness allocation, not an intrinsic SKY130 process limit.
+tapeout_window:
+  format_version: 1
+  name: Caravel SKY130 user area
+  width_um: 2920.0
+  height_um: 3520.0
+  edge_margin_um: 0.0
+
+nmos:
+  threshold_voltage: 0.45
+  nominal_on_resistance_ohms: 12000.0
+  reference_width_um: 1.0
+  reference_length_um: 1.0
+  gate_capacitance_ff_per_um: 2.0
+  diffusion_capacitance_ff_per_um: 1.0
+
+pmos:
+  threshold_voltage: -0.45
+  nominal_on_resistance_ohms: 22000.0
+  reference_width_um: 1.0
+  reference_length_um: 1.0
+  gate_capacitance_ff_per_um: 2.2
+  diffusion_capacitance_ff_per_um: 1.2
+
+physical_parasitics:
+  format_version: 1
+  wire_capacitance_ff_per_um: 0.16
+  via_capacitance_ff: 0.05
+  layer_capacitance_ff_per_um:
+    metal1: 0.20
+    metal2: 0.18
+    metal3: 0.16
+    metal4: 0.14
+    metal5: 0.12
+  via_capacitance_overrides_ff:
+    via12: 0.060
+    via23: 0.055
+    via34: 0.050
+    via45: 0.045
+
+physical_rules:
+  format_version: 1
+  database_units_per_micron: 1000
+  manufacturing_grid_um: 0.01
+  diffusion: { min_width_um: 0.30, min_spacing_um: 0.30, min_area_um2: 0.09 }
+  poly: { min_width_um: 0.20, min_spacing_um: 0.20, min_area_um2: 0.04 }
+  well: { min_width_um: 0.60, min_spacing_um: 0.60, min_area_um2: 0.36 }
+  metal: { min_width_um: 0.20, min_spacing_um: 0.04, min_area_um2: 0.04 }
+  contact: { size_um: 0.22, min_spacing_um: 0.08, enclosure_um: 0.03 }
+  via: { size_um: 0.24, min_spacing_um: 0.08, enclosure_um: 0.02 }
+  gate_extension_um: 0.20
+  well_enclosure_um: 0.30
+  layer_overrides: {}
+  via_overrides: {}
+
+physical_planning:
+  placement_site_width_um: 0.50
+  row_height_um: 1.70
+  target_device_density: 0.65
+  target_routing_utilization: 0.75
+  floorplan_growth_factor: 0.08
+  max_floorplan_growth_passes: 3
+  global_route_max_iterations: 30
+  global_route_stall_iterations: 3
+  detailed_route_max_iterations: 10
+  routing_layers:
+    metal1: { pitch_um: 0.32, offset_um: 0.16, preferred_direction: horizontal, capacity_adjustment: 0.75, reserved_for_power: true }
+    metal2: { pitch_um: 0.32, offset_um: 0.16, preferred_direction: vertical, capacity_adjustment: 0.75, reserved_for_power: false }
+    metal3: { pitch_um: 0.32, offset_um: 0.16, preferred_direction: horizontal, capacity_adjustment: 0.75, reserved_for_power: false }
+    metal4: { pitch_um: 0.32, offset_um: 0.16, preferred_direction: vertical, capacity_adjustment: 0.75, reserved_for_power: false }
+    metal5: { pitch_um: 0.32, offset_um: 0.16, preferred_direction: horizontal, capacity_adjustment: 0.75, reserved_for_power: false }

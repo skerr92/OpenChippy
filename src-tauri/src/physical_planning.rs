@@ -2,9 +2,9 @@ use crate::{
     physical_layout::{NetRole, PhysicalDevice, PhysicalNet, PhysicalPin},
     technology::{RoutingDirection, Technology},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FloorplanStrategy {
     Square,
@@ -12,7 +12,7 @@ pub enum FloorplanStrategy {
     Topology,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PhysicalNetClass {
     Power,
@@ -20,7 +20,7 @@ pub enum PhysicalNetClass {
     Signal,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutingLayerPlan {
     pub layer: u16,
@@ -31,7 +31,7 @@ pub struct RoutingLayerPlan {
     pub reserved_for_power: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlannedNet {
     pub net: usize,
@@ -42,7 +42,7 @@ pub struct PlannedNet {
     pub estimated_demand: f64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutingBinLayerCapacity {
     pub layer: u16,
@@ -51,7 +51,7 @@ pub struct RoutingBinLayerCapacity {
     pub reserved_for_power: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutingBin {
     pub id: usize,
@@ -64,7 +64,7 @@ pub struct RoutingBin {
     pub layer_capacities: Vec<RoutingBinLayerCapacity>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FloorplanCandidate {
     pub id: usize,
@@ -84,7 +84,7 @@ pub struct FloorplanCandidate {
     pub score: f64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhysicalPlanningReport {
     pub placement_site_width_um: f64,

@@ -1,18 +1,22 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { MapControls } from "three/addons/controls/MapControls.js";
-import type { PhysicalDrcDiagnostic, PhysicalDrcReport, PhysicalLayoutIr } from "./types";
+import type { PhysicalBuildReport, PhysicalDrcDiagnostic, PhysicalDrcReport, PhysicalLayoutIr } from "./types";
 
 type ViewMode = "schematic" | "3d" | "waveform";
 
 type Props = {
   layout: PhysicalLayoutIr | null;
   drc: PhysicalDrcReport | null;
+  buildReport: PhysicalBuildReport | null;
+  buildError: string | null;
   selectedIds: string[];
   projectName: string;
   technologyName: string;
   onSelect: (id: string | null, additive?: boolean) => void;
   onSaveDrc: () => void;
+  onSaveLayout: () => void;
+  onRetry: () => void;
   onView: (view: ViewMode) => void;
 };
 
@@ -57,19 +61,32 @@ function createLayers(maxMetalLayers: number): Record<string, LayerStyle> {
 }
 
 type LayerName = string;
+type CameraSnapshot = {
+  position: THREE.Vector3;
+  target: THREE.Vector3;
+  up: THREE.Vector3;
+  zoom: number;
+};
 
 export default function PhysicalViewport({
   layout,
   drc,
+  buildReport,
+  buildError,
   selectedIds,
   projectName,
   technologyName,
   onSelect,
   onSaveDrc,
+  onSaveLayout,
+  onRetry,
   onView,
 }: Props) {
   const host = useRef<HTMLDivElement>(null);
-  const resetView = useRef<() => void>(() => {});
+  const fitView = useRef<() => void>(() => {});
+  const orientView = useRef<(orientation: "top" | "iso" | "front" | "right") => void>(() => {});
+  const cameraSnapshot = useRef<CameraSnapshot | null>(null);
+  const cameraLayout = useRef<PhysicalLayoutIr | null>(null);
   const selectRef = useRef(onSelect);
   const layers = useMemo(() => createLayers(layout?.maxMetalLayers ?? 5), [layout?.maxMetalLayers]);
   const [visibleLayers, setVisibleLayers] = useState<Set<LayerName>>(
@@ -80,6 +97,7 @@ export default function PhysicalViewport({
   const [drcRule, setDrcRule] = useState("all");
   const [drcSeverity, setDrcSeverity] = useState("all");
   const [drcNet, setDrcNet] = useState("all");
+  const [showBlockRegions, setShowBlockRegions] = useState(true);
   selectRef.current = onSelect;
 
   useEffect(() => {
@@ -91,6 +109,8 @@ export default function PhysicalViewport({
 
   useEffect(() => {
     if (!host.current || !layout) return;
+    const sameLayout = cameraLayout.current === layout;
+    cameraLayout.current = layout;
     const container = host.current;
     const scene = new THREE.Scene();
     scene.background = new THREE.Color("#08110e");
@@ -166,28 +186,79 @@ export default function PhysicalViewport({
       ),
     );
     scene.add(new THREE.Box3Helper(boundary, new THREE.Color("#3a5b50")));
+    if (showBlockRegions && layout.physicalBlocks.length) {
+      const colors = ["#56d6b1", "#e6ba58", "#7ca8ff", "#df7fc0"];
+      layout.physicalBlocks.forEach((block, index) => {
+        const region = block.bounds;
+        const regionBox = new THREE.Box3(
+          new THREE.Vector3(region.minX, .36, region.minY),
+          new THREE.Vector3(region.maxX, .42, region.maxY),
+        );
+        scene.add(new THREE.Box3Helper(regionBox, new THREE.Color(colors[index % colors.length])));
+      });
+    }
 
-    const fit = () => {
+    const updateProjection = () => {
       const aspect = container.clientWidth / Math.max(container.clientHeight, 1);
       camera.left = -aspect;
       camera.right = aspect;
       camera.top = 1;
       camera.bottom = -1;
+      camera.updateProjectionMatrix();
+    };
+    const fit = () => {
+      const aspect = container.clientWidth / Math.max(container.clientHeight, 1);
       camera.zoom = Math.min(
         (2 * aspect) / Math.max(width * 1.25, .1),
         2 / Math.max(depth * 1.25, .1),
       );
       camera.updateProjectionMatrix();
     };
-    resetView.current = () => {
+    const rememberCamera = () => {
+      cameraSnapshot.current = {
+        position: camera.position.clone(),
+        target: controls.target.clone(),
+        up: camera.up.clone(),
+        zoom: camera.zoom,
+      };
+    };
+    const setOrientation = (orientation: "top" | "iso" | "front" | "right") => {
       controls.target.copy(center);
-      camera.position.set(center.x, span * 2, center.z + .001);
-      camera.up.set(0, 0, -1);
+      if (orientation === "top") {
+        camera.position.set(center.x, span * 2, center.z + .001);
+        camera.up.set(0, 0, -1);
+      } else if (orientation === "front") {
+        camera.position.set(center.x, span * .35, center.z + span * 2);
+        camera.up.set(0, 1, 0);
+      } else if (orientation === "right") {
+        camera.position.set(center.x + span * 2, span * .35, center.z);
+        camera.up.set(0, 1, 0);
+      } else {
+        camera.position.set(center.x + span * 1.35, span * 1.5, center.z + span * 1.35);
+        camera.up.set(0, 1, 0);
+      }
       camera.lookAt(center);
+      controls.update();
+      rememberCamera();
+    };
+    orientView.current = setOrientation;
+    fitView.current = () => {
       fit();
       controls.update();
+      rememberCamera();
     };
-    resetView.current();
+    updateProjection();
+    if (sameLayout && cameraSnapshot.current) {
+      camera.position.copy(cameraSnapshot.current.position);
+      controls.target.copy(cameraSnapshot.current.target);
+      camera.up.copy(cameraSnapshot.current.up);
+      camera.zoom = cameraSnapshot.current.zoom;
+      camera.updateProjectionMatrix();
+      controls.update();
+    } else {
+      setOrientation("top");
+      fitView.current();
+    }
     if (!highlightedBox.isEmpty()) {
       const violationCenter = highlightedBox.getCenter(new THREE.Vector3());
       const violationSize = highlightedBox.getSize(new THREE.Vector3());
@@ -199,7 +270,9 @@ export default function PhysicalViewport({
       camera.zoom = Math.min((2 * aspect) / (violationSpan * 1.8), 2 / (violationSpan * 1.8));
       camera.updateProjectionMatrix();
       controls.update();
+      rememberCamera();
     }
+    controls.addEventListener("change", rememberCamera);
 
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
@@ -221,7 +294,7 @@ export default function PhysicalViewport({
 
     const resize = () => {
       renderer.setSize(container.clientWidth, container.clientHeight, false);
-      fit();
+      updateProjection();
     };
     const observer = new ResizeObserver(resize);
     observer.observe(container);
@@ -239,13 +312,14 @@ export default function PhysicalViewport({
       observer.disconnect();
       renderer.domElement.removeEventListener("pointerdown", pointerDown);
       renderer.domElement.removeEventListener("pointerup", pointerUp);
+      controls.removeEventListener("change", rememberCamera);
       controls.dispose();
       geometries.forEach((geometry) => geometry.dispose());
       materials.forEach((material) => material.dispose());
       renderer.dispose();
       renderer.domElement.remove();
     };
-  }, [layout, selectedIds, visibleLayers, layers, selectedDrc]);
+  }, [layout, selectedIds, visibleLayers, layers, selectedDrc, showBlockRegions]);
 
   const toggleLayer = (layer: LayerName) => {
     setVisibleLayers((current) => {
@@ -292,7 +366,13 @@ export default function PhysicalViewport({
           <button className="active">3D Layout</button>
           <button onClick={() => onView("waveform")}>Waveforms</button>
         </div>
-        <button className="physical-reset" onClick={() => resetView.current()}>Top view / Fit</button>
+        <button
+          className="physical-reset"
+          onClick={() => setShowBlockRegions((current) => !current)}
+          disabled={!layout?.physicalBlocks.length}
+        >
+          {showBlockRegions ? "Hide" : "Show"} block regions
+        </button>
         <p className="physical-sidebar-section">Rust physical IR</p>
         <div className="physical-summary">
           <strong>Format v{layout?.formatVersion ?? "…"}</strong>
@@ -302,6 +382,9 @@ export default function PhysicalViewport({
           {layout && (() => {
             const candidate = layout.planning.candidates[layout.planning.selectedCandidate];
             const placement = layout.placement.candidates[layout.placement.selectedCandidate];
+            const candidateTiming = layout.timing.candidates.find(
+              (entry) => entry.candidate === layout.timing.selectedCandidate,
+            );
             return candidate ? (
               <>
                 <span>{candidate.strategy} plan · {candidate.widthUm.toFixed(2)} × {candidate.heightUm.toFixed(2)} µm</span>
@@ -313,12 +396,43 @@ export default function PhysicalViewport({
                     <span>{placement.strategy} placement · {placement.legal ? "legal" : "illegal"}</span>
                     <span>{placement.estimatedWireLengthUm.toFixed(1)} µm HPWL · {(placement.peakBinUtilization * 100).toFixed(1)}% peak bin</span>
                     <span>{placement.diffusionSharingPairs} diffusion-sharing pairs</span>
+                    <span>{placement.reservedDeviceShapes} reserved device shapes · {placement.occupancyRetries} occupancy retries</span>
+                    {placement.blockRegions.length > 0 && (
+                      <>
+                        <span>{placement.blockRegions.length} staged block regions</span>
+                        <span>private → shared → external → power routing</span>
+                        <span>local M1 rails · deferred M2 power stitch</span>
+                      </>
+                    )}
                   </>
                 )}
                 <span>{layout.globalRouting.converged ? "global route converged" : `${layout.globalRouting.totalOverflow} route overflow`}</span>
                 <span>{layout.globalRouting.routes.length} routed nets · {layout.globalRouting.iterations.length} negotiation passes</span>
                 <span>{layout.detailedRouting.converged ? "detailed route converged" : `${layout.detailedRouting.conflictCount} detail conflicts · ${layout.detailedRouting.blockedPinCount} blocked pins`}</span>
                 <span>{layout.detailedRouting.totalWireLengthUm.toFixed(1)} µm detailed wire · {layout.detailedRouting.totalViaCount} vias · {layout.detailedRouting.iterations.length} repair passes</span>
+                <span>{layout.detailedRouting.rejectedGeometryCount} illegal route shapes rejected before IR</span>
+                <span>{layout.detailedRouting.seededDeviceShapeCount} device shapes seeded before routing</span>
+                <span>{layout.detailedRouting.trackRetryCount} indexed track retries · {layout.detailedRouting.layerEscalationCount} layer escalations</span>
+                {layout.physicalBlocks.length > 0 && (
+                  <span>{layout.physicalBlocks.filter((block) => block.verified).length}/{layout.physicalBlocks.length} frozen blocks locally DRC-clean · {layout.physicalBlocks.reduce((count, block) => count + block.interfacePins.length, 0)} interface pins</span>
+                )}
+                <span>{layout.timing.estimatedWorstDelayNs.toFixed(4)} ns worst path · {layout.timing.paths.length} input/output paths</span>
+                <span>{layout.timing.candidates.length} routed candidates timing-scored</span>
+                {candidateTiming && (
+                  <span>
+                    selected {candidateTiming.strategy}{candidateTiming.timingDriven ? " timing-driven" : ""} · {candidateTiming.estimatedWorstDelayNs.toFixed(4)} ns · {candidateTiming.areaUm2.toFixed(2)} µm²
+                  </span>
+                )}
+                <span>{layout.timing.timingTargetNs === null
+                  ? "timing unconstrained"
+                  : `${layout.timing.worstSlackNs !== null && layout.timing.worstSlackNs >= 0 ? "+" : ""}${layout.timing.worstSlackNs?.toFixed(4)} ns worst slack · ${layout.timing.worstSlackNs !== null && layout.timing.worstSlackNs >= 0 ? "MET" : "VIOLATED"}`}</span>
+                {layout.timing.criticalPath !== null && (() => {
+                  const path = layout.timing.paths[layout.timing.criticalPath];
+                  return <span>critical {path.inputPin} → {path.outputPin} · {path.netNames.join(" → ")}</span>;
+                })()}
+                <span>{layout.tapeout.fits ? "FITS" : "EXCEEDS"} {layout.tapeout.name} · {layout.tapeout.geometryWidthUm.toFixed(2)} × {layout.tapeout.geometryHeightUm.toFixed(2)} µm used</span>
+                <span>{(layout.tapeout.areaUtilization * 100).toFixed(4)}% tapeout area · {layout.tapeout.shapesOutsideTapeout} shapes outside</span>
+                {layout.tapeout.shapesOutsideFloorplan > 0 && <span>{layout.tapeout.shapesOutsideFloorplan} shapes extend beyond synthesized floorplan</span>}
               </>
             ) : null;
           })()}
@@ -328,6 +442,12 @@ export default function PhysicalViewport({
           <strong>{drc ? (drc.errorCount ? `${drc.errorCount} errors` : "DRC clean") : "Checking…"}</strong>
           <span>{drc ? `${drc.warningCount} warnings · ${drc.diagnostics.length} results` : "Rust rule deck"}</span>
         </div>
+        {drc && <div className="physical-build-statistics">
+          <strong>Build report</strong>
+          {Object.entries(drc.byCategory).map(([name, count]) => <span key={name}>{name} <b>{count}</b></span>)}
+          {Object.entries(drc.byOrigin).map(([name, count]) => <span key={name}>{name} <b>{count}</b></span>)}
+          {buildReport && <small>{buildReport.elapsedMs} ms · overflow {buildReport.globalRoutingOverflow} · conflicts {buildReport.detailedRoutingConflicts} · rejected {buildReport.rejectedGeometryCount}</small>}
+        </div>}
         <div className="physical-drc-filters">
           <select aria-label="Filter DRC by layer" value={drcLayer} onChange={(event) => setDrcLayer(event.target.value)}>
             <option value="all">All layers</option>
@@ -362,6 +482,7 @@ export default function PhysicalViewport({
           {drc && !filteredDiagnostics.length && <p>{drc.diagnostics.length ? "No results match these filters." : "No physical violations."}</p>}
         </div>
         <button className="physical-reset" disabled={!drc} onClick={onSaveDrc}>Save DRC report…</button>
+        <button className="physical-reset" disabled={!layout} onClick={onSaveLayout}>Save .chippy_gds…</button>
         <p className="physical-sidebar-section">Layers</p>
         <button className="physical-reset" onClick={showAllLayers}>Show all layers</button>
         <div className="physical-layers">
@@ -382,10 +503,36 @@ export default function PhysicalViewport({
             </label>
           ))}
         </div>
-        <p className="physical-help">Drag to pan · Right-drag to rotate · Wheel or pinch to zoom · Top view / Fit resets bounds</p>
+        <p className="physical-help">Drag to pan · Right-drag to rotate · Wheel or pinch to zoom · Use the lower-right controls for exact views</p>
       </aside>
       <div className="physical-canvas" ref={host}>
-        {!layout && <div className="physical-loading">Synthesizing compact layout…</div>}
+        <div className="physical-camera-controls" role="group" aria-label="Physical view camera controls">
+          <button type="button" onClick={() => orientView.current("top")}>Top</button>
+          <button type="button" onClick={() => orientView.current("iso")}>Iso</button>
+          <button type="button" onClick={() => orientView.current("front")}>Front</button>
+          <button type="button" onClick={() => orientView.current("right")}>Right</button>
+          <button type="button" className="fit" onClick={() => fitView.current()}>Fit</button>
+        </div>
+        {!layout && !buildError && <div className="physical-build-overlay">
+          <div className="physical-build-card">
+            <strong>Building Your Design…</strong>
+            <span>Generating physical layout</span>
+            <div className="physical-build-progress"><i /></div>
+            <ol>
+              <li>Logical placement and device generation</li>
+              <li>Local and global signal routing</li>
+              <li>Physical IR and categorized DRC</li>
+            </ol>
+            <small>Good silicon takes a little patience.</small>
+          </div>
+        </div>}
+        {!layout && buildError && <div className="physical-build-overlay">
+          <div className="physical-build-card failed">
+            <strong>Build Failed</strong>
+            <span>{buildError}</span>
+            <button type="button" onClick={onRetry}>Retry build</button>
+          </div>
+        </div>}
       </div>
     </div>
   );
