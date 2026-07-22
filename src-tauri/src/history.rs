@@ -60,6 +60,7 @@ impl ProjectHistory {
 #[cfg(test)]
 mod tests {
     use super::ProjectHistory;
+    use crate::rtl::{map_module, parse_structural_verilog};
     use crate::technology::Technology;
 
     #[test]
@@ -69,6 +70,18 @@ mod tests {
         assert_eq!(history.current().components.len(), 1);
         assert_eq!(history.undo().unwrap().components.len(), 0);
         assert_eq!(history.redo().unwrap().components.len(), 1);
+    }
+
+    #[test]
+    fn rtl_import_is_undoable_and_redoable() {
+        let module =
+            parse_structural_verilog("module inv(input A, output Y); not u0(Y, A); endmodule")
+                .unwrap();
+        let mut history = ProjectHistory::default();
+        history.update(|project| project.set_rtl_design(map_module(module)));
+        assert!(history.current().rtl_design.is_some());
+        assert!(history.undo().unwrap().rtl_design.is_none());
+        assert!(history.redo().unwrap().rtl_design.is_some());
     }
 
     #[test]
@@ -102,6 +115,28 @@ mod tests {
             history.redo().unwrap().technology.name,
             "Alternate technology"
         );
+    }
+
+    #[test]
+    fn timing_target_changes_can_be_undone_and_redone() {
+        let mut history = ProjectHistory::default();
+        history
+            .try_update(|project| project.set_timing_target(Some(0.75)))
+            .unwrap();
+        assert_eq!(history.current().timing_target_ns, Some(0.75));
+        assert_eq!(history.undo().unwrap().timing_target_ns, None);
+        assert_eq!(history.redo().unwrap().timing_target_ns, Some(0.75));
+    }
+
+    #[test]
+    fn fanout_threshold_changes_can_be_undone_and_redone() {
+        let mut history = ProjectHistory::default();
+        history
+            .try_update(|project| project.set_high_fanout_warning_threshold(12))
+            .unwrap();
+        assert_eq!(history.current().high_fanout_warning_threshold, 12);
+        assert_eq!(history.undo().unwrap().high_fanout_warning_threshold, 8);
+        assert_eq!(history.redo().unwrap().high_fanout_warning_threshold, 12);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DeviceCharacteristics, LogicState, PhysicalLayoutIr, Project, SimulationResult, TruthTableResult, ValidationReport, WaveformConfig, WaveformResult, WorkspaceState } from "./types";
+import type { DeviceCharacteristics, LogicState, PhysicalDrcReport, PhysicalLayoutIr, Project, RtlModule, SimulationResult, TruthTableResult, ValidationReport, WaveformConfig, WaveformGroup, WaveformResult, WorkspaceState } from "./types";
 
 const browserFallback = (): WorkspaceState => ({
   project: {
@@ -8,6 +8,10 @@ const browserFallback = (): WorkspaceState => ({
     components: [],
     wires: [],
     blockDefinitions: [],
+    waveformGroups: [],
+    timingTargetNs: null,
+    highFanoutWarningThreshold: 8,
+    rtlDesign: null,
     technology: {
       format_version: 1,
       name: "OpenChippy EDU CMOS",
@@ -28,6 +32,53 @@ const browserFallback = (): WorkspaceState => ({
         reference_length_um: 1,
         gate_capacitance_ff_per_um: 2.2,
         diffusion_capacitance_ff_per_um: 1.2,
+      },
+      physical_parasitics: {
+        format_version: 1,
+        wire_capacitance_ff_per_um: .16,
+        via_capacitance_ff: .05,
+        layer_capacitance_ff_per_um: {},
+        via_capacitance_overrides_ff: {},
+      },
+      tapeout_window: {
+        format_version: 1,
+        name: "Caravel SKY130 user area",
+        width_um: 2920,
+        height_um: 3520,
+        edge_margin_um: 0,
+      },
+      physical_rules: {
+        format_version: 1,
+        database_units_per_micron: 1000,
+        manufacturing_grid_um: .01,
+        diffusion: { min_width_um: .3, min_spacing_um: .3, min_area_um2: .09 },
+        poly: { min_width_um: .2, min_spacing_um: .2, min_area_um2: .04 },
+        well: { min_width_um: .6, min_spacing_um: .6, min_area_um2: .36 },
+        metal: { min_width_um: .2, min_spacing_um: .04, min_area_um2: .04 },
+        contact: { size_um: .22, min_spacing_um: .08, enclosure_um: .03 },
+        via: { size_um: .24, min_spacing_um: .08, enclosure_um: .02 },
+        gate_extension_um: .2,
+        well_enclosure_um: .3,
+        layer_overrides: {},
+        via_overrides: {},
+      },
+      physical_planning: {
+        placement_site_width_um: .5,
+        row_height_um: 1.7,
+        target_device_density: .65,
+        target_routing_utilization: .75,
+        floorplan_growth_factor: .08,
+        max_floorplan_growth_passes: 3,
+        global_route_max_iterations: 30,
+        global_route_stall_iterations: 3,
+        detailed_route_max_iterations: 10,
+        routing_layers: {
+          metal1: { pitch_um: .32, offset_um: .16, preferred_direction: "horizontal", capacity_adjustment: .75, reserved_for_power: true },
+          metal2: { pitch_um: .32, offset_um: .16, preferred_direction: "vertical", capacity_adjustment: .75, reserved_for_power: false },
+          metal3: { pitch_um: .32, offset_um: .16, preferred_direction: "horizontal", capacity_adjustment: .75, reserved_for_power: false },
+          metal4: { pitch_um: .32, offset_um: .16, preferred_direction: "vertical", capacity_adjustment: .75, reserved_for_power: false },
+          metal5: { pitch_um: .32, offset_um: .16, preferred_direction: "horizontal", capacity_adjustment: .75, reserved_for_power: false },
+        },
       },
     },
   },
@@ -128,12 +179,56 @@ export async function renameProject(name: string): Promise<WorkspaceState> {
   return invoke("rename_project", { name });
 }
 
+export async function setTimingTarget(targetNs: number | null): Promise<WorkspaceState> {
+  return invoke("set_timing_target", { targetNs });
+}
+
+export async function setHighFanoutWarningThreshold(threshold: number): Promise<WorkspaceState> {
+  return invoke("set_high_fanout_warning_threshold", { threshold });
+}
+
 export async function validateProject(): Promise<ValidationReport> {
   return invoke("validate_project");
 }
 
+export async function parseVerilog(source: string): Promise<RtlModule> {
+  return invoke("parse_verilog", { source });
+}
+
+export async function readVerilogSource(path: string): Promise<string> {
+  return invoke("read_verilog_source", { path });
+}
+
+export async function importVerilog(source: string): Promise<WorkspaceState> {
+  return invoke("import_verilog", { source });
+}
+
+export async function exportVerilog(): Promise<string> {
+  return invoke("export_verilog");
+}
+
+export async function saveTextFile(path: string, data: string): Promise<string> {
+  return invoke("save_text_file", { path, data });
+}
+
 export async function generatePhysicalIr(): Promise<PhysicalLayoutIr> {
   return invoke("generate_physical_ir");
+}
+
+export async function validatePhysicalLayout(): Promise<PhysicalDrcReport> {
+  return invoke("validate_physical_layout");
+}
+
+export async function inspectPhysicalLayout(): Promise<{ layout: PhysicalLayoutIr; drc: PhysicalDrcReport; buildReport: import("./types").PhysicalBuildReport }> {
+  return invoke("inspect_physical_layout");
+}
+
+export async function savePhysicalLayout(path: string): Promise<string> {
+  return invoke("save_physical_layout", { path });
+}
+
+export async function savePhysicalDrcReport(path: string, data: string): Promise<string> {
+  return invoke("save_physical_drc_report", { path, data });
 }
 
 export async function captureBlock(name: string): Promise<WorkspaceState> {
@@ -162,6 +257,10 @@ export async function generateTruthTable(): Promise<TruthTableResult> {
 
 export async function simulateWaveform(config: WaveformConfig): Promise<WaveformResult> {
   return invoke("simulate_waveform", { config });
+}
+
+export async function setWaveformGroups(groups: WaveformGroup[]): Promise<WorkspaceState> {
+  return invoke("set_waveform_groups", { groups });
 }
 
 export async function undo(): Promise<WorkspaceState> {

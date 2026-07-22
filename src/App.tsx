@@ -1,14 +1,17 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import * as backend from "./backend";
-import type { ComponentKind, DeviceCharacteristics, LogicState, PhysicalLayoutIr, SimulationResult, TerminalRef, TruthTableResult, ValidationReport, WaveformConfig, WaveformResult, WorkspaceState } from "./types";
+import type { ComponentKind, DeviceCharacteristics, LogicState, PhysicalBuildReport, PhysicalDrcReport, PhysicalLayoutIr, RtlModule, SimulationResult, TerminalRef, TruthTableResult, ValidationReport, WaveformConfig, WaveformGroup, WaveformResult, WorkspaceState } from "./types";
 import PhysicalViewport from "./PhysicalViewport";
 import SchematicViewport from "./SchematicViewport";
 import WaveformView from "./WaveformView";
+import RtlViewport from "./RtlViewport";
+import { isEditableTarget, isEditingText } from "./dom";
 
-type ViewMode = "schematic" | "3d" | "waveform";
+type ViewMode = "schematic" | "3d" | "waveform" | "rtl";
 
 export default function App() {
+  const editableFocusRef = useRef(false);
   const [workspace, setWorkspace] = useState<WorkspaceState | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [selectedWireId, setSelectedWireId] = useState<string | null>(null);
@@ -32,6 +35,16 @@ export default function App() {
   const [waveformRunning, setWaveformRunning] = useState(false);
   const [deviceCharacteristics, setDeviceCharacteristics] = useState<DeviceCharacteristics | null>(null);
   const [physicalIr, setPhysicalIr] = useState<PhysicalLayoutIr | null>(null);
+  const [physicalDrc, setPhysicalDrc] = useState<PhysicalDrcReport | null>(null);
+  const [physicalBuildReport, setPhysicalBuildReport] = useState<PhysicalBuildReport | null>(null);
+  const [physicalBuildError, setPhysicalBuildError] = useState<string | null>(null);
+  const [physicalBuildRevision, setPhysicalBuildRevision] = useState(0);
+  const [rtlDialogOpen, setRtlDialogOpen] = useState(false);
+  const [rtlSource, setRtlSource] = useState("");
+  const [rtlPath, setRtlPath] = useState<string | null>(null);
+  const [rtlPreview, setRtlPreview] = useState<RtlModule | null>(null);
+  const [rtlDiagnostic, setRtlDiagnostic] = useState<string | null>(null);
+  const [rtlParsing, setRtlParsing] = useState(false);
   const [blockDialogOpen, setBlockDialogOpen] = useState(false);
   const [blockName, setBlockName] = useState("");
   const [blockDialogError, setBlockDialogError] = useState<string | null>(null);
@@ -48,6 +61,11 @@ export default function App() {
     () => project?.components.filter(({ kind }) => kind === "input") ?? [],
     [project],
   );
+  const truthTableInputCount = useMemo(() => project?.rtlDesign
+    ? project.rtlDesign.module.ports
+      .filter(({ direction }) => direction === "input")
+      .reduce((count, port) => count + (port.range ? Math.abs(port.range.msb - port.range.lsb) + 1 : 1), 0)
+    : digitalInputs.length, [digitalInputs.length, project?.rtlDesign]);
 
   useEffect(() => {
     setInputStates((current) => Object.fromEntries(
@@ -76,21 +94,79 @@ export default function App() {
   useEffect(() => {
     if (viewMode !== "3d" || !project) {
       setPhysicalIr(null);
+      setPhysicalDrc(null);
+      setPhysicalBuildReport(null);
+      setPhysicalBuildError(null);
       return;
     }
     setPhysicalIr(null);
+    setPhysicalDrc(null);
+    setPhysicalBuildReport(null);
+    setPhysicalBuildError(null);
     let active = true;
-    backend.generatePhysicalIr()
-      .then((ir) => {
-        if (active) setPhysicalIr(ir);
+    backend.inspectPhysicalLayout()
+      .then(({ layout: ir, drc: report, buildReport }) => {
+        if (active) {
+          setPhysicalIr(ir);
+          setPhysicalDrc(report);
+          setPhysicalBuildReport(buildReport);
+        }
       })
       .catch((reason) => {
-        if (active) showError(reason);
+        if (active) setPhysicalBuildError(reason instanceof Error ? reason.message : String(reason));
       });
     return () => {
       active = false;
     };
-  }, [viewMode, project]);
+  }, [viewMode, project, physicalBuildRevision]);
+
+  const savePhysicalReport = async () => {
+    if (!physicalIr || !physicalDrc) return;
+    try {
+      const destination = await save({
+        defaultPath: `${project?.name ?? "OpenChippy"}.physical-drc.json`,
+        filters: [{ name: "Physical DRC report", extensions: ["json"] }],
+      });
+      if (!destination) return;
+      const candidate = physicalIr.planning.candidates[physicalIr.planning.selectedCandidate];
+      const placement = physicalIr.placement.candidates[physicalIr.placement.selectedCandidate];
+      const artifact = {
+        formatVersion: 1,
+        generatedBy: "OpenChippy",
+        project: physicalIr.sourceProjectName,
+        technology: physicalIr.technologyName,
+        physicalIrVersion: physicalIr.formatVersion,
+        physicalIr,
+        selectedCandidate: {
+          planning: candidate,
+          placement,
+          globalRouting: physicalIr.globalRouting,
+          detailedRouting: physicalIr.detailedRouting,
+        },
+        buildReport: physicalBuildReport,
+        report: physicalDrc,
+      };
+      await backend.savePhysicalDrcReport(destination, JSON.stringify(artifact, null, 2));
+      setStatus(`Saved physical DRC report to ${destination}`);
+    } catch (reason) {
+      showError(reason);
+    }
+  };
+
+  const savePhysicalLayout = async () => {
+    if (!physicalIr) return;
+    try {
+      const destination = await save({
+        defaultPath: `${project?.name ?? "OpenChippy"}.chippy_gds`,
+        filters: [{ name: "OpenChippy physical IR", extensions: ["chippy_gds"] }],
+      });
+      if (!destination) return;
+      await backend.savePhysicalLayout(destination);
+      setStatus(`Saved physical layout to ${destination}`);
+    } catch (reason) {
+      showError(reason);
+    }
+  };
 
   useEffect(() => {
     backend.createProject()
@@ -110,6 +186,7 @@ export default function App() {
         setPendingTerminal(null);
         setPendingWireId(null);
         setBlockDialogOpen(false);
+        setRtlDialogOpen(false);
         setBlockDialogError(null);
         setStatus("Placement cancelled");
       }
@@ -294,7 +371,7 @@ export default function App() {
     setPendingTerminal(null);
     setPendingWireId(wireId);
     setSelectedWireId(wireId);
-    setStatus("Select a terminal to finish this wire · Esc to cancel");
+    setStatus("Click grid points to extend this wire, or select a terminal to finish · Esc to cancel");
   };
 
   const selectComponent = (id: string | null, additive = false) => {
@@ -323,9 +400,17 @@ export default function App() {
 
   const renameSelected = async (name: string) => {
     if (!selected || name.trim() === selected.name) return;
+    const componentId = selected.id;
+    const previousName = selected.name;
     try {
-      replaceWorkspace(await backend.renameComponent(selected.id, name), `Renamed ${selected.name} to ${name.trim()}`);
-      setSelectedIds([selected.id]);
+      const next = await backend.renameComponent(componentId, name);
+      setWorkspace(next);
+      setError(null);
+      setValidation(null);
+      setSimulation(null);
+      setTruthTable(null);
+      setWaveform(null);
+      setStatus(`Renamed ${previousName} to ${name.trim()}`);
     } catch (reason) {
       showError(reason);
     }
@@ -335,6 +420,38 @@ export default function App() {
     if (!project || name.trim() === project.name) return;
     try {
       replaceWorkspace(await backend.renameProject(name), `Renamed circuit to ${name.trim()}`);
+    } catch (reason) {
+      showError(reason);
+    }
+  };
+
+  const updateTimingTarget = async (value: string) => {
+    if (!project) return;
+    const trimmed = value.trim();
+    const target = trimmed ? Number(trimmed) : null;
+    if (target === project.timingTargetNs) return;
+    try {
+      const next = await backend.setTimingTarget(target);
+      setWorkspace(next);
+      setError(null);
+      setPhysicalIr(null);
+      setPhysicalDrc(null);
+      setStatus(target === null ? "Cleared timing target" : `Timing target set to ${target} ns`);
+    } catch (reason) {
+      showError(reason);
+    }
+  };
+
+  const updateHighFanoutThreshold = async (value: string) => {
+    if (!project) return;
+    const threshold = Number(value);
+    if (threshold === project.highFanoutWarningThreshold) return;
+    try {
+      const next = await backend.setHighFanoutWarningThreshold(threshold);
+      setWorkspace(next);
+      setError(null);
+      setSimulation(null);
+      setStatus(`High-fanout warning threshold set to ${threshold} loads`);
     } catch (reason) {
       showError(reason);
     }
@@ -421,8 +538,20 @@ export default function App() {
     }
   };
 
+  const updateWaveformGroups = async (groups: WaveformGroup[]) => {
+    try {
+      const next = await backend.setWaveformGroups(groups);
+      setWorkspace(next);
+      setError(null);
+      setStatus("Updated waveform groups");
+    } catch (reason) {
+      showError(reason);
+    }
+  };
+
   useEffect(() => {
     const editSelection = (event: KeyboardEvent) => {
+      if (editableFocusRef.current || isEditingText(event)) return;
       if (event.key === "Delete" || event.key === "Backspace") {
         if (!selectedIds.length && !selectedWireId) return;
         event.preventDefault();
@@ -453,8 +582,11 @@ export default function App() {
       let path = saveAs ? null : workspace?.path ?? null;
       if (!path) {
         path = await save({
-          defaultPath: `${project?.name ?? "project"}.chippy`,
-          filters: [{ name: "OpenChippy", extensions: ["chippy"] }],
+          defaultPath: `${project?.name ?? "project"}.ochippy`,
+          filters: [
+            { name: "OpenChippy project", extensions: ["ochippy"] },
+            { name: "OpenChippy circuit", extensions: ["chippy"] },
+          ],
         });
       }
       if (path) {
@@ -471,7 +603,10 @@ export default function App() {
   const loadExisting = async () => {
     try {
       if (!(await confirmDiscard())) return;
-      const path = await open({ multiple: false, filters: [{ name: "OpenChippy", extensions: ["chippy"] }] });
+      const path = await open({
+        multiple: false,
+        filters: [{ name: "OpenChippy", extensions: ["ochippy", "chippy"] }],
+      });
       if (typeof path === "string") replaceWorkspace(await backend.loadProject(path), "Project loaded", true);
     } catch (reason) {
       showError(reason);
@@ -510,6 +645,74 @@ export default function App() {
     }
   };
 
+  const parseRtlPreview = async (source = rtlSource) => {
+    setRtlParsing(true);
+    setRtlPreview(null);
+    setRtlDiagnostic(null);
+    try {
+      setRtlPreview(await backend.parseVerilog(source));
+    } catch (reason) {
+      setRtlDiagnostic(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setRtlParsing(false);
+    }
+  };
+
+  const chooseVerilogFile = async () => {
+    try {
+      const path = await open({
+        multiple: false,
+        filters: [{ name: "Structural Verilog", extensions: ["v", "sv"] }],
+      });
+      if (typeof path !== "string") return;
+      const source = await backend.readVerilogSource(path);
+      setRtlPath(path);
+      setRtlSource(source);
+      await parseRtlPreview(source);
+    } catch (reason) {
+      setRtlDiagnostic(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const acceptRtlImport = async () => {
+    if (!rtlPreview) return;
+    setRtlParsing(true);
+    setRtlDiagnostic(null);
+    try {
+      const moduleName = rtlPreview.name;
+      const next = await backend.importVerilog(rtlSource);
+      if (!next.project.rtlDesign) {
+        throw new Error("The desktop backend did not return the imported logical design.");
+      }
+      replaceWorkspace(next, `Imported logical RTL module ${moduleName}`);
+      setViewMode("rtl");
+      setPlacementKind(null);
+      setBlockPlacementId(null);
+      setPendingTerminal(null);
+      setPendingWireId(null);
+      setRtlDialogOpen(false);
+    } catch (reason) {
+      setRtlDiagnostic(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setRtlParsing(false);
+    }
+  };
+
+  const exportRtl = async () => {
+    if (!project?.rtlDesign) return;
+    try {
+      const destination = await save({
+        defaultPath: `${project.rtlDesign.module.name}.v`,
+        filters: [{ name: "Structural Verilog", extensions: ["v"] }],
+      });
+      if (!destination) return;
+      await backend.saveTextFile(destination, await backend.exportVerilog());
+      setStatus(`Exported structural Verilog to ${destination}`);
+    } catch (reason) {
+      showError(reason);
+    }
+  };
+
   const stepHistory = async (direction: "undo" | "redo") => {
     try {
       const next = direction === "undo" ? await backend.undo() : await backend.redo();
@@ -522,7 +725,28 @@ export default function App() {
   if (!project || !workspace) return <main className="loading">Preparing OpenChippy…</main>;
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${viewMode === "schematic" ? "schematic-mode" : "focused-mode"}`}
+      onPointerDownCapture={(event) => {
+        const active = document.activeElement;
+        if (
+          isEditableTarget(active)
+          && active instanceof HTMLElement
+          && !active.contains(event.target as Node)
+        ) {
+          active.blur();
+        }
+      }}
+      onFocusCapture={(event) => {
+        if (isEditableTarget(event.target)) editableFocusRef.current = true;
+      }}
+      onBlurCapture={() => {
+        queueMicrotask(() => {
+          editableFocusRef.current = isEditableTarget(document.activeElement);
+        });
+      }}
+      onKeyDown={(event) => {
+        if (editableFocusRef.current || isEditableTarget(event.target)) event.stopPropagation();
+      }}>
       <header>
         <div className="brand"><span className="mark">OC</span><div><strong>OpenChippy</strong><small>Silicon design studio</small></div></div>
         <nav>
@@ -530,6 +754,10 @@ export default function App() {
           <button onClick={loadExisting}>Open</button>
           <button onClick={() => saveCurrent()}>Save</button>
           <button onClick={() => saveCurrent(true)}>Save As</button>
+          <button onClick={() => {
+            setRtlDialogOpen(true);
+            setRtlDiagnostic(null);
+          }}>Import RTL</button>
           <span className="separator" />
           <button disabled={!workspace.canUndo} onClick={() => stepHistory("undo")}>Undo</button>
           <button disabled={!workspace.canRedo} onClick={() => stepHistory("redo")}>Redo</button>
@@ -549,7 +777,7 @@ export default function App() {
               }}><strong>Waveform view</strong><small>Run a timed input sequence</small></button>
             </div>
           </details>
-          <button className="truth-table-button" disabled={!digitalInputs.length} onClick={generateTruthTable}>Truth Table</button>
+          <button className="truth-table-button" disabled={!truthTableInputCount} onClick={generateTruthTable}>Truth Table</button>
           <button disabled={!project.components.length} onClick={openBlockDialog}>Save as Block</button>
         </nav>
       </header>
@@ -603,6 +831,7 @@ export default function App() {
         </div>}
         {viewMode !== "3d" && <div className="view-switch" role="group" aria-label="Editor view">
           <button className={viewMode === "schematic" ? "active" : ""} onClick={() => setViewMode("schematic")}>2D Schematic</button>
+          {project.rtlDesign && <button className={viewMode === "rtl" ? "active" : ""} onClick={() => setViewMode("rtl")}>RTL View</button>}
           <button onClick={() => { setViewMode("3d"); setPlacementKind(null); }}>3D View</button>
           <button className={viewMode === "waveform" ? "active" : ""} onClick={() => { setViewMode("waveform"); setPlacementKind(null); }}>Waveforms</button>
         </div>}
@@ -632,17 +861,26 @@ export default function App() {
         ) : viewMode === "3d" ? (
           <PhysicalViewport
             layout={physicalIr}
+            drc={physicalDrc}
+            buildReport={physicalBuildReport}
+            buildError={physicalBuildError}
             selectedIds={selectedIds}
             projectName={project.name}
             technologyName={project.technology.name}
             onSelect={selectComponent}
+            onSaveDrc={savePhysicalReport}
+            onSaveLayout={savePhysicalLayout}
+            onRetry={() => setPhysicalBuildRevision((revision) => revision + 1)}
             onView={(view) => {
               setViewMode(view);
               setPlacementKind(null);
             }}
           />
+        ) : viewMode === "rtl" && project.rtlDesign ? (
+          <RtlViewport design={project.rtlDesign} />
         ) : (
           <WaveformView config={waveformConfig} result={waveform} running={waveformRunning}
+            groups={project.waveformGroups} onGroups={updateWaveformGroups}
             onConfig={setWaveformConfig} onRun={runWaveform} />
         )}
         {viewMode === "schematic" && (digitalInputs.length > 0 || simulation) && (
@@ -700,7 +938,7 @@ export default function App() {
           <button onClick={() => { setPlacementKind(null); setBlockPlacementId(null); setPendingTerminal(null); setPendingWireId(null); }}>Cancel</button>
         </div>}
         {viewMode === "schematic" && !placementKind && !blockPlacementId && !pendingTerminal && !pendingWireId && (
-          <div className="viewport-help">Drag empty canvas / two-finger / arrows to pan · Shift-arrows pan faster · Pinch or Ctrl-wheel to zoom · F or Home fits the circuit · Click a terminal, then the grid, to leave a routed endpoint</div>
+          <div className="viewport-help">Drag empty canvas / two-finger / arrows to pan · Shift-arrows pan faster · Pinch or Ctrl-wheel to zoom · F or Home fits the circuit · Click any dangling wire to continue routing it</div>
         )}
       </section>
       <aside className="properties">
@@ -774,6 +1012,41 @@ export default function App() {
               ))}
               {!simulation.outputs.length && <p className="selection-note">No output probes are placed.</p>}
             </div>
+            <p className="inspector-section">Fanout analysis</p>
+            <details className="net-state-details" open>
+              <summary>
+                Fanout · {simulation.fanout.highFanoutCount} high · {simulation.fanout.undrivenCount} undriven · {simulation.fanout.multiplyDrivenCount} multiple
+              </summary>
+              <div className="state-list">
+                {simulation.fanout.nets.filter((net) => net.fanout > 0 || net.drivers.length > 1).map((net) => (
+                  <button key={net.name} onClick={() => {
+                    const endpoint = net.loads.find(({ componentId }) => componentId)
+                      ?? net.drivers.find(({ componentId }) => componentId);
+                    if (!endpoint?.componentId) return;
+                    const direct = project.components.find(({ id }) => id === endpoint.componentId);
+                    const owner = direct ?? project.components.find((component) => (
+                      component.kind === "block" && endpoint.name.startsWith(`${component.name}·`)
+                    ));
+                    if (owner) selectComponent(owner.id);
+                  }}>
+                    <span>
+                      {net.name}
+                      <small>{net.drivers.length} driver{net.drivers.length === 1 ? "" : "s"} · {net.loads.length} loads</small>
+                    </span>
+                    <strong className={net.highFanout || net.undriven || net.multiplyDriven ? "logic-unknown" : ""}>
+                      FO {net.fanout}
+                    </strong>
+                  </button>
+                ))}
+                {simulation.fanout.groups.map((group) => (
+                  <div key={`fanout-group-${group.name}`}>
+                    <span>{group.name}<small>{group.signals.join(", ")}</small></span>
+                    <strong>Σ{group.totalFanout} · max {group.maxFanout}</strong>
+                  </div>
+                ))}
+              </div>
+              <small>High fanout is currently more than {simulation.fanout.highFanoutThreshold} loads.</small>
+            </details>
             <p className="inspector-section">Transistors</p>
             <div className="state-list transistor-states">
               {simulation.transistors.map((transistor) => (
@@ -878,7 +1151,7 @@ export default function App() {
                   <dt>Diffusion cap.</dt>
                   <dd>{deviceCharacteristics.diffusionCapacitanceFf.toLocaleString(undefined, { maximumFractionDigits: 3 })} fF</dd>
                 </dl>
-                <p className="selection-note">Educational estimates from the active technology. Timing application begins in Milestone 3.5.</p>
+                <p className="selection-note">Educational estimates derived from the active technology and current device geometry.</p>
               </>
             )}
             {selected.kind === "block" && (() => {
@@ -915,6 +1188,35 @@ export default function App() {
                 if (event.key === "Enter") event.currentTarget.blur();
               }}
             />
+            <label className="property-label" htmlFor="timing-target">Timing target (ns)</label>
+            <input
+              id="timing-target"
+              className="property-input numeric-property"
+              type="number"
+              min="0.000001"
+              step="0.01"
+              placeholder="Unconstrained"
+              key={`timing-target-${project.timingTargetNs ?? "none"}`}
+              defaultValue={project.timingTargetNs ?? ""}
+              onBlur={(event) => updateTimingTarget(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
+            />
+            <label className="property-label" htmlFor="fanout-threshold">High-fanout warning (loads)</label>
+            <input
+              id="fanout-threshold"
+              className="property-input numeric-property"
+              type="number"
+              min="1"
+              step="1"
+              key={`fanout-threshold-${project.highFanoutWarningThreshold}`}
+              defaultValue={project.highFanoutWarningThreshold}
+              onBlur={(event) => updateHighFanoutThreshold(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
+            />
             <div className="technology-card">
               <p className="inspector-section">Active technology</p>
               <strong>{project.technology.name}</strong>
@@ -922,6 +1224,15 @@ export default function App() {
                 <dt>Format</dt><dd>v{project.technology.format_version}</dd>
                 <dt>Supply</dt><dd>{project.technology.supply_voltage} V</dd>
                 <dt>Routing metals</dt><dd>{project.technology.max_metal_layers}</dd>
+                <dt>Rule deck</dt><dd>v{project.technology.physical_rules.format_version}</dd>
+                <dt>Grid</dt><dd>{project.technology.physical_rules.manufacturing_grid_um} µm</dd>
+                <dt>Contact</dt><dd>{project.technology.physical_rules.contact.size_um} µm</dd>
+                <dt>Via</dt><dd>{project.technology.physical_rules.via.size_um} µm</dd>
+                <dt>Wire C</dt><dd>{project.technology.physical_parasitics.wire_capacitance_ff_per_um} fF/µm</dd>
+                <dt>Via C</dt><dd>{project.technology.physical_parasitics.via_capacitance_ff} fF</dd>
+                <dt>Tapeout</dt><dd>{project.technology.tapeout_window.width_um} × {project.technology.tapeout_window.height_um} µm</dd>
+                <dt>Placement density</dt><dd>{Math.round(project.technology.physical_planning.target_device_density * 100)}%</dd>
+                <dt>Route utilization</dt><dd>{Math.round(project.technology.physical_planning.target_routing_utilization * 100)}%</dd>
                 <dt>NMOS Vt</dt><dd>{project.technology.nmos.threshold_voltage} V</dd>
                 <dt>NMOS Ron</dt><dd>{project.technology.nmos.nominal_on_resistance_ohms.toLocaleString()} Ω</dd>
                 <dt>PMOS Vt</dt><dd>{project.technology.pmos.threshold_voltage} V</dd>
@@ -932,6 +1243,20 @@ export default function App() {
                 <button onClick={resetTechnology}>Use built-in</button>
               </div>
             </div>
+            {project.rtlDesign && <div className="technology-card rtl-project-card">
+              <p className="inspector-section">Imported RTL</p>
+              <strong>{project.rtlDesign.module.name}</strong>
+              <dl>
+                <dt>Ports</dt><dd>{project.rtlDesign.module.ports.length}</dd>
+                <dt>Nets</dt><dd>{project.rtlDesign.module.nets.length}</dd>
+                <dt>Gates</dt><dd>{project.rtlDesign.module.instances.length}</dd>
+                <dt>Levels</dt><dd>{Math.max(0, ...project.rtlDesign.placements.map(({ level }) => level)) + 1}</dd>
+              </dl>
+              <small>Logical-only representation · transistor implementation requires synthesis</small>
+              <div className="selection-actions">
+                <button onClick={() => void exportRtl()}>Export Verilog…</button>
+              </div>
+            </div>}
             <div className="empty compact"><span>⌁</span><p>Select an object in the viewport to inspect it.</p></div>
           </>
         )}
@@ -963,6 +1288,43 @@ export default function App() {
               </button>
             </div>
           </form>
+        </div>
+      )}
+      {rtlDialogOpen && (
+        <div className="modal-backdrop" role="presentation" onPointerDown={() => setRtlDialogOpen(false)}>
+          <section className="rtl-dialog" role="dialog" aria-modal="true" aria-labelledby="rtl-dialog-title"
+            onPointerDown={(event) => event.stopPropagation()}>
+            <p className="eyebrow">RTL Import · Structural Verilog</p>
+            <div className="rtl-dialog-heading">
+              <div>
+                <h2 id="rtl-dialog-title">Preview RTL import</h2>
+                <small>{rtlPath?.split(/[/\\]/).pop() ?? "No source file selected"}</small>
+              </div>
+              <button type="button" onClick={() => void chooseVerilogFile()}>Choose file…</button>
+            </div>
+            <textarea aria-label="Verilog source preview" spellCheck={false} value={rtlSource}
+              placeholder="module example(input A, output Y);\n  not u0(Y, A);\nendmodule"
+              onChange={(event) => {
+                setRtlSource(event.currentTarget.value);
+                setRtlPreview(null);
+                setRtlDiagnostic(null);
+              }} />
+            {rtlDiagnostic && <div className="rtl-diagnostic"><strong>Cannot import this source</strong><span>{rtlDiagnostic}</span></div>}
+            {rtlPreview && <div className="rtl-preview-summary">
+              <strong>{rtlPreview.name}</strong>
+              <span>{rtlPreview.ports.length} ports · {rtlPreview.nets.length} internal nets · {rtlPreview.instances.length} instances · {rtlPreview.assignments.length} continuous assignments · {rtlPreview.parameters.length} parameters</span>
+              {rtlPreview.parameters.length > 0 && <small>{rtlPreview.parameters.map((parameter) => `${parameter.name}=${parameter.defaultExpression} → ${parameter.defaultValue}`).join(" · ")}</small>}
+              <small>{rtlPreview.ports.map((port) => `${port.direction} ${port.range ? `[${port.range.msb}:${port.range.lsb}] ` : ""}${port.name}`).join(" · ")}</small>
+            </div>}
+            <div className="block-dialog-actions">
+              <button type="button" onClick={() => setRtlDialogOpen(false)}>Cancel</button>
+              <button type="button" disabled={!rtlSource.trim() || rtlParsing} onClick={() => void parseRtlPreview()}>
+                {rtlParsing ? "Parsing…" : "Validate preview"}
+              </button>
+              <button className="primary" type="button" disabled={!rtlPreview || rtlParsing}
+                onClick={() => void acceptRtlImport()}>Import and open design</button>
+            </div>
+          </section>
         </div>
       )}
       <footer className={error ? "has-error" : ""}>

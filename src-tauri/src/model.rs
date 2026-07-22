@@ -1,9 +1,15 @@
+use crate::rtl::RtlDesign;
 use crate::technology::Technology;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 pub const CURRENT_FORMAT_VERSION: u32 = 1;
+pub const DEFAULT_HIGH_FANOUT_WARNING_THRESHOLD: usize = 8;
+
+fn default_high_fanout_warning_threshold() -> usize {
+    DEFAULT_HIGH_FANOUT_WARNING_THRESHOLD
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -93,6 +99,23 @@ pub struct BlockDefinition {
     pub pins: Vec<BlockPin>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WaveformRadix {
+    Binary,
+    Hex,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaveformGroup {
+    pub id: Uuid,
+    pub name: String,
+    pub signals: Vec<String>,
+    pub radix: WaveformRadix,
+    pub collapsed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Project {
@@ -105,6 +128,14 @@ pub struct Project {
     pub technology: Technology,
     #[serde(default)]
     pub block_definitions: Vec<BlockDefinition>,
+    #[serde(default)]
+    pub waveform_groups: Vec<WaveformGroup>,
+    #[serde(default)]
+    pub timing_target_ns: Option<f64>,
+    #[serde(default = "default_high_fanout_warning_threshold")]
+    pub high_fanout_warning_threshold: usize,
+    #[serde(default)]
+    pub rtl_design: Option<RtlDesign>,
 }
 
 fn terminal_offset(kind: &str, terminal: &str) -> (f64, f64) {
@@ -158,11 +189,18 @@ impl Default for Project {
             wires: Vec::new(),
             technology: Technology::default(),
             block_definitions: Vec::new(),
+            waveform_groups: Vec::new(),
+            timing_target_ns: None,
+            high_fanout_warning_threshold: DEFAULT_HIGH_FANOUT_WARNING_THRESHOLD,
+            rtl_design: None,
         }
     }
 }
 
 impl Project {
+    pub fn set_rtl_design(&mut self, design: RtlDesign) {
+        self.rtl_design = Some(design);
+    }
     pub fn set_technology(&mut self, technology: Technology) {
         self.technology = technology;
     }
@@ -177,6 +215,81 @@ impl Project {
             return Err("circuit name cannot be empty".into());
         }
         self.name = name.into();
+        Ok(())
+    }
+
+    pub fn set_timing_target(&mut self, target_ns: Option<f64>) -> Result<(), String> {
+        if target_ns.is_some_and(|target| !target.is_finite() || target <= 0.0) {
+            return Err("timing target must be a finite positive value".into());
+        }
+        self.timing_target_ns = target_ns;
+        Ok(())
+    }
+
+    pub fn set_high_fanout_warning_threshold(&mut self, threshold: usize) -> Result<(), String> {
+        if threshold == 0 {
+            return Err("high-fanout warning threshold must be positive".into());
+        }
+        self.high_fanout_warning_threshold = threshold;
+        Ok(())
+    }
+
+    pub fn set_waveform_groups(&mut self, groups: Vec<WaveformGroup>) -> Result<(), String> {
+        let mut available = self
+            .components
+            .iter()
+            .filter(|component| matches!(component.kind.as_str(), "input" | "output"))
+            .map(|component| component.name.clone())
+            .collect::<HashSet<_>>();
+        if let Some(design) = &self.rtl_design {
+            for port in &design.module.ports {
+                if let Some(range) = &port.range {
+                    for index in range.msb.min(range.lsb)..=range.msb.max(range.lsb) {
+                        available.insert(format!("{}[{index}]", port.name));
+                    }
+                } else {
+                    available.insert(port.name.clone());
+                }
+            }
+        }
+        let mut ids = HashSet::new();
+        let mut names = HashSet::new();
+        let mut claimed_signals = HashSet::new();
+        for group in &groups {
+            let name = group.name.trim();
+            if name.is_empty() {
+                return Err("waveform group name cannot be empty".into());
+            }
+            if !ids.insert(group.id) || !names.insert(name.to_ascii_lowercase()) {
+                return Err("waveform group IDs and names must be unique".into());
+            }
+            if group.signals.len() < 2 {
+                return Err(format!("waveform group {name} needs at least two signals"));
+            }
+            let mut members = HashSet::new();
+            for signal in &group.signals {
+                if !available.contains(signal) {
+                    return Err(format!(
+                        "waveform group {name} references missing signal {signal}"
+                    ));
+                }
+                if !members.insert(signal.as_str()) {
+                    return Err(format!("waveform group {name} repeats signal {signal}"));
+                }
+                if !claimed_signals.insert(signal.as_str()) {
+                    return Err(format!(
+                        "signal {signal} belongs to more than one waveform group"
+                    ));
+                }
+            }
+        }
+        self.waveform_groups = groups
+            .into_iter()
+            .map(|mut group| {
+                group.name = group.name.trim().into();
+                group
+            })
+            .collect();
         Ok(())
     }
 
@@ -256,13 +369,74 @@ impl Project {
             .components
             .iter()
             .find(|component| component.id == reference.component_id)?;
-        let (dx, dy) = terminal_offset(&component.kind, &reference.terminal);
+        let (dx, dy) = self.component_terminal_offset(component, &reference.terminal);
         let cosine = component.rotation.cos();
         let sine = component.rotation.sin();
         Some((
             component.position.x + dx * cosine - dy * sine,
             component.position.y + dx * sine + dy * cosine,
         ))
+    }
+
+    fn component_terminal_offset(&self, component: &Component, terminal: &str) -> (f64, f64) {
+        if component.kind != "block" {
+            return terminal_offset(&component.kind, terminal);
+        }
+        let Some(definition) = component
+            .block_definition_id
+            .and_then(|id| self.block_definition(id))
+        else {
+            return (-1.8, 0.0);
+        };
+        let Some(pin) = definition.pins.iter().find(|pin| pin.name == terminal) else {
+            return (-1.8, 0.0);
+        };
+        let role_pins = definition
+            .pins
+            .iter()
+            .filter(|candidate| candidate.role == pin.role)
+            .collect::<Vec<_>>();
+        let index = role_pins
+            .iter()
+            .position(|candidate| candidate.name == terminal)
+            .unwrap_or(0);
+        let side_count = definition
+            .pins
+            .iter()
+            .filter(|candidate| candidate.role == BlockPinRole::Input)
+            .count()
+            .max(
+                definition
+                    .pins
+                    .iter()
+                    .filter(|candidate| candidate.role == BlockPinRole::Output)
+                    .count(),
+            )
+            .max(1);
+        let vertical_count = definition
+            .pins
+            .iter()
+            .filter(|candidate| candidate.role == BlockPinRole::Power)
+            .count()
+            .max(
+                definition
+                    .pins
+                    .iter()
+                    .filter(|candidate| candidate.role == BlockPinRole::Ground)
+                    .count(),
+            )
+            .max(1);
+        let height = 2.3_f64.max(1.1 + (side_count - 1) as f64 * 0.72);
+        let width = 2.9_f64
+            .max(1.5 + (vertical_count - 1) as f64 * 0.72)
+            .max(definition.name.len() as f64 * 0.32 + 0.8);
+        let offset = (index as f64 - (role_pins.len() - 1) as f64 / 2.0) * 0.72;
+        match pin.role {
+            BlockPinRole::Input => (-width / 2.0 - 0.36, offset),
+            BlockPinRole::Output => (width / 2.0 + 0.36, offset),
+            BlockPinRole::Power => (offset, -height / 2.0 - 0.36),
+            BlockPinRole::Ground => (offset, height / 2.0 + 0.36),
+        }
     }
 
     fn attach_junction_to_wire(&mut self, junction_id: Uuid, x: f64, y: f64) {
@@ -352,7 +526,18 @@ impl Project {
             .iter_mut()
             .find(|component| component.id == id)
             .ok_or_else(|| "component not found".to_string())?;
+        let old_name = component.name.clone();
+        let waveform_signal = matches!(component.kind.as_str(), "input" | "output");
         component.name = name.into();
+        if waveform_signal {
+            for group in &mut self.waveform_groups {
+                for signal in &mut group.signals {
+                    if *signal == old_name {
+                        *signal = name.into();
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -422,6 +607,14 @@ impl Project {
         {
             return Err("component not found".into());
         }
+        let removed_signals = self
+            .components
+            .iter()
+            .filter(|component| {
+                ids.contains(&component.id) && matches!(component.kind.as_str(), "input" | "output")
+            })
+            .map(|component| component.name.clone())
+            .collect::<HashSet<_>>();
         self.components
             .retain(|component| !ids.contains(&component.id));
         self.wires.retain(|wire| {
@@ -431,6 +624,13 @@ impl Project {
                     .as_ref()
                     .is_none_or(|terminal| !ids.contains(&terminal.component_id))
         });
+        for group in &mut self.waveform_groups {
+            group
+                .signals
+                .retain(|signal| !removed_signals.contains(signal));
+        }
+        self.waveform_groups
+            .retain(|group| group.signals.len() >= 2);
         Ok(())
     }
 
@@ -776,6 +976,10 @@ impl Project {
             wires: Vec::new(),
             technology: self.technology.clone(),
             block_definitions: Vec::new(),
+            waveform_groups: self.waveform_groups.clone(),
+            timing_target_ns: self.timing_target_ns,
+            high_fanout_warning_threshold: self.high_fanout_warning_threshold,
+            rtl_design: self.rtl_design.clone(),
         };
         let mut instance_terminals: HashMap<(Uuid, String), TerminalRef> = HashMap::new();
         for instance in self
@@ -957,7 +1161,8 @@ impl Project {
 
 #[cfg(test)]
 mod tests {
-    use super::{Component, Position, Project, TerminalRef};
+    use super::{Component, Position, Project, TerminalRef, WaveformGroup, WaveformRadix};
+    use crate::rtl::{map_module, parse_structural_verilog};
     use crate::technology::Technology;
     use uuid::Uuid;
 
@@ -967,6 +1172,109 @@ mod tests {
         project.rename("CMOS Inverter".into()).unwrap();
         assert_eq!(project.name, "CMOS Inverter");
         assert!(project.rename("  ".into()).is_err());
+    }
+
+    #[test]
+    fn imported_rtl_names_and_placement_survive_save_load() {
+        let module = parse_structural_verilog(
+            "module imported(input A, input B, output Y); nand gate_1(Y, A, B); endmodule",
+        )
+        .unwrap();
+        let mut project = Project::default();
+        project.set_rtl_design(map_module(module));
+        let restored: Project =
+            serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        let design = restored.rtl_design.unwrap();
+        assert_eq!(design.module.name, "imported");
+        assert_eq!(design.module.instances[0].name, "gate_1");
+        assert_eq!(design.module.instances[0].connections, ["Y", "A", "B"]);
+        assert_eq!(design.placements[0].instance_name, "gate_1");
+    }
+
+    #[test]
+    fn optional_timing_target_validates_and_round_trips() {
+        let mut project = Project::default();
+        assert_eq!(project.timing_target_ns, None);
+        project.set_timing_target(Some(1.25)).unwrap();
+        let restored: Project =
+            serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        assert_eq!(restored.timing_target_ns, Some(1.25));
+        assert!(project.set_timing_target(Some(0.0)).is_err());
+        assert!(project.set_timing_target(Some(f64::NAN)).is_err());
+        project.set_timing_target(None).unwrap();
+        assert_eq!(project.timing_target_ns, None);
+    }
+
+    #[test]
+    fn high_fanout_threshold_defaults_validates_and_round_trips() {
+        let mut project = Project::default();
+        assert_eq!(project.high_fanout_warning_threshold, 8);
+        project.set_high_fanout_warning_threshold(12).unwrap();
+        let restored: Project =
+            serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        assert_eq!(restored.high_fanout_warning_threshold, 12);
+        assert!(project.set_high_fanout_warning_threshold(0).is_err());
+
+        let mut value = serde_json::to_value(Project::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("highFanoutWarningThreshold");
+        let legacy: Project = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.high_fanout_warning_threshold, 8);
+    }
+
+    #[test]
+    fn waveform_groups_validate_order_and_round_trip() {
+        let mut project = Project::default();
+        let a = project.add_component("input", 0.0, 0.0).unwrap();
+        let b = project.add_component("input", 0.0, 2.0).unwrap();
+        let names = project
+            .components
+            .iter()
+            .filter(|component| component.id == a || component.id == b)
+            .map(|component| component.name.clone())
+            .collect::<Vec<_>>();
+        let group = WaveformGroup {
+            id: Uuid::new_v4(),
+            name: "DATA".into(),
+            signals: names.clone(),
+            radix: WaveformRadix::Hex,
+            collapsed: true,
+        };
+        project.set_waveform_groups(vec![group.clone()]).unwrap();
+        let mut restored: Project =
+            serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        assert_eq!(restored.waveform_groups, vec![group.clone()]);
+        assert_eq!(restored.waveform_groups[0].signals, names);
+        restored.rename_component(a, "D7".into()).unwrap();
+        assert_eq!(restored.waveform_groups[0].signals[0], "D7");
+        restored.delete_components(&[b]).unwrap();
+        assert!(restored.waveform_groups.is_empty());
+
+        let mut invalid = vec![group];
+        invalid[0].signals = vec!["MISSING".into(), "ALSO_MISSING".into()];
+        assert!(project.set_waveform_groups(invalid).is_err());
+    }
+
+    #[test]
+    fn imported_rtl_port_bits_can_be_persisted_as_waveform_groups() {
+        let module = parse_structural_verilog(
+            "module bus(input [3:0] A, output [3:0] Y); assign Y = A + 0; endmodule",
+        )
+        .unwrap();
+        let mut project = Project::default();
+        project.set_rtl_design(map_module(module));
+        project
+            .set_waveform_groups(vec![WaveformGroup {
+                id: Uuid::new_v4(),
+                name: "A".into(),
+                signals: vec!["A[3]".into(), "A[2]".into(), "A[1]".into(), "A[0]".into()],
+                radix: WaveformRadix::Hex,
+                collapsed: true,
+            }])
+            .unwrap();
+        assert_eq!(project.waveform_groups[0].signals[0], "A[3]");
     }
 
     #[test]
@@ -1216,6 +1524,38 @@ mod tests {
             .unwrap();
         assert!(project.wires[0].to.is_some());
         assert!(project.wires[0].end.is_none());
+    }
+
+    #[test]
+    fn reusable_block_symbol_offsets_expand_with_pin_count() {
+        let mut project = Project::default();
+        for row in 0..4 {
+            project.add_component("input", -4.0, row as f64).unwrap();
+        }
+        project.add_component("output", 4.0, 0.0).unwrap();
+        let definition = project.capture_block("WIDE_INTERFACE".into()).unwrap();
+
+        let mut parent = Project::default();
+        parent.block_definitions = project.block_definitions;
+        let instance = parent.place_block(definition, 10.0, 20.0).unwrap();
+        let first = parent
+            .terminal_position(&TerminalRef {
+                component_id: instance,
+                terminal: "IN1".into(),
+            })
+            .unwrap();
+        let last = parent
+            .terminal_position(&TerminalRef {
+                component_id: instance,
+                terminal: "IN4".into(),
+            })
+            .unwrap();
+
+        assert!((last.1 - first.1 - 2.16).abs() < 0.001);
+        assert!(
+            first.0 < 8.0,
+            "long block names should expand the body width"
+        );
     }
 
     #[test]

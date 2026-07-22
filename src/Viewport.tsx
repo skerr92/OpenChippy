@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { MapControls } from "three/addons/controls/MapControls.js";
 import { terminalPosition } from "./SchematicViewport";
 import type { Component, LogicState, SimulationResult, Wire } from "./types";
+import { isEditingText } from "./dom";
 
 type Props = {
   components: Component[];
@@ -401,7 +402,7 @@ export default function Viewport({ components, wires, selectedIds, simulation, o
 
     const handleArrowPan = (event: KeyboardEvent) => {
       if (!event.key.startsWith("Arrow")) return;
-      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
+      if (isEditingText(event)) return;
       event.preventDefault();
       const visibleHeight = 2 / camera.zoom;
       const step = visibleHeight * .06;

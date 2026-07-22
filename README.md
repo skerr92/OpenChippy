@@ -1,100 +1,168 @@
 # OpenChippy
-OpenChippy is an education-first, open source desktop environment for transistor-level
-integrated-circuit design, switch simulation, validation, and physical-layout visualization.
 
-### About OpenChippy
+OpenChippy is an open source desktop workspace for learning how digital integrated
+circuits move from transistor schematics to simulation and physical layout.
 
-OpenChippy bridges the gap between integrated commercial environments such as Cadence
-Virtuoso and powerful but disjointed open source tools. It provides one coherent workspace
-for learning and prototyping CMOS circuits from the transistor level upward, while keeping
-the authoritative project, technology, connectivity, simulation, and physical-layout models
-in Rust.
+It brings schematic editing, reusable circuit blocks, waveform inspection, basic design
+checks, RTL import, and a layered 3D layout view into one application. The long-term goal
+is to make open chip-design tools feel connected and approachable without hiding how the
+design works.
 
-The project is deliberately growing in validated milestones. OpenChippy is not yet a
-foundry-qualified replacement for signoff tools, a SPICE-compatible analog simulator, or a
-production place-and-route system. Its current focus is a sound, inspectable foundation:
-schematic intent, educational switch behavior, reusable hierarchy, and a compact
-process-aware physical representation that can later feed shared 2D/GDS and 3D views.
+OpenChippy is still under active development. It is useful for education and experiments,
+but it is not yet a replacement for a foundry-qualified signoff flow, a full analog
+simulator, or production place-and-route software.
 
-### Capabilities
+## What you can do today
 
-The current Milestone 0–3 implementation includes:
+- Draw CMOS schematics with NMOS and PMOS transistors, power and ground, digital inputs,
+  output probes, net labels, junctions, resistors, and routed wires.
+- Pan, zoom, rotate parts, select multiple objects, continue dangling wires, and save or
+  reopen your work.
+- Build reusable blocks, including nested blocks, and use them in larger designs.
+- Run basic circuit checks for missing power, floating connections, shorts, broken block
+  pins, and other common schematic mistakes.
+- Simulate transistor-level digital behavior and inspect high, low, floating, contended,
+  or unknown signals.
+- Generate truth tables and timed waveforms. Waveforms support cursors, zoom, scalar
+  signals, and user-defined binary or hexadecimal buses.
+- Load a technology YAML file or use the included five-metal educational process. See
+  [the example technology file](docs/examples/openchippy-edu-5m.yaml).
+- Generate a compact physical layout, inspect process layers in 3D, run physical design
+  checks, isolate violations, and export a report.
+- Import a useful, deliberately limited subset of Verilog, inspect its logical structure,
+  simulate supported designs, and export the preserved RTL again.
 
-* A Tauri desktop project workflow with new, open, save, save-as, rename, dirty-state
-  tracking, and undo/redo.
-* A pan-and-zoom 2D CMOS schematic editor with NMOS, PMOS, VDD, GND, digital inputs,
-  output probes, junctions, net labels, resistors, rotatable and multi-selectable
-  components, and editable orthogonal or intentionally dangling wires.
-* Rust-owned connectivity DRC for missing power, floating terminals, broken connections,
-  duplicate names, dangling routes, shorted rails, and invalid reusable-block interfaces.
-* A five-state educational CMOS switch solver (`HIGH`, `LOW`, `FLOATING`, `CONTENDED`,
-  and `UNKNOWN`) with supply and threshold awareness, geometry-derived resistance and
-  capacitance, path resistance, and `0.69RC` delay estimates.
-* Interactive operating-point visualization, generated truth tables, and a bounded
-  GTKWave-inspired timed waveform view.
-* Versioned technology YAML with validated NMOS/PMOS characteristics and an explicit
-  process routing-layer ceiling. The built-in educational process provides five metals.
-* A Rust-normalized physical-layout IR independent of schematic drawing coordinates,
-  aspect-ratio-aware folded CMOS row banks, diffusion/poly/contact geometry,
-  process-bounded direction-separated routing through a reserved signal channel,
-  stacked vias, and a broadly zoomable Three.js layer view.
-* Reusable device blocks captured from transistor-level or block-composed circuits with
-  promoted input, output, VDD, and GND pins; compact shared instances; arbitrary-depth,
-  cycle-checked nesting; project persistence and undo/redo; automatic portable
-  `.chippyblock` storage and discovery in a project-adjacent `chippyblocks/` folder; and
-  deterministic hierarchy flattening for DRC, simulation, truth tables, waveforms, and
-  physical generation.
+## Project files
 
-The Rust suite currently validates 52 tests covering project history, model
-compatibility, technology files, CMOS behavior, timing, hierarchy, DRC, and physical
-routing. The TypeScript/Vite production build and packaged Tauri release build are also
-part of the milestone validation workflow. Detailed scope and future work live in the
-[roadmap](docs/roadmap.md).
+New projects save as an `.ochippy` manifest. It lists the files that belong to the project:
 
-### contribution
+- `.chippy` contains the editable circuit and logical design.
+- `.chippy_gds` contains the generated physical layout used by the 3D viewer.
+- `chippyblocks/` contains reusable `.chippyblock` files stored beside the project.
 
-Contributors are welcome. The backend is intentionally Rust-first for durable models,
-serialization, analysis, and memory safety. The desktop interface uses React, TypeScript,
-HTML/CSS, SVG, and Three.js so the same authoritative backend data can support approachable
-interactive views.
+The cached physical file is tied to the circuit it came from. If they no longer match,
+OpenChippy refuses to display the stale layout. A matching cache lets the 3D view reopen
+without repeating placement and routing. Existing standalone `.chippy` files remain
+supported.
 
-### questions?
+`.chippy_gds` is currently OpenChippy's versioned physical-layout format. Despite the
+name, it is not yet a foundry-ready binary GDSII stream.
 
-Please open an issue if you have any questions.
+## RTL support and limitations
 
-### Development
+OpenChippy's RTL importer is intentionally smaller than a full Verilog or SystemVerilog
+compiler. It is designed to preserve supported source clearly and reject unsupported code
+instead of silently changing its meaning.
 
-The current foundation is a Tauri 2 desktop application with a Rust backend and a
-React, TypeScript, and Three.js frontend.
+Currently supported:
 
-Prerequisites:
+- One module per imported source.
+- ANSI and classic module ports, scalar signals, and fixed packed vectors.
+- Built-in gates such as `and`, `or`, `xor`, `nand`, `nor`, `xnor`, `not`, and `buf`.
+- Continuous assignments with a bounded set of arithmetic and bitwise expressions.
+- Integer parameters, parameter-based vector widths, and parameter overrides on referenced
+  cells.
+- Constant bit selection, concatenation, and constant or parameter-counted replication.
+- Simple `always_comb` and `always @*` logic with bounded blocking assignments,
+  `if`/`else`, and `case` statements.
+- Simple edge-triggered `always` and `always_ff` registers with one nonblocking assignment.
+- Waveform simulation for the supported combinational and sequential forms.
 
-* Node.js 20 or newer
-* The stable Rust toolchain
-* The platform prerequisites listed in the
-  [Tauri setup guide](https://v2.tauri.app/start/prerequisites/)
+Not yet supported:
 
-Install dependencies and start the desktop application:
+- Multi-module source bundles or descending into linked child-module definitions.
+- General SystemVerilog syntax, interfaces, packages, classes, or advanced types.
+- `generate`, `defparam`, arbitrary constant functions, or full parameter elaboration.
+- General part selects, signed arithmetic rules, shifts, unpacked arrays, and memories.
+- Clocked blocks with reset/enable branches, multiple statements, or mixed assignment
+  styles.
+- `initial` blocks, delays, tasks, `force`, or unrestricted testbench code.
+- Converting imported RTL directly into transistor schematics or final physical layout.
+
+These items are tracked in Milestone 7 alongside Yosys and ABC synthesis integration. See
+the [roadmap](docs/roadmap.md) for the planned order.
+
+## Build from source
+
+### Prerequisites
+
+- Node.js 20 or newer
+- The stable Rust toolchain from [rustup](https://rustup.rs/)
+- The platform tools required by
+  [Tauri 2](https://v2.tauri.app/start/prerequisites/)
+
+On macOS, install Xcode Command Line Tools if needed:
 
 ```sh
+xcode-select --install
+```
+
+### Install dependencies
+
+```sh
+git clone https://github.com/skerr92/OpenChippy.git
+cd OpenChippy
 npm install
+```
+
+### Run the desktop application
+
+```sh
 npm run tauri dev
 ```
 
-For frontend-only development in a browser:
+The browser-only frontend can be started with `npm run dev`, but saving, loading,
+simulation, design checks, technology files, and physical generation require the desktop
+application and Rust backend.
+
+### Build the latest release executable
 
 ```sh
-npm run dev
+npm run tauri -- build
 ```
 
-The full editor, save/load workflow, simulation, DRC, technology loading, reusable blocks,
-and physical generation require the desktop application. The browser build is useful for
-frontend development but does not replace the Rust backend.
+This repository currently leaves automatic installer bundling disabled. The release
+executable is written to `src-tauri/target/release/` on the current platform.
 
-Useful validation commands:
+### Build an Apple Silicon app and DMG
+
+Run this on an Apple Silicon Mac:
+
+```sh
+rustup target add aarch64-apple-darwin
+npm run tauri -- build \
+  --target aarch64-apple-darwin \
+  --bundles app,dmg \
+  --config '{"bundle":{"active":true}}' \
+  --no-sign
+```
+
+The unsigned local packages will be under:
+
+```text
+src-tauri/target/aarch64-apple-darwin/release/bundle/macos/OpenChippy.app
+src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/
+```
+
+`--no-sign` is suitable for local testing. A DMG intended for other users should be signed
+with an Apple Developer ID certificate and notarized before distribution.
+
+### Validation
 
 ```sh
 npm run build
-cd src-tauri && cargo test
-npm run tauri build
+cargo test --manifest-path src-tauri/Cargo.toml
+npm run tauri -- build
 ```
+
+The current baseline is 121 passing Rust tests plus successful frontend and Tauri release
+builds.
+
+## Contributing
+
+Contributions and bug reports are welcome. The Rust backend owns saved project data,
+simulation, validation, and physical-layout generation. React, TypeScript, SVG, and
+Three.js provide the desktop interface and visualization.
+
+Please open an issue when proposing a large feature so it can be matched to the roadmap
+and file-format compatibility requirements.
