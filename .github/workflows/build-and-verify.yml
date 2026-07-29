@@ -1,0 +1,75 @@
+name: build-and-verify
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libwebkit2gtk-4.1-dev libxdo-dev xvfb
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Build the web frontend
+        run: npm run build
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build the Rust application
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --release
+
+      - name: Package an unsigned build artifact
+        run: |
+          mkdir -p artifacts
+          cp src-tauri/target/release/openchippy artifacts/openchippy-unsigned
+          chmod +x artifacts/openchippy-unsigned
+          tar -czf artifacts/openchippy-unsigned-linux-x64.tar.gz -C artifacts openchippy-unsigned
+
+      - name: Upload unsigned artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openchippy-unsigned-linux-x64
+          path: artifacts/openchippy-unsigned-linux-x64.tar.gz
+          if-no-files-found: error
