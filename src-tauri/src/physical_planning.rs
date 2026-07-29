@@ -1,4 +1,8 @@
 use crate::{
+    physical_canvas::{
+        device_active_width, device_diffusion_height, device_diffusion_landing_size,
+        device_terminal_offset,
+    },
     physical_layout::{NetRole, PhysicalDevice, PhysicalNet, PhysicalPin},
     technology::{RoutingDirection, Technology},
 };
@@ -141,10 +145,11 @@ fn dimensions(
     channel_height: f64,
     site_width: f64,
     row_height: f64,
+    device_pitch: f64,
 ) -> (f64, f64, usize, usize) {
     let pmos_rows = pmos_count.max(1).div_ceil(columns);
     let nmos_rows = nmos_count.max(1).div_ceil(columns);
-    let width = snap_up(columns as f64 * 2.0 + 2.0, site_width);
+    let width = snap_up(columns as f64 * device_pitch + 2.0, site_width);
     let height = snap_up(
         (pmos_rows + nmos_rows) as f64 * row_height + channel_height + 2.6,
         row_height,
@@ -160,6 +165,7 @@ fn choose_columns(
     channel_height: f64,
     site_width: f64,
     row_height: f64,
+    device_pitch: f64,
 ) -> usize {
     (1..=largest_row)
         .min_by(|left, right| {
@@ -170,6 +176,7 @@ fn choose_columns(
                 channel_height,
                 site_width,
                 row_height,
+                device_pitch,
             );
             let (right_width, right_height, _, _) = dimensions(
                 *right,
@@ -178,6 +185,7 @@ fn choose_columns(
                 channel_height,
                 site_width,
                 row_height,
+                device_pitch,
             );
             ((left_width / left_height).ln() - target_aspect.ln())
                 .abs()
@@ -262,9 +270,30 @@ pub fn plan(
             .max(rules.row_height_um);
     let device_area = devices
         .iter()
-        .map(|device| 1.55 * (0.55 + device.width_um.min(4.0) * 0.12))
+        .map(|device| {
+            device_active_width(device, &technology.physical_rules)
+                * device_diffusion_height(device, &technology.physical_rules)
+        })
         .sum::<f64>()
         .max(rules.placement_site_width_um * rules.row_height_um);
+    let widest_active = devices
+        .iter()
+        .map(|device| device_active_width(device, &technology.physical_rules))
+        .fold(technology.physical_rules.diffusion.min_width_um, f64::max);
+    let widest_terminal_span = devices
+        .iter()
+        .map(|device| 2.0 * device_terminal_offset(device, &technology.physical_rules))
+        .fold(0.0, f64::max);
+    let metal1 = technology
+        .physical_rules
+        .layer_overrides
+        .get("metal1")
+        .unwrap_or(&technology.physical_rules.metal);
+    let device_pitch = (widest_active + technology.physical_rules.diffusion.min_spacing_um).max(
+        widest_terminal_span
+            + device_diffusion_landing_size(&technology.physical_rules)
+            + metal1.min_spacing_um,
+    );
     let topology_aspect = (largest_row as f64
         / (pmos_count.max(1).div_ceil(largest_row) + nmos_count.max(1).div_ceil(largest_row))
             as f64)
@@ -284,6 +313,7 @@ pub fn plan(
             channel_height,
             rules.placement_site_width_um,
             rules.row_height_um,
+            device_pitch,
         );
         let (mut width, mut height, pmos_rows, nmos_rows) = dimensions(
             columns,
@@ -292,6 +322,7 @@ pub fn plan(
             channel_height,
             rules.placement_site_width_um,
             rules.row_height_um,
+            device_pitch,
         );
         let density_scale = (device_area / (width * height * rules.target_device_density))
             .sqrt()

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import * as backend from "./backend";
-import type { ComponentKind, DeviceCharacteristics, LogicState, PhysicalBuildReport, PhysicalDrcReport, PhysicalLayoutIr, RtlModule, SimulationResult, TerminalRef, TruthTableResult, ValidationReport, WaveformConfig, WaveformGroup, WaveformResult, WorkspaceState } from "./types";
+import type { ComponentKind, DeviceCharacteristics, LogicState, PhysicalBuildProgress, PhysicalBuildReport, PhysicalDrcReport, PhysicalLayoutIr, RtlModule, SimulationResult, TerminalRef, TruthTableResult, ValidationReport, WaveformConfig, WaveformGroup, WaveformResult, WorkspaceState } from "./types";
 import PhysicalViewport from "./PhysicalViewport";
 import SchematicViewport from "./SchematicViewport";
 import WaveformView from "./WaveformView";
@@ -37,6 +38,8 @@ export default function App() {
   const [physicalIr, setPhysicalIr] = useState<PhysicalLayoutIr | null>(null);
   const [physicalDrc, setPhysicalDrc] = useState<PhysicalDrcReport | null>(null);
   const [physicalBuildReport, setPhysicalBuildReport] = useState<PhysicalBuildReport | null>(null);
+  const [physicalBuildProgress, setPhysicalBuildProgress] = useState<PhysicalBuildProgress | null>(null);
+  const [physicalBuildStartedAt, setPhysicalBuildStartedAt] = useState<number | null>(null);
   const [physicalBuildError, setPhysicalBuildError] = useState<string | null>(null);
   const [physicalBuildRevision, setPhysicalBuildRevision] = useState(0);
   const [rtlDialogOpen, setRtlDialogOpen] = useState(false);
@@ -96,27 +99,42 @@ export default function App() {
       setPhysicalIr(null);
       setPhysicalDrc(null);
       setPhysicalBuildReport(null);
+      setPhysicalBuildProgress(null);
+      setPhysicalBuildStartedAt(null);
       setPhysicalBuildError(null);
       return;
     }
     setPhysicalIr(null);
     setPhysicalDrc(null);
     setPhysicalBuildReport(null);
+    setPhysicalBuildProgress({ stage: "topology", percent: 0, elapsedMs: 0 });
+    setPhysicalBuildStartedAt(Date.now());
     setPhysicalBuildError(null);
     let active = true;
-    backend.inspectPhysicalLayout()
-      .then(({ layout: ir, drc: report, buildReport }) => {
+    let stopListening: (() => void) | null = null;
+    void (async () => {
+      stopListening = await listen<PhysicalBuildProgress>("physical-build-progress", ({ payload }) => {
+        if (active) setPhysicalBuildProgress(payload);
+      });
+      if (!active) {
+        stopListening();
+        return;
+      }
+      try {
+        const { layout: ir, drc: report, buildReport } = await backend.inspectPhysicalLayout();
         if (active) {
           setPhysicalIr(ir);
           setPhysicalDrc(report);
           setPhysicalBuildReport(buildReport);
+          setPhysicalBuildProgress({ stage: "complete", percent: 100, elapsedMs: buildReport.elapsedMs });
         }
-      })
-      .catch((reason) => {
+      } catch (reason) {
         if (active) setPhysicalBuildError(reason instanceof Error ? reason.message : String(reason));
-      });
+      }
+    })();
     return () => {
       active = false;
+      stopListening?.();
     };
   }, [viewMode, project, physicalBuildRevision]);
 
@@ -163,6 +181,36 @@ export default function App() {
       if (!destination) return;
       await backend.savePhysicalLayout(destination);
       setStatus(`Saved physical layout to ${destination}`);
+    } catch (reason) {
+      showError(reason);
+    }
+  };
+
+  const exportPhysicalGds = async () => {
+    if (!physicalIr) return;
+    try {
+      const destination = await save({
+        defaultPath: `${project?.name ?? "OpenChippy"}.gds`,
+        filters: [{ name: "GDSII stream", extensions: ["gds"] }],
+      });
+      if (!destination) return;
+      const report = await backend.exportGdsii(destination);
+      setStatus(`Exported ${report.boundaryCount} boundaries in ${report.structureCount} GDSII structures to ${destination}`);
+    } catch (reason) {
+      showError(reason);
+    }
+  };
+
+  const exportPhysicalLef = async () => {
+    if (!physicalIr) return;
+    try {
+      const destination = await save({
+        defaultPath: `${project?.name ?? "OpenChippy"}.lef`,
+        filters: [{ name: "LEF macro", extensions: ["lef"] }],
+      });
+      if (!destination) return;
+      await backend.exportLef(destination);
+      setStatus(`Exported LEF macro to ${destination}`);
     } catch (reason) {
       showError(reason);
     }
@@ -863,6 +911,8 @@ export default function App() {
             layout={physicalIr}
             drc={physicalDrc}
             buildReport={physicalBuildReport}
+            buildProgress={physicalBuildProgress}
+            buildStartedAt={physicalBuildStartedAt}
             buildError={physicalBuildError}
             selectedIds={selectedIds}
             projectName={project.name}
@@ -870,6 +920,8 @@ export default function App() {
             onSelect={selectComponent}
             onSaveDrc={savePhysicalReport}
             onSaveLayout={savePhysicalLayout}
+            onExportGds={exportPhysicalGds}
+            onExportLef={exportPhysicalLef}
             onRetry={() => setPhysicalBuildRevision((revision) => revision + 1)}
             onView={(view) => {
               setViewMode(view);

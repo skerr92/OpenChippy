@@ -1,0 +1,14 @@
+format_version: 1
+library_name: OpenChippy EDU Standard Cells
+process_id: openchippy-edu-cmos
+deck_revision: builtin-v1
+source: OpenChippy educational parametric cell generator
+placement_site_width_um: 0.50
+row_height_um: 8.00
+transistor_pitch_um: 0.80
+cell_padding_um: 0.50
+pin_layer: 2
+power_layer: 1
+nmos_width_um: 1.00
+pmos_width_um: 1.00
+gate_length_um: 1.00

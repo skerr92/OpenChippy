@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { MapControls } from "three/addons/controls/MapControls.js";
-import type { PhysicalBuildReport, PhysicalDrcDiagnostic, PhysicalDrcReport, PhysicalLayoutIr } from "./types";
+import type { PhysicalBuildProgress, PhysicalBuildReport, PhysicalDrcDiagnostic, PhysicalDrcReport, PhysicalLayoutIr } from "./types";
 
 type ViewMode = "schematic" | "3d" | "waveform";
 
@@ -9,6 +9,8 @@ type Props = {
   layout: PhysicalLayoutIr | null;
   drc: PhysicalDrcReport | null;
   buildReport: PhysicalBuildReport | null;
+  buildProgress: PhysicalBuildProgress | null;
+  buildStartedAt: number | null;
   buildError: string | null;
   selectedIds: string[];
   projectName: string;
@@ -16,6 +18,8 @@ type Props = {
   onSelect: (id: string | null, additive?: boolean) => void;
   onSaveDrc: () => void;
   onSaveLayout: () => void;
+  onExportGds: () => void;
+  onExportLef: () => void;
   onRetry: () => void;
   onView: (view: ViewMode) => void;
 };
@@ -29,6 +33,7 @@ type LayerStyle = {
 
 const BASE_LAYERS: Record<string, LayerStyle> = {
   substrate: { label: "Substrate", color: "#263548", elevation: -.12, thickness: .18 },
+  pwell: { label: "P-well", color: "#436b76", elevation: -.01, thickness: .07 },
   nwell: { label: "N-well", color: "#76599a", elevation: .02, thickness: .07 },
   ndiff: { label: "N diffusion", color: "#38bca8", elevation: .12, thickness: .11 },
   pdiff: { label: "P diffusion", color: "#d276a5", elevation: .12, thickness: .11 },
@@ -72,6 +77,8 @@ export default function PhysicalViewport({
   layout,
   drc,
   buildReport,
+  buildProgress,
+  buildStartedAt,
   buildError,
   selectedIds,
   projectName,
@@ -79,6 +86,8 @@ export default function PhysicalViewport({
   onSelect,
   onSaveDrc,
   onSaveLayout,
+  onExportGds,
+  onExportLef,
   onRetry,
   onView,
 }: Props) {
@@ -93,6 +102,13 @@ export default function PhysicalViewport({
     () => new Set(Object.keys(createLayers(5))),
   );
   const [selectedDiagnostic, setSelectedDiagnostic] = useState<number | null>(null);
+  const [clockNow, setClockNow] = useState(Date.now());
+  useEffect(() => {
+    if (layout || buildError || buildStartedAt === null) return;
+    setClockNow(Date.now());
+    const timer = window.setInterval(() => setClockNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [layout, buildError, buildStartedAt]);
   const [drcLayer, setDrcLayer] = useState("all");
   const [drcRule, setDrcRule] = useState("all");
   const [drcSeverity, setDrcSeverity] = useState("all");
@@ -353,6 +369,25 @@ export default function PhysicalViewport({
     .filter(({ diagnostic }) => drcRule === "all" || diagnostic.ruleId === drcRule)
     .filter(({ diagnostic }) => drcSeverity === "all" || diagnostic.severity === drcSeverity)
     .filter(({ diagnostic }) => drcNet === "all" || diagnosticNets(diagnostic).includes(Number(drcNet)));
+  const buildStages = [
+    { id: "topology", label: "Prepare topology and reusable hierarchy", doneAt: 8 },
+    { id: "planning", label: "Plan the floorplan and placement fabric", doneAt: 10 },
+    { id: "candidateRouting", label: "Evaluate placement and routing candidates", doneAt: 64 },
+    { id: "geometryRefinement", label: "Refine and repair physical geometry", doneAt: 90 },
+    { id: "physicalIr", label: "Assemble the physical design", doneAt: 96 },
+    { id: "drc", label: "Run categorized physical DRC", doneAt: 100 },
+  ];
+  const buildPercent = Math.max(0, Math.min(100, buildProgress?.percent ?? 0));
+  const elapsedMs = buildStartedAt === null ? 0 : Math.max(0, clockNow - buildStartedAt);
+  const estimatedRemainingMs = buildPercent >= 5 && buildPercent < 100
+    ? (elapsedMs / buildPercent) * (100 - buildPercent)
+    : null;
+  const formatDuration = (milliseconds: number) => {
+    const totalSeconds = Math.max(0, Math.round(milliseconds / 1000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return minutes ? `${minutes}m ${seconds.toString().padStart(2, "0")}s` : `${seconds}s`;
+  };
 
   return (
     <div className="physical-workspace">
@@ -379,6 +414,7 @@ export default function PhysicalViewport({
           <span>{layout ? `${layout.devices.length} MOS` : "Generating…"}</span>
           <span>{layout ? `${layout.nets.length} nets · ${layout.pins.length} pins` : ""}</span>
           <span>{layout ? `${layout.maxMetalLayers} routing metals` : ""}</span>
+          <span>{layout ? `deck ${layout.technologyFingerprint}` : ""}</span>
           {layout && (() => {
             const candidate = layout.planning.candidates[layout.planning.selectedCandidate];
             const placement = layout.placement.candidates[layout.placement.selectedCandidate];
@@ -411,10 +447,14 @@ export default function PhysicalViewport({
                 <span>{layout.detailedRouting.converged ? "detailed route converged" : `${layout.detailedRouting.conflictCount} detail conflicts · ${layout.detailedRouting.blockedPinCount} blocked pins`}</span>
                 <span>{layout.detailedRouting.totalWireLengthUm.toFixed(1)} µm detailed wire · {layout.detailedRouting.totalViaCount} vias · {layout.detailedRouting.iterations.length} repair passes</span>
                 <span>{layout.detailedRouting.rejectedGeometryCount} illegal route shapes rejected before IR</span>
+                <span>{layout.orphanRoutingShapesRemoved} disconnected metal/via shapes removed after routing</span>
                 <span>{layout.detailedRouting.seededDeviceShapeCount} device shapes seeded before routing</span>
                 <span>{layout.detailedRouting.trackRetryCount} indexed track retries · {layout.detailedRouting.layerEscalationCount} layer escalations</span>
                 {layout.physicalBlocks.length > 0 && (
                   <span>{layout.physicalBlocks.filter((block) => block.verified).length}/{layout.physicalBlocks.length} frozen blocks locally DRC-clean · {layout.physicalBlocks.reduce((count, block) => count + block.interfacePins.length, 0)} interface pins</span>
+                )}
+                {layout.standardCellLibrary.generated && (
+                  <span>{layout.standardCellLibrary.cells.length} packaged cells · {layout.standardCellLibrary.libraryName}</span>
                 )}
                 <span>{layout.timing.estimatedWorstDelayNs.toFixed(4)} ns worst path · {layout.timing.paths.length} input/output paths</span>
                 <span>{layout.timing.candidates.length} routed candidates timing-scored</span>
@@ -446,7 +486,7 @@ export default function PhysicalViewport({
           <strong>Build report</strong>
           {Object.entries(drc.byCategory).map(([name, count]) => <span key={name}>{name} <b>{count}</b></span>)}
           {Object.entries(drc.byOrigin).map(([name, count]) => <span key={name}>{name} <b>{count}</b></span>)}
-          {buildReport && <small>{buildReport.elapsedMs} ms · overflow {buildReport.globalRoutingOverflow} · conflicts {buildReport.detailedRoutingConflicts} · rejected {buildReport.rejectedGeometryCount}</small>}
+          {buildReport && <small>{buildReport.elapsedMs} ms · overflow {buildReport.globalRoutingOverflow} · conflicts {buildReport.detailedRoutingConflicts} · rejected {buildReport.rejectedGeometryCount} · orphan cleanup {buildReport.orphanRoutingShapesRemoved}</small>}
         </div>}
         <div className="physical-drc-filters">
           <select aria-label="Filter DRC by layer" value={drcLayer} onChange={(event) => setDrcLayer(event.target.value)}>
@@ -483,6 +523,8 @@ export default function PhysicalViewport({
         </div>
         <button className="physical-reset" disabled={!drc} onClick={onSaveDrc}>Save DRC report…</button>
         <button className="physical-reset" disabled={!layout} onClick={onSaveLayout}>Save .chippy_gds…</button>
+        <button className="physical-reset" disabled={!layout} onClick={onExportGds}>Export binary GDSII…</button>
+        <button className="physical-reset" disabled={!layout} onClick={onExportLef}>Export LEF macro…</button>
         <p className="physical-sidebar-section">Layers</p>
         <button className="physical-reset" onClick={showAllLayers}>Show all layers</button>
         <div className="physical-layers">
@@ -516,14 +558,26 @@ export default function PhysicalViewport({
         {!layout && !buildError && <div className="physical-build-overlay">
           <div className="physical-build-card">
             <strong>Building Your Design…</strong>
-            <span>Generating physical layout</span>
-            <div className="physical-build-progress"><i /></div>
-            <ol>
-              <li>Logical placement and device generation</li>
-              <li>Local and global signal routing</li>
-              <li>Physical IR and categorized DRC</li>
+            <span>{buildStages.find(({ id }) => id === buildProgress?.stage)?.label ?? "Starting physical generation"}</span>
+            <div className="physical-build-timing">
+              <span>Elapsed <b>{formatDuration(elapsedMs)}</b></span>
+              <span>Estimate <b>{estimatedRemainingMs === null ? "Calculating…" : `~${formatDuration(estimatedRemainingMs)} remaining`}</b></span>
+            </div>
+            <div className="physical-build-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={buildPercent}>
+              <i style={{ width: `${buildPercent}%` }} />
+            </div>
+            <small>{buildPercent}% complete · estimates adjust as routing complexity becomes known</small>
+            <ol className="physical-build-checklist">
+              {buildStages.map((stage) => {
+                const complete = buildPercent >= stage.doneAt;
+                const active = !complete && buildProgress?.stage === stage.id;
+                return <li key={stage.id} className={complete ? "complete" : active ? "active" : ""}>
+                  <i aria-hidden="true">{complete ? "✓" : active ? "●" : "○"}</i>
+                  <span>{stage.label}</span>
+                </li>;
+              })}
             </ol>
-            <small>Good silicon takes a little patience.</small>
+            <small>Routing is correctness-first; difficult paths will continue searching.</small>
           </div>
         </div>}
         {!layout && buildError && <div className="physical-build-overlay">

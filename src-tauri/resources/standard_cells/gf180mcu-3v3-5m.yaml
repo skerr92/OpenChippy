@@ -1,0 +1,14 @@
+format_version: 1
+library_name: OpenChippy GF180MCU 3.3V Standard Cells
+process_id: gf180mcu-3v3-5m-compat
+deck_revision: openchippy-compat-v1
+source: OpenChippy parametric cells using the public GF180MCU compatibility rules
+placement_site_width_um: 0.56
+row_height_um: 5.60
+transistor_pitch_um: 0.84
+cell_padding_um: 0.56
+pin_layer: 2
+power_layer: 1
+nmos_width_um: 1.00
+pmos_width_um: 1.40
+gate_length_um: 0.28

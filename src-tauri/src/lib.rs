@@ -1,36 +1,45 @@
+pub mod gds_import;
+pub mod gdsii;
 mod history;
+pub mod lef;
 mod model;
 #[allow(dead_code)]
 mod physical_canvas;
 mod physical_detailed_routing;
-mod physical_drc;
+pub mod physical_drc;
 mod physical_global_routing;
 mod physical_layout;
+pub mod physical_lvs;
 mod physical_placement;
 mod physical_planning;
 #[allow(dead_code)]
 mod plugins;
 mod rtl;
 mod simulation;
+pub mod standard_cells;
 pub mod technology;
 mod validation;
 
+use gdsii::GdsExportReport;
 use history::ProjectHistory;
 use model::{
     BlockDefinition, DeviceCharacteristics, Project, TerminalRef, WaveformGroup,
     CURRENT_FORMAT_VERSION,
 };
 use physical_drc::PhysicalDrcReport;
-use physical_layout::{PhysicalLayoutIr, CURRENT_PHYSICAL_IR_VERSION};
+pub use physical_layout::PhysicalLayoutIr;
+use physical_layout::{PhysicalRouteQualityReport, CURRENT_PHYSICAL_IR_VERSION};
+use physical_lvs::NativeLvsReport;
 use serde::{Deserialize, Serialize};
 use simulation::{LogicState, SimulationResult, TruthTableResult, WaveformConfig, WaveformResult};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
     time::Instant,
 };
+use tauri::Emitter;
 use technology::Technology;
 use thiserror::Error;
 use validation::ValidationReport;
@@ -51,11 +60,238 @@ struct PhysicalBuildReport {
     global_routing_overflow: usize,
     detailed_routing_conflicts: usize,
     rejected_geometry_count: usize,
+    orphan_routing_shapes_removed: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PhysicalBuildProgress {
+    stage: &'static str,
+    percent: u8,
+    elapsed_ms: u128,
 }
 
 const BLOCK_LIBRARY_DIRECTORY: &str = "chippyblocks";
 const OCHIPPY_FORMAT_VERSION: u32 = 1;
 const PHYSICAL_ARTIFACT_FORMAT_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalAuditSummary {
+    pub project: String,
+    pub technology: String,
+    pub technology_fingerprint: String,
+    pub topology_compacted: bool,
+    pub shape_count: usize,
+    pub shape_purposes: BTreeMap<String, usize>,
+    pub row_count: usize,
+    pub active_island_count: usize,
+    pub shared_active_island_count: usize,
+    pub devices_in_shared_active: usize,
+    pub gate_strap_count: usize,
+    pub devices_on_gate_straps: usize,
+    pub shared_terminal_access_count: usize,
+    pub devices_on_shared_terminal_accesses: usize,
+    pub route_quality: PhysicalRouteQualityReport,
+    pub error_count: usize,
+    pub warning_count: usize,
+    pub orphan_routing_shapes_removed: usize,
+    pub by_rule: BTreeMap<String, usize>,
+    pub by_layer: BTreeMap<String, usize>,
+    pub open_nets: Vec<PhysicalAuditOpenNet>,
+    pub native_lvs: NativeLvsReport,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalAuditOpenNet {
+    pub net: usize,
+    pub name: String,
+    pub islands: usize,
+    pub terminals: Vec<String>,
+}
+
+pub fn audit_physical_sources(
+    project_source: &str,
+    technology_source: &str,
+) -> Result<PhysicalAuditSummary, String> {
+    let mut project: Project = serde_json::from_str(project_source)
+        .map_err(|error| format!("project JSON is invalid: {error}"))?;
+    let technology = Technology::from_yaml(technology_source)?;
+    project.set_technology(technology.clone());
+    let layout = physical_layout::normalize_project(&project)?;
+    let report = physical_drc::validate(&layout, &technology);
+    if std::env::var_os("OPENCHIPPY_ROUTER_TRACE").is_some() {
+        for diagnostic in &report.diagnostics {
+            eprintln!("{}: {}", diagnostic.rule_id, diagnostic.message);
+            for shape_index in &diagnostic.shape_indices {
+                let Some(shape) = layout.shapes.get(*shape_index) else {
+                    continue;
+                };
+                let component = shape
+                    .component_id
+                    .and_then(|id| {
+                        layout
+                            .devices
+                            .iter()
+                            .find(|device| device.component_id == id)
+                    })
+                    .map(|device| device.name.as_str())
+                    .unwrap_or("-");
+                eprintln!(
+                    "  shape={shape_index} layer={:?} net={:?} component={component} at=({:.4},{:.4}) size=({:.4},{:.4})",
+                    shape.layer, shape.net, shape.x, shape.y, shape.width, shape.height
+                );
+            }
+        }
+    }
+    let native_lvs = physical_lvs::compare(&layout, &technology);
+    let mut by_rule = BTreeMap::new();
+    let mut by_layer = BTreeMap::new();
+    let mut shape_purposes = BTreeMap::new();
+    for shape in &layout.shapes {
+        *shape_purposes
+            .entry(shape.purpose.as_str().to_string())
+            .or_insert(0) += 1;
+    }
+    for diagnostic in &report.diagnostics {
+        *by_rule.entry(diagnostic.rule_id.to_string()).or_insert(0) += 1;
+        *by_layer.entry(diagnostic.layer.clone()).or_insert(0) += 1;
+    }
+    let mut open_nets = report
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.rule_id == "CONNECTIVITY.OPEN_NET")
+        .filter_map(|diagnostic| {
+            let net_id = diagnostic
+                .shape_indices
+                .iter()
+                .filter_map(|index| layout.shapes.get(*index)?.net)
+                .next()?;
+            let net = layout.nets.iter().find(|net| net.id == net_id)?;
+            Some(PhysicalAuditOpenNet {
+                net: net.id,
+                name: net.name.clone(),
+                islands: diagnostic.measured.round().max(0.0) as usize,
+                terminals: net
+                    .terminals
+                    .iter()
+                    .map(|terminal| format!("{}:{}", terminal.component_name, terminal.terminal))
+                    .collect(),
+            })
+        })
+        .collect::<Vec<_>>();
+    open_nets.sort_by_key(|net| net.net);
+    Ok(PhysicalAuditSummary {
+        project: project.name,
+        technology: technology.name,
+        technology_fingerprint: layout.technology_fingerprint.clone(),
+        topology_compacted: layout.placement.candidates[layout.placement.selected_candidate]
+            .topology_compacted,
+        shape_count: layout.shapes.len(),
+        shape_purposes,
+        row_count: layout.row_topology.len(),
+        active_island_count: layout
+            .row_topology
+            .iter()
+            .map(|row| row.islands.len())
+            .sum(),
+        shared_active_island_count: layout
+            .row_topology
+            .iter()
+            .flat_map(|row| &row.islands)
+            .filter(|island| island.device_ids.len() > 1)
+            .count(),
+        devices_in_shared_active: layout
+            .row_topology
+            .iter()
+            .flat_map(|row| &row.islands)
+            .filter(|island| island.device_ids.len() > 1)
+            .map(|island| island.device_ids.len())
+            .sum(),
+        gate_strap_count: layout
+            .row_topology
+            .iter()
+            .map(|row| row.gate_straps.len())
+            .sum(),
+        devices_on_gate_straps: layout
+            .row_topology
+            .iter()
+            .flat_map(|row| &row.gate_straps)
+            .map(|strap| strap.device_ids.len())
+            .sum(),
+        shared_terminal_access_count: layout
+            .row_topology
+            .iter()
+            .flat_map(|row| &row.islands)
+            .flat_map(|island| &island.accesses)
+            .filter(|access| access.shared_contact)
+            .count(),
+        devices_on_shared_terminal_accesses: layout
+            .row_topology
+            .iter()
+            .flat_map(|row| &row.islands)
+            .flat_map(|island| &island.accesses)
+            .filter(|access| access.shared_contact)
+            .map(|access| access.device_ids.len())
+            .sum(),
+        route_quality: layout.route_quality.clone(),
+        error_count: report.error_count,
+        warning_count: report.warning_count,
+        orphan_routing_shapes_removed: layout.orphan_routing_shapes_removed,
+        by_rule,
+        by_layer,
+        open_nets,
+        native_lvs,
+    })
+}
+
+pub fn generate_physical_ir_sources(
+    project_source: &str,
+    technology_source: &str,
+) -> Result<PhysicalLayoutIr, String> {
+    let mut project: Project = serde_json::from_str(project_source)
+        .map_err(|error| format!("project JSON is invalid: {error}"))?;
+    project.set_technology(Technology::from_yaml(technology_source)?);
+    physical_layout::normalize_project(&project)
+}
+
+pub fn audit_physical_drc_sources(
+    project_source: &str,
+    technology_source: &str,
+) -> Result<PhysicalDrcReport, String> {
+    let mut project: Project = serde_json::from_str(project_source)
+        .map_err(|error| format!("project JSON is invalid: {error}"))?;
+    let technology = Technology::from_yaml(technology_source)?;
+    project.set_technology(technology.clone());
+    Ok(physical_drc::validate(
+        &physical_layout::normalize_project(&project)?,
+        &technology,
+    ))
+}
+
+pub fn export_lef_sources(project_source: &str, technology_source: &str) -> Result<String, String> {
+    let mut project: Project = serde_json::from_str(project_source)
+        .map_err(|error| format!("project JSON is invalid: {error}"))?;
+    project.set_technology(Technology::from_yaml(technology_source)?);
+    lef::export(&physical_layout::normalize_project(&project)?)
+}
+
+pub fn export_gds_sources(
+    project_source: &str,
+    technology_source: &str,
+) -> Result<(Vec<u8>, GdsExportReport), String> {
+    let mut project: Project = serde_json::from_str(project_source)
+        .map_err(|error| format!("project JSON is invalid: {error}"))?;
+    let technology = Technology::from_yaml(technology_source)?;
+    project.set_technology(technology.clone());
+    let layout = physical_layout::normalize_project(&project)?;
+    gdsii::export(
+        &layout,
+        technology.physical_rules.database_units_per_micron,
+        &technology.gds_layers,
+    )
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -765,8 +1001,24 @@ fn validate_physical_layout(
 }
 
 #[tauri::command]
+fn validate_physical_lvs(state: tauri::State<AppState>) -> Result<NativeLvsReport, ProjectError> {
+    let workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| ProjectError::StateUnavailable)?;
+    let project = workspace.history.current();
+    let layout = matching_cached_layout(&workspace.physical_cache, &project)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            physical_layout::normalize_project(&project).map_err(ProjectError::InvalidAction)
+        })?;
+    Ok(physical_lvs::compare(&layout, &project.technology))
+}
+
+#[tauri::command]
 async fn inspect_physical_layout(
     state: tauri::State<'_, AppState>,
+    window: tauri::Window,
 ) -> Result<PhysicalInspection, ProjectError> {
     let (project, cached_layout) = {
         let workspace = state
@@ -783,11 +1035,30 @@ async fn inspect_physical_layout(
         move || -> Result<PhysicalInspection, ProjectError> {
             let started = Instant::now();
             let from_cache = cached_layout.is_some();
+            let emit_progress = |stage: &'static str, percent: u8| {
+                let _ = window.emit(
+                    "physical-build-progress",
+                    PhysicalBuildProgress {
+                        stage,
+                        percent,
+                        elapsed_ms: started.elapsed().as_millis(),
+                    },
+                );
+            };
+            emit_progress(
+                if from_cache { "physicalIr" } else { "topology" },
+                if from_cache { 94 } else { 0 },
+            );
             let layout = cached_layout.map(Ok).unwrap_or_else(|| {
-                physical_layout::normalize_project(&project_for_build)
-                    .map_err(ProjectError::InvalidAction)
+                physical_layout::normalize_project_with_progress(
+                    &project_for_build,
+                    |stage, percent| emit_progress(stage, percent),
+                )
+                .map_err(ProjectError::InvalidAction)
             })?;
+            emit_progress("drc", 96);
             let drc = physical_drc::validate(&layout, &project_for_build.technology);
+            emit_progress("complete", 100);
             let build_report = PhysicalBuildReport {
                 elapsed_ms: started.elapsed().as_millis(),
                 stages: if from_cache {
@@ -807,6 +1078,7 @@ async fn inspect_physical_layout(
                 global_routing_overflow: layout.global_routing.total_overflow,
                 detailed_routing_conflicts: layout.detailed_routing.conflict_count,
                 rejected_geometry_count: layout.detailed_routing.rejected_geometry_count,
+                orphan_routing_shapes_removed: layout.orphan_routing_shapes_removed,
             };
             Ok(PhysicalInspection {
                 layout,
@@ -855,6 +1127,64 @@ fn save_physical_layout(
     };
     fs::write(&path, serde_json::to_string_pretty(&artifact)?)?;
     workspace.physical_cache = Some(artifact);
+    Ok(path)
+}
+
+#[tauri::command]
+fn export_gdsii(
+    path: String,
+    state: tauri::State<AppState>,
+) -> Result<GdsExportReport, ProjectError> {
+    let workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| ProjectError::StateUnavailable)?;
+    let project = workspace.history.current();
+    let layout = matching_cached_layout(&workspace.physical_cache, &project)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            physical_layout::normalize_project(&project).map_err(ProjectError::InvalidAction)
+        })?;
+    let connectivity_errors = physical_drc::validate(&layout, &project.technology)
+        .diagnostics
+        .into_iter()
+        .filter(|diagnostic| diagnostic.rule_id.starts_with("CONNECTIVITY."))
+        .count();
+    if connectivity_errors > 0 {
+        return Err(ProjectError::InvalidAction(format!(
+            "GDSII export blocked: physical layout has {connectivity_errors} unconnected transistor-net diagnostics. Regenerate or repair the physical layout before manufacturing export."
+        )));
+    }
+    let (bytes, report) = gdsii::export(
+        &layout,
+        project.technology.physical_rules.database_units_per_micron,
+        &project.technology.gds_layers,
+    )
+    .map_err(ProjectError::InvalidAction)?;
+    if !report.structurally_valid {
+        return Err(ProjectError::InvalidAction(format!(
+            "GDSII structural validation failed: {}",
+            report.diagnostics.join("; ")
+        )));
+    }
+    fs::write(path, bytes)?;
+    Ok(report)
+}
+
+#[tauri::command]
+fn export_lef(path: String, state: tauri::State<AppState>) -> Result<String, ProjectError> {
+    let workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| ProjectError::StateUnavailable)?;
+    let project = workspace.history.current();
+    let layout = matching_cached_layout(&workspace.physical_cache, &project)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            physical_layout::normalize_project(&project).map_err(ProjectError::InvalidAction)
+        })?;
+    let source = lef::export(&layout).map_err(ProjectError::InvalidAction)?;
+    fs::write(&path, source)?;
     Ok(path)
 }
 
@@ -1050,6 +1380,7 @@ fn load_circuit_file(path: &Path) -> Result<Project, ProjectError> {
             supported: CURRENT_FORMAT_VERSION,
         });
     }
+    project.technology.migrate_legacy_gds_layers();
     load_block_library(path, &mut project)?;
     Ok(project)
 }
@@ -1088,14 +1419,15 @@ fn load_project_files(path: &Path) -> Result<(Project, Option<PhysicalArtifact>)
             ".ochippy may include at most one physical file".into(),
         ));
     }
-    let physical_cache = physical_files
-        .first()
-        .map(|file| -> Result<PhysicalArtifact, ProjectError> {
-            let artifact_path = safe_included_path(root, &file.path)?;
-            let artifact = serde_json::from_str(&fs::read_to_string(artifact_path)?)?;
-            validate_physical_artifact(artifact, &project)
-        })
-        .transpose()?;
+    let physical_cache = if let Some(file) = physical_files.first() {
+        let artifact_path = safe_included_path(root, &file.path)?;
+        fs::read_to_string(artifact_path)
+            .ok()
+            .and_then(|source| serde_json::from_str(&source).ok())
+            .and_then(|artifact| validate_physical_artifact(artifact, &project).ok())
+    } else {
+        None
+    };
     Ok((project, physical_cache))
 }
 
@@ -1219,8 +1551,11 @@ pub fn run() {
             save_text_file,
             generate_physical_ir,
             validate_physical_layout,
+            validate_physical_lvs,
             inspect_physical_layout,
             save_physical_layout,
+            export_gdsii,
+            export_lef,
             save_physical_drc_report,
             capture_block,
             place_block,
@@ -1243,9 +1578,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_physical_artifact, load_block_library, load_project_files, save_block_library,
-        save_physical_drc_report, OchippyIncludedFile, OchippyManifest, Workspace,
-        BLOCK_LIBRARY_DIRECTORY, OCHIPPY_FORMAT_VERSION,
+        build_physical_artifact, load_block_library, load_project_files, matching_cached_layout,
+        save_block_library, save_physical_drc_report, validate_physical_artifact,
+        OchippyIncludedFile, OchippyManifest, Workspace, BLOCK_LIBRARY_DIRECTORY,
+        CURRENT_PHYSICAL_IR_VERSION, OCHIPPY_FORMAT_VERSION,
     };
     use crate::model::{Project, TerminalRef};
     use std::fs;
@@ -1316,6 +1652,26 @@ mod tests {
     }
 
     #[test]
+    fn loading_a_legacy_gf180_project_restores_pwell_export_mapping() {
+        let root = std::env::temp_dir().join(format!("openchippy-gf180-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("legacy.chippy");
+        let mut project = Project::default();
+        project.technology = crate::technology::Technology::from_yaml(include_str!(
+            "../../docs/examples/process_gf180mcu_3v3_5m_dr.yaml"
+        ))
+        .unwrap();
+        project.technology.gds_layers.layers.remove("pwell");
+        fs::write(&path, serde_json::to_string_pretty(&project).unwrap()).unwrap();
+
+        let (loaded, cache) = load_project_files(&path).unwrap();
+        assert!(cache.is_none());
+        assert_eq!(loaded.technology.gds_layers.layers["pwell"][0].layer, 204);
+        assert!(loaded.technology.validate().is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn ochippy_manifest_loads_circuit_and_matching_physical_cache() {
         let root =
             std::env::temp_dir().join(format!("openchippy-project-{}", uuid::Uuid::new_v4()));
@@ -1354,6 +1710,13 @@ mod tests {
             .connect(terminal(pmos, "drain"), terminal(output, "in"))
             .unwrap();
         let artifact = build_physical_artifact(&project).unwrap();
+        let mut stale_artifact = artifact.clone();
+        stale_artifact.physical_ir.format_version = CURRENT_PHYSICAL_IR_VERSION.saturating_sub(1);
+        assert!(matching_cached_layout(&Some(stale_artifact.clone()), &project).is_none());
+        assert!(validate_physical_artifact(stale_artifact, &project)
+            .unwrap_err()
+            .to_string()
+            .contains("physical IR version"));
         fs::write(
             &circuit_path,
             serde_json::to_string_pretty(&project).unwrap(),
@@ -1403,7 +1766,20 @@ mod tests {
             serde_json::to_string_pretty(&project).unwrap(),
         )
         .unwrap();
-        assert!(load_project_files(&manifest_path).is_err());
+        let (edited, stale_cache) = load_project_files(&manifest_path).unwrap();
+        assert_eq!(edited.name, project.name);
+        assert!(stale_cache.is_none());
+
+        let mut stale_artifact = artifact;
+        stale_artifact.physical_ir.format_version = CURRENT_PHYSICAL_IR_VERSION.saturating_sub(1);
+        fs::write(
+            &physical_path,
+            serde_json::to_string_pretty(&stale_artifact).unwrap(),
+        )
+        .unwrap();
+        let (loaded_without_stale_cache, stale_cache) = load_project_files(&manifest_path).unwrap();
+        assert_eq!(loaded_without_stale_cache.name, project.name);
+        assert!(stale_cache.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 

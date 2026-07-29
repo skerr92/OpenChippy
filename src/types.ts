@@ -4,6 +4,22 @@ export type Position = {
   z: number;
 };
 
+export type GdsExportReport = {
+  formatVersion: number;
+  libraryName: string;
+  topCell: string;
+  databaseUnitsPerMicron: number;
+  boundaryCount: number;
+  labelCount: number;
+  structureCount: number;
+  referenceCount: number;
+  layerBoundaryCounts: Record<string, number>;
+  bounds: { minX: number; minY: number; maxX: number; maxY: number };
+  byteCount: number;
+  structurallyValid: boolean;
+  diagnostics: string[];
+};
+
 export type Component = {
   id: string;
   kind: string;
@@ -136,6 +152,9 @@ export type MosTechnology = {
 export type Technology = {
   format_version: number;
   name: string;
+  process_id: string;
+  deck_revision: string;
+  source: string;
   supply_voltage: number;
   max_metal_layers: number;
   nmos: MosTechnology;
@@ -144,6 +163,13 @@ export type Technology = {
   tapeout_window: TapeoutWindow;
   physical_rules: PhysicalRuleDeck;
   physical_planning: PhysicalPlanningRules;
+  gds_layers: GdsLayerMap;
+};
+
+export type GdsLayerMap = {
+  format_version: number;
+  label_datatype: number;
+  layers: Record<string, Array<{ purpose: string; layer: number; datatype: number }>>;
 };
 
 export type TapeoutWindow = {
@@ -225,6 +251,7 @@ export type PhysicalLayoutIr = {
   formatVersion: number;
   sourceProjectName: string;
   technologyName: string;
+  technologyFingerprint: string;
   maxMetalLayers: number;
   devices: Array<{
     componentId: string;
@@ -343,8 +370,11 @@ export type PhysicalLayoutIr = {
       estimatedWireLengthUm: number;
       peakBinUtilization: number;
       diffusionSharingPairs: number;
+      gateStrapPairs: number;
       occupancyRetries: number;
       reservedDeviceShapes: number;
+      standardCellInstances: number;
+      topologyCompacted: boolean;
       score: number;
     }>;
     selectedCandidate: number;
@@ -487,7 +517,93 @@ export type PhysicalLayoutIr = {
     height: number;
     componentId: string | null;
     net: number | null;
+    purpose:
+      | "unknown"
+      | "fabric"
+      | "active"
+      | "gate"
+      | "gate_access"
+      | "contact"
+      | "device_landing"
+      | "pin"
+      | "power_rail"
+      | "route"
+      | "route_fill"
+      | "dummy_fill"
+      | "via_landing"
+      | "via"
+      | "tap";
   }>;
+  rowTopology: Array<{
+    kind: "nmos" | "pmos";
+    y: number;
+    orderedDevices: string[];
+    islands: Array<{
+      layer: string;
+      deviceIds: string[];
+      terminalNets: number[];
+      accesses: Array<{
+        net: number;
+        deviceIds: string[];
+        x: number;
+        y: number;
+        sharedContact: boolean;
+      }>;
+      bounds: { minX: number; minY: number; maxX: number; maxY: number };
+      geometry: Array<{
+        minX: number;
+        minY: number;
+        maxX: number;
+        maxY: number;
+      }>;
+    }>;
+    gateStraps: Array<{
+      net: number;
+      deviceIds: string[];
+      bounds: { minX: number; minY: number; maxX: number; maxY: number };
+      geometry: Array<{
+        minX: number;
+        minY: number;
+        maxX: number;
+        maxY: number;
+      }>;
+    }>;
+  }>;
+  routeQuality: {
+    routedShapeAreaUm2: number;
+    routingBboxAreaUm2: number;
+    maxDeviceEnvelopeExcursionUm: number;
+    maxTerminalEnvelopeExcursionUm: number;
+    largestTerminalExcursions: Array<{
+      shapeIndex: number;
+      net: number | null;
+      layer: string;
+      purpose: string;
+      excursionUm: number;
+      bounds: { minX: number; minY: number; maxX: number; maxY: number };
+    }>;
+    terminalFreeComponentCount: number;
+    terminalFreeShapeCount: number;
+    terminalFreeComponents: Array<{
+      net: number;
+      shapeIndices: number[];
+      layers: string[];
+      purposes: string[];
+      bounds: { minX: number; minY: number; maxX: number; maxY: number };
+    }>;
+    exactDuplicateViaCount: number;
+    unlandedViaCount: number;
+    unjustifiedRouteEndpointCount: number;
+    unjustifiedRouteEndpoints: Array<{
+      shapeIndex: number;
+      net: number;
+      layer: string;
+      purpose: string;
+      x: number;
+      y: number;
+    }>;
+  };
+  orphanRoutingShapesRemoved: number;
   physicalBlocks: Array<{
     instanceName: string;
     bounds: { minX: number; minY: number; maxX: number; maxY: number };
@@ -499,6 +615,33 @@ export type PhysicalLayoutIr = {
     verified: boolean;
     immutable: boolean;
   }>;
+  standardCellLibrary: {
+    formatVersion: number;
+    libraryName: string;
+    processId: string;
+    deckRevision: string;
+    source: string;
+    generated: boolean;
+    cells: Array<{
+      definition: {
+        name: string;
+        class: "combinational" | "pass_gate" | "sequential";
+        inputs: string[];
+        outputs: string[];
+        powerPins: string[];
+        function: string;
+        transistorCount: number;
+      };
+      widthUm: number;
+      heightUm: number;
+      placementSites: number;
+      pinLayer: number;
+      powerLayer: number;
+      nmosWidthUm: number;
+      pmosWidthUm: number;
+      gateLengthUm: number;
+    }>;
+  };
 };
 
 export type PhysicalDrcDiagnostic = {
@@ -521,12 +664,30 @@ export type PhysicalDrcReport = {
   byOrigin: Record<string, number>;
 };
 
+export type NativeLvsReport = {
+  matched: boolean;
+  expectedDeviceCount: number;
+  recognizedDeviceCount: number;
+  expectedNetCount: number;
+  openNetCount: number;
+  shortCount: number;
+  missingDevices: string[];
+  missingTerminals: string[];
+};
+
 export type PhysicalBuildReport = {
   elapsedMs: number;
   stages: string[];
   globalRoutingOverflow: number;
   detailedRoutingConflicts: number;
   rejectedGeometryCount: number;
+  orphanRoutingShapesRemoved: number;
+};
+
+export type PhysicalBuildProgress = {
+  stage: string;
+  percent: number;
+  elapsedMs: number;
 };
 
 export type Diagnostic = {

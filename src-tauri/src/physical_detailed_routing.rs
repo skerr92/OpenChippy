@@ -1,8 +1,12 @@
 use crate::{
     physical_canvas::{device_footprint, PhysicalCanvas},
     physical_global_routing::GlobalRoutingReport,
-    physical_layout::{PhysicalLayer, PhysicalNet, PhysicalPin, PhysicalShape},
-    physical_placement::PhysicalPlacementReport,
+    physical_layout::{
+        PhysicalLayer, PhysicalNet, PhysicalPin, PhysicalShape, PhysicalShapePurpose,
+    },
+    physical_placement::{
+        commit_compact_device_entries, compact_device_entries, PhysicalPlacementReport,
+    },
     physical_planning::PhysicalPlanningReport,
     technology::Technology,
 };
@@ -79,6 +83,7 @@ fn rectangle(
         height: if horizontal { width } else { bottom - top },
         component_id: None,
         net: Some(net),
+        purpose: PhysicalShapePurpose::Route,
     }
 }
 
@@ -129,6 +134,7 @@ fn transition_stack(
             height: landing,
             component_id: None,
             net: Some(net),
+            purpose: PhysicalShapePurpose::ViaLanding,
         });
     }
     for lower in low..high {
@@ -145,6 +151,7 @@ fn transition_stack(
             height: cut.size_um,
             component_id: None,
             net: Some(net),
+            purpose: PhysicalShapePurpose::Via,
         });
     }
     shapes
@@ -185,19 +192,27 @@ fn build_routes(
         .iter()
         .map(|device| (device.component_id, device))
         .collect::<HashMap<_, _>>();
-    let mut device_entries = Vec::with_capacity(selected_placement.devices.len() * 4);
-    for placed in &selected_placement.devices {
-        let device = devices_by_id
-            .get(&placed.component_id)
-            .expect("placed device belongs to physical device IR");
-        device_entries.extend(
-            device_footprint(device, placed.x, placed.y, &technology.physical_rules)
-                .into_iter()
-                .map(|(shape, obstruction)| (shape, device.name.clone(), obstruction)),
-        );
-    }
-    canvas
-        .commit_batch(&device_entries)
+    let device_entries = if selected_placement.topology_compacted {
+        compact_device_entries(
+            &selected_placement.devices,
+            devices,
+            &technology.physical_rules,
+        )
+    } else {
+        let mut entries = Vec::with_capacity(selected_placement.devices.len() * 4);
+        for placed in &selected_placement.devices {
+            let device = devices_by_id
+                .get(&placed.component_id)
+                .expect("placed device belongs to physical device IR");
+            entries.extend(
+                device_footprint(device, placed.x, placed.y, &technology.physical_rules)
+                    .into_iter()
+                    .map(|(shape, obstruction)| (shape, device.name.clone(), obstruction)),
+            );
+        }
+        entries
+    };
+    commit_compact_device_entries(&mut canvas, &device_entries)
         .expect("selected placement footprints remain legal when routing begins");
     let mut rejected_conflicts = Vec::new();
     for global_route in &global.routes {

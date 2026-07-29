@@ -3,6 +3,9 @@
 technology:
   format_version: 1
   name: OpenChippy Example EDU 5M
+  process_id: openchippy-edu-5m
+  deck_revision: example-v1
+  source: OpenChippy educational example
   supply_voltage: 1.8
   max_metal_layers: 5
 
@@ -47,6 +50,27 @@ physical_parasitics:
     via23: 0.055
     via34: 0.050
     via45: 0.045
+
+gds_layers:
+  format_version: 1
+  label_datatype: 10
+  layers:
+    substrate: [{ purpose: substrate_preview, layer: 1, datatype: 0 }]
+    pwell: [{ purpose: pwell, layer: 20, datatype: 0 }]
+    nwell: [{ purpose: nwell, layer: 21, datatype: 0 }]
+    ndiff: [{ purpose: ndiff, layer: 22, datatype: 0 }]
+    pdiff: [{ purpose: pdiff, layer: 22, datatype: 1 }]
+    poly: [{ purpose: poly, layer: 30, datatype: 0 }]
+    contact: [{ purpose: contact, layer: 33, datatype: 0 }]
+    metal1: [{ purpose: metal1, layer: 34, datatype: 0 }]
+    via12: [{ purpose: via12, layer: 35, datatype: 0 }]
+    metal2: [{ purpose: metal2, layer: 36, datatype: 0 }]
+    via23: [{ purpose: via23, layer: 37, datatype: 0 }]
+    metal3: [{ purpose: metal3, layer: 38, datatype: 0 }]
+    via34: [{ purpose: via34, layer: 39, datatype: 0 }]
+    metal4: [{ purpose: metal4, layer: 40, datatype: 0 }]
+    via45: [{ purpose: via45, layer: 41, datatype: 0 }]
+    metal5: [{ purpose: metal5, layer: 42, datatype: 0 }]
 
 physical_rules:
   format_version: 1

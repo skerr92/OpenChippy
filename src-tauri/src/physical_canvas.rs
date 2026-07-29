@@ -1,5 +1,7 @@
 use crate::{
-    physical_layout::{DeviceKind, PhysicalDevice, PhysicalLayer, PhysicalShape},
+    physical_layout::{
+        DeviceKind, PhysicalDevice, PhysicalLayer, PhysicalShape, PhysicalShapePurpose,
+    },
     technology::PhysicalRuleDeck,
 };
 use serde::Serialize;
@@ -53,6 +55,13 @@ impl CanvasBounds {
             && self.top < other.bottom - EPSILON
             && self.bottom > other.top + EPSILON
     }
+
+    fn touches(self, other: Self) -> bool {
+        self.left <= other.right + EPSILON
+            && self.right + EPSILON >= other.left
+            && self.top <= other.bottom + EPSILON
+            && self.bottom + EPSILON >= other.top
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -72,6 +81,25 @@ pub struct OccupiedInterval {
     pub spacing_halo_um: f64,
     #[serde(skip)]
     bounds: CanvasBounds,
+}
+
+impl OccupiedInterval {
+    fn physical_bounds(&self) -> CanvasBounds {
+        match self.orientation {
+            OccupancyOrientation::Horizontal => CanvasBounds {
+                left: self.start,
+                top: self.cross_start,
+                right: self.end,
+                bottom: self.cross_end,
+            },
+            OccupancyOrientation::Vertical => CanvasBounds {
+                left: self.cross_start,
+                top: self.start,
+                right: self.cross_end,
+                bottom: self.end,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -126,11 +154,14 @@ impl PhysicalCanvas {
         owner: impl Into<String>,
         obstruction_type: ObstructionType,
     ) -> Result<u64, Vec<CanvasCollision>> {
-        let routing = matches!(
+        let mergeable = matches!(
             obstruction_type,
-            ObstructionType::Metal | ObstructionType::PowerRail | ObstructionType::Via
+            ObstructionType::Metal
+                | ObstructionType::PowerRail
+                | ObstructionType::Via
+                | ObstructionType::Poly
         );
-        if routing {
+        if mergeable {
             self.can_route(shape)?;
         } else {
             self.can_place(shape)?;
@@ -272,6 +303,104 @@ impl PhysicalCanvas {
         Ok(committed)
     }
 
+    /// Admit a pre-synthesized, electrically continuous same-net poly tree.
+    ///
+    /// Pairwise spacing cannot correctly judge a rectilinear tree: a trunk can
+    /// be within spacing of a gate-access rectangle while a third branch fills
+    /// the apparent gap and joins both into one polygon. The topology
+    /// synthesizer proves collective connectivity first. This admission still
+    /// rejects every foreign-net poly obstruction and commits the complete
+    /// tree transactionally.
+    pub fn commit_topology_poly_geometry(
+        &mut self,
+        shapes: &[PhysicalShape],
+        owner: impl Into<String>,
+    ) -> Result<Vec<u64>, Vec<CanvasCollision>> {
+        if shapes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let net = shapes[0].net;
+        if net.is_none()
+            || shapes
+                .iter()
+                .any(|shape| shape.layer != PhysicalLayer::Poly || shape.net != net)
+        {
+            return Err(Vec::new());
+        }
+        let mut foreign = Vec::new();
+        for shape in shapes {
+            if let Err(collisions) = self.can_route(shape) {
+                foreign.extend(
+                    collisions
+                        .into_iter()
+                        .filter(|collision| collision.net != net),
+                );
+            }
+        }
+        foreign.sort_by_key(|collision| collision.occupied_id);
+        foreign.dedup_by_key(|collision| collision.occupied_id);
+        if !foreign.is_empty() {
+            return Err(foreign);
+        }
+        let mut candidate = self.clone();
+        let owner = owner.into();
+        let ids = shapes
+            .iter()
+            .map(|shape| candidate.index_unchecked(shape, owner.clone(), ObstructionType::Poly))
+            .collect::<Vec<_>>();
+        *self = candidate;
+        Ok(ids)
+    }
+
+    /// Admit one finalized rectilinear active island as a composite polygon.
+    ///
+    /// Mixed-width transistor rows decompose one connected diffusion island
+    /// into edge-abutting rectangles. Pairwise placement would reject the
+    /// second rectangle against the first one's spacing halo even though their
+    /// union is one legal active polygon. Validate the complete island only
+    /// against previously occupied diffusion, then index all of its pieces
+    /// atomically.
+    pub fn commit_topology_active_geometry(
+        &mut self,
+        shapes: &[PhysicalShape],
+        owner: impl Into<String>,
+    ) -> Result<Vec<u64>, Vec<CanvasCollision>> {
+        if shapes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let layer = shapes[0].layer;
+        if !matches!(layer, PhysicalLayer::Ndiff | PhysicalLayer::Pdiff)
+            || shapes.iter().any(|shape| {
+                shape.layer != layer
+                    || shape.purpose != PhysicalShapePurpose::Active
+                    || shape.component_id.is_some()
+            })
+        {
+            return Err(Vec::new());
+        }
+        let mut collisions = Vec::new();
+        for shape in shapes {
+            if let Err(found) = self.can_place(shape) {
+                collisions.extend(found);
+            }
+        }
+        collisions.sort_by_key(|collision| collision.occupied_id);
+        collisions.dedup_by_key(|collision| collision.occupied_id);
+        if !collisions.is_empty() {
+            return Err(collisions);
+        }
+        let mut candidate = self.clone();
+        let owner = owner.into();
+        let ids = shapes
+            .iter()
+            .map(|shape| {
+                candidate.index_unchecked(shape, owner.clone(), ObstructionType::Diffusion)
+            })
+            .collect::<Vec<_>>();
+        *self = candidate;
+        Ok(ids)
+    }
+
     pub fn remove(&mut self, id: u64) -> bool {
         let mut removed = false;
         for intervals in self.occupancy.values_mut() {
@@ -378,14 +507,18 @@ impl PhysicalCanvas {
             .query_neighbors(shape)
             .into_iter()
             .filter(|occupied| {
+                let same_net_poly_overlap = shape.layer == PhysicalLayer::Poly
+                    && occupied.layer == PhysicalLayer::Poly
+                    && CanvasBounds::from_shape(shape, 0.0).touches(occupied.physical_bounds());
                 if allow_same_net_merge
                     && shape.net.is_some()
                     && shape.net == occupied.net
-                    && matches!(shape.layer, PhysicalLayer::Metal(_))
-                    && matches!(
-                        occupied.obstruction_type,
-                        ObstructionType::Metal | ObstructionType::PowerRail
-                    )
+                    && (same_net_poly_overlap
+                        || (matches!(shape.layer, PhysicalLayer::Metal(_))
+                            && matches!(
+                                occupied.obstruction_type,
+                                ObstructionType::Metal | ObstructionType::PowerRail
+                            )))
                 {
                     return false;
                 }
@@ -409,7 +542,7 @@ impl PhysicalCanvas {
 
     fn spacing_for(&self, layer: PhysicalLayer) -> f64 {
         match layer {
-            PhysicalLayer::Nwell => self.rules.well.min_spacing_um,
+            PhysicalLayer::Pwell | PhysicalLayer::Nwell => self.rules.well.min_spacing_um,
             PhysicalLayer::Ndiff | PhysicalLayer::Pdiff => self.rules.diffusion.min_spacing_um,
             PhysicalLayer::Poly => self.rules.poly.min_spacing_um,
             PhysicalLayer::Metal(index) => {
@@ -504,7 +637,76 @@ pub fn device_footprint(
     y: f64,
     rules: &PhysicalRuleDeck,
 ) -> Vec<(PhysicalShape, ObstructionType)> {
-    let diffusion_height = 0.55 + device.width_um.min(4.0) * 0.12;
+    device_footprint_with_gate_access(device, x, y, rules, false)
+}
+
+fn snap_dimension_up(value: f64, grid: f64) -> f64 {
+    (value / grid).ceil().max(1.0) * grid
+}
+
+/// Process-derived horizontal distance from the gate axis to either
+/// source/drain contact center. The diffusion spacing term is conservative:
+/// the compact row synthesizer may collapse two facing accesses only after it
+/// proves that they are the same terminal net.
+pub(crate) fn device_terminal_offset(device: &PhysicalDevice, rules: &PhysicalRuleDeck) -> f64 {
+    let gate_width = rules.poly.min_width_um.max(device.length_um);
+    snap_dimension_up(
+        gate_width / 2.0
+            + rules.diffusion.min_spacing_um
+            + rules.contact.size_um / 2.0
+            + rules.contact.enclosure_um,
+        rules.manufacturing_grid_um,
+    )
+}
+
+pub(crate) fn device_active_width(device: &PhysicalDevice, rules: &PhysicalRuleDeck) -> f64 {
+    snap_dimension_up(
+        2.0 * (device_terminal_offset(device, rules)
+            + rules.contact.size_um / 2.0
+            + rules.contact.enclosure_um),
+        rules.manufacturing_grid_um,
+    )
+}
+
+pub(crate) fn device_diffusion_height(device: &PhysicalDevice, rules: &PhysicalRuleDeck) -> f64 {
+    let active_width = device_active_width(device, rules);
+    snap_dimension_up(
+        device
+            .width_um
+            .max(rules.diffusion.min_width_um)
+            .max(rules.diffusion.min_area_um2 / active_width)
+            .max(rules.contact.size_um + 2.0 * rules.contact.enclosure_um),
+        rules.manufacturing_grid_um,
+    )
+}
+
+/// Builds a MOS footprint with a process/device-sized gate core and a separate
+/// one-sided poly access extension. The core crosses active by exactly the
+/// required gate extension; the access grows only far enough to reach its
+/// selected contact rather than forcing every device into one fixed rectangle.
+pub fn device_footprint_with_gate_access(
+    device: &PhysicalDevice,
+    x: f64,
+    y: f64,
+    rules: &PhysicalRuleDeck,
+    outward_gate_access: bool,
+) -> Vec<(PhysicalShape, ObstructionType)> {
+    let diffusion_height = device_diffusion_height(device, rules);
+    let terminal_offset = device_terminal_offset(device, rules);
+    let mut gate_direction = if device.kind == DeviceKind::Pmos {
+        1.0
+    } else {
+        -1.0
+    };
+    if outward_gate_access {
+        gate_direction = -gate_direction;
+    }
+    // Foundry contacts are exact-size cuts, not minimum-size geometry. Keep
+    // access flexibility in the enclosing poly/M1 landings.
+    let gate_cut_size = rules.contact.size_um;
+    let gate_landing_size = device_gate_landing_size(rules);
+    let gate_offset = device_gate_access_offset(diffusion_height, rules);
+    let gate_y = y + gate_direction * gate_offset;
     let diffusion = PhysicalShape {
         layer: if device.kind == DeviceKind::Pmos {
             PhysicalLayer::Pdiff
@@ -513,45 +715,160 @@ pub fn device_footprint(
         },
         x,
         y,
-        width: 1.55,
+        width: device_active_width(device, rules),
         height: diffusion_height,
         component_id: Some(device.component_id),
         net: None,
+        purpose: PhysicalShapePurpose::Active,
     };
+    let poly_width =
+        rules.poly.min_width_um.max(device.length_um) + rules.manufacturing_grid_um * 4.0;
     let poly = PhysicalShape {
         layer: PhysicalLayer::Poly,
         x,
         y,
-        width: 0.22_f64.max(device.length_um * 0.22),
-        height: 1.25_f64.max(diffusion_height + rules.gate_extension_um * 2.0),
+        width: poly_width,
+        height: diffusion_height
+            + rules.gate_extension_um * 2.0
+            + rules.manufacturing_grid_um * 4.0,
         component_id: Some(device.component_id),
         net: Some(device.gate_net),
+        purpose: PhysicalShapePurpose::Gate,
+    };
+    let core_edge = y + gate_direction * (diffusion_height / 2.0 + rules.gate_extension_um);
+    let contact_reach =
+        gate_cut_size / 2.0 + rules.contact.enclosure_um + rules.manufacturing_grid_um * 4.0;
+    let access_min = (gate_y - contact_reach).min(core_edge - rules.manufacturing_grid_um);
+    let access_max = (gate_y + contact_reach).max(core_edge + rules.manufacturing_grid_um);
+    let poly_access = PhysicalShape {
+        layer: PhysicalLayer::Poly,
+        x,
+        y: (access_min + access_max) / 2.0,
+        width: poly_width.max(
+            gate_cut_size + rules.contact.enclosure_um * 2.0 + rules.manufacturing_grid_um * 8.0,
+        ),
+        height: (access_max - access_min)
+            .max(rules.poly.min_width_um + rules.manufacturing_grid_um * 4.0),
+        component_id: Some(device.component_id),
+        net: Some(device.gate_net),
+        purpose: PhysicalShapePurpose::GateAccess,
     };
     let drain = PhysicalShape {
         layer: PhysicalLayer::Contact,
-        x: x - 0.58,
+        x: x - terminal_offset,
         y,
         width: rules.contact.size_um,
         height: rules.contact.size_um,
         component_id: Some(device.component_id),
         net: Some(device.drain_net),
+        purpose: PhysicalShapePurpose::Contact,
     };
     let source = PhysicalShape {
         layer: PhysicalLayer::Contact,
-        x: x + 0.58,
+        x: x + terminal_offset,
         net: Some(device.source_net),
         ..drain.clone()
+    };
+    // Source/drain contacts are transistor terminals, so their immediate M1
+    // landing is part of the immutable device footprint. Longer access drops
+    // may fail or be rerouted, but that must never leave a bare contact behind.
+    let diffusion_landing_size = device_diffusion_landing_size(rules);
+    let drain_landing = PhysicalShape {
+        layer: PhysicalLayer::Metal(1),
+        x: drain.x,
+        y: drain.y,
+        width: diffusion_landing_size,
+        height: diffusion_landing_size,
+        component_id: Some(device.component_id),
+        net: Some(device.drain_net),
+        purpose: PhysicalShapePurpose::DeviceLanding,
+    };
+    let source_landing = PhysicalShape {
+        layer: PhysicalLayer::Metal(1),
+        x: source.x,
+        net: Some(device.source_net),
+        ..drain_landing.clone()
+    };
+    let gate = PhysicalShape {
+        layer: PhysicalLayer::Contact,
+        x,
+        y: gate_y,
+        width: gate_cut_size,
+        height: gate_cut_size,
+        component_id: Some(device.component_id),
+        net: Some(device.gate_net),
+        purpose: PhysicalShapePurpose::Contact,
+    };
+    let gate_landing = PhysicalShape {
+        layer: PhysicalLayer::Metal(1),
+        x,
+        y: gate_y,
+        width: gate_landing_size,
+        height: gate_landing_size,
+        component_id: Some(device.component_id),
+        net: Some(device.gate_net),
+        purpose: PhysicalShapePurpose::DeviceLanding,
     };
     let mut footprint = vec![
         (diffusion, ObstructionType::Diffusion),
         (poly, ObstructionType::Poly),
+        (poly_access, ObstructionType::Poly),
         (drain, ObstructionType::Contact),
         (source, ObstructionType::Contact),
+        (drain_landing, ObstructionType::Metal),
+        (source_landing, ObstructionType::Metal),
+        (gate, ObstructionType::Contact),
+        (gate_landing, ObstructionType::Metal),
     ];
     for (shape, _) in &mut footprint {
         snap_shape_to_grid(shape, rules.manufacturing_grid_um);
     }
     footprint
+}
+
+pub fn device_gate_access(device: &PhysicalDevice, y: f64, rules: &PhysicalRuleDeck) -> f64 {
+    device_gate_access_with_side(device, y, rules, false)
+}
+
+pub fn device_gate_access_with_side(
+    device: &PhysicalDevice,
+    y: f64,
+    rules: &PhysicalRuleDeck,
+    outward_gate_access: bool,
+) -> f64 {
+    let diffusion_height = device_diffusion_height(device, rules);
+    let mut direction = if device.kind == DeviceKind::Pmos {
+        1.0
+    } else {
+        -1.0
+    };
+    if outward_gate_access {
+        direction = -direction;
+    }
+    let offset = device_gate_access_offset(diffusion_height, rules);
+    ((y + direction * offset) / rules.manufacturing_grid_um).round() * rules.manufacturing_grid_um
+}
+
+fn device_gate_access_offset(diffusion_height: f64, rules: &PhysicalRuleDeck) -> f64 {
+    let metal1 = rules.layer_overrides.get("metal1").unwrap_or(&rules.metal);
+    let landing = device_gate_landing_size(rules);
+    diffusion_height / 2.0 + landing / 2.0 + metal1.min_spacing_um
+}
+
+fn device_gate_landing_size(rules: &PhysicalRuleDeck) -> f64 {
+    let metal1 = rules.layer_overrides.get("metal1").unwrap_or(&rules.metal);
+    (rules.contact.size_um + rules.manufacturing_grid_um * 2.0 + rules.contact.enclosure_um * 2.0)
+        .max(metal1.min_width_um)
+        .max(metal1.min_area_um2.sqrt())
+        + rules.manufacturing_grid_um * 2.0
+}
+
+pub(crate) fn device_diffusion_landing_size(rules: &PhysicalRuleDeck) -> f64 {
+    let metal1 = rules.layer_overrides.get("metal1").unwrap_or(&rules.metal);
+    (rules.contact.size_um + rules.contact.enclosure_um * 2.0)
+        .max(metal1.min_width_um)
+        .max(metal1.min_area_um2.sqrt())
+        + rules.manufacturing_grid_um * 2.0
 }
 
 fn snap_shape_to_grid(shape: &mut PhysicalShape, grid: f64) {
@@ -582,9 +899,15 @@ pub fn reserve_device_footprint(
 
 #[cfg(test)]
 mod tests {
-    use super::{reserve_device_footprint, ObstructionType, OccupancyOrientation, PhysicalCanvas};
+    use super::{
+        device_active_width, device_diffusion_height, device_footprint_with_gate_access,
+        device_terminal_offset, reserve_device_footprint, ObstructionType, OccupancyOrientation,
+        PhysicalCanvas,
+    };
     use crate::{
-        physical_layout::{DeviceKind, PhysicalDevice, PhysicalLayer, PhysicalShape},
+        physical_layout::{
+            DeviceKind, PhysicalDevice, PhysicalLayer, PhysicalShape, PhysicalShapePurpose,
+        },
         technology::PhysicalRuleDeck,
     };
     use uuid::Uuid;
@@ -598,6 +921,7 @@ mod tests {
             height: 1.0,
             component_id: None,
             net,
+            purpose: PhysicalShapePurpose::Unknown,
         }
     }
 
@@ -630,6 +954,87 @@ mod tests {
     }
 
     #[test]
+    fn same_net_poly_may_touch_but_may_not_leave_a_subspacing_gap() {
+        let mut canvas = PhysicalCanvas::new(&PhysicalRuleDeck::default());
+        let first = PhysicalShape {
+            layer: PhysicalLayer::Poly,
+            x: 0.0,
+            y: 0.0,
+            width: 0.2,
+            height: 1.0,
+            component_id: None,
+            net: Some(1),
+            purpose: PhysicalShapePurpose::GateAccess,
+        };
+        let touching = PhysicalShape {
+            x: 0.5,
+            width: 0.8,
+            height: 0.2,
+            ..first.clone()
+        };
+        let separated = PhysicalShape {
+            x: 0.53,
+            ..touching.clone()
+        };
+
+        canvas
+            .commit(&first, "gate-branch", ObstructionType::Poly)
+            .unwrap();
+        assert!(canvas.can_route(&touching).is_ok());
+        assert!(canvas.can_route(&separated).is_err());
+    }
+
+    #[test]
+    fn continuous_topology_poly_tree_admits_collectively_but_rejects_foreign_net() {
+        let mut canvas = PhysicalCanvas::new(&PhysicalRuleDeck::default());
+        let access = PhysicalShape {
+            layer: PhysicalLayer::Poly,
+            x: 0.0,
+            y: 0.0,
+            width: 0.2,
+            height: 1.0,
+            component_id: Some(Uuid::new_v4()),
+            net: Some(1),
+            purpose: PhysicalShapePurpose::GateAccess,
+        };
+        canvas
+            .commit(&access, "gate-access", ObstructionType::Poly)
+            .unwrap();
+        let tree = vec![
+            PhysicalShape {
+                x: 0.5,
+                y: -0.7,
+                width: 1.2,
+                height: 0.2,
+                component_id: None,
+                ..access.clone()
+            },
+            PhysicalShape {
+                x: 0.0,
+                y: -0.35,
+                width: 0.2,
+                height: 0.9,
+                component_id: None,
+                ..access.clone()
+            },
+        ];
+        canvas
+            .commit_topology_poly_geometry(&tree, "shared-gate")
+            .unwrap();
+
+        let foreign = PhysicalShape {
+            x: 1.2,
+            y: -0.7,
+            net: Some(2),
+            component_id: Some(Uuid::new_v4()),
+            ..access
+        };
+        canvas
+            .commit(&foreign, "foreign-gate", ObstructionType::Poly)
+            .unwrap_err();
+    }
+
+    #[test]
     fn committed_geometry_can_be_queried_and_removed() {
         let mut canvas = PhysicalCanvas::new(&PhysicalRuleDeck::default());
         let device = shape(PhysicalLayer::Ndiff, 0.0, None);
@@ -653,6 +1058,7 @@ mod tests {
             height: 0.2,
             component_id: None,
             net: Some(7),
+            purpose: PhysicalShapePurpose::Unknown,
         };
         canvas
             .commit(&horizontal, "clock-trunk", ObstructionType::Metal)
@@ -686,6 +1092,7 @@ mod tests {
             component_id: Uuid::new_v4(),
             name: "M1".into(),
             physical_group: None,
+            standard_cell_group: None,
             kind: DeviceKind::Nmos,
             gate_net: 1,
             drain_net: 2,
@@ -694,7 +1101,7 @@ mod tests {
             length_um: 1.0,
         };
         reserve_device_footprint(&mut canvas, &device, 0.0, 0.0, &rules).unwrap();
-        assert_eq!(canvas.occupied_count(), 4);
+        assert_eq!(canvas.occupied_count(), 9);
 
         let mut colliding = device.clone();
         colliding.component_id = Uuid::new_v4();
@@ -702,9 +1109,112 @@ mod tests {
         assert!(reserve_device_footprint(&mut canvas, &colliding, 0.0, 0.0, &rules).is_err());
         assert_eq!(
             canvas.occupied_count(),
-            4,
+            9,
             "failed footprint must not partially commit"
         );
+    }
+
+    #[test]
+    fn flexible_gate_access_preserves_the_gate_core_and_moves_the_access_extension() {
+        let rules = PhysicalRuleDeck::default();
+        let device = PhysicalDevice {
+            component_id: Uuid::new_v4(),
+            name: "M1".into(),
+            physical_group: Some("BLOCK".into()),
+            standard_cell_group: Some("BLOCK·NAND2".into()),
+            kind: DeviceKind::Nmos,
+            gate_net: 1,
+            drain_net: 2,
+            source_net: 3,
+            width_um: 1.0,
+            length_um: 1.0,
+        };
+        let inward = device_footprint_with_gate_access(&device, 0.0, 0.0, &rules, false);
+        let outward = device_footprint_with_gate_access(&device, 0.0, 0.0, &rules, true);
+        let layer = |footprint: &[(PhysicalShape, ObstructionType)], wanted| {
+            footprint
+                .iter()
+                .find(|(shape, _)| shape.layer == wanted)
+                .map(|(shape, _)| shape.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            layer(&inward, PhysicalLayer::Ndiff),
+            layer(&outward, PhysicalLayer::Ndiff)
+        );
+        let poly_shapes = |footprint: &[(PhysicalShape, ObstructionType)]| {
+            footprint
+                .iter()
+                .filter(|(shape, _)| shape.layer == PhysicalLayer::Poly)
+                .map(|(shape, _)| shape.clone())
+                .collect::<Vec<_>>()
+        };
+        let inward_poly = poly_shapes(&inward);
+        let outward_poly = poly_shapes(&outward);
+        assert_eq!(inward_poly.len(), 2);
+        assert_eq!(inward_poly[0], outward_poly[0]);
+        assert!(inward_poly[1].y < outward_poly[1].y);
+        let gate_contact = inward
+            .iter()
+            .filter(|(shape, _)| shape.layer == PhysicalLayer::Contact)
+            .nth(2)
+            .map(|(shape, _)| shape)
+            .unwrap();
+        let access = &inward_poly[1];
+        let enclosure = rules.contact.enclosure_um;
+        assert!(
+            access.x - access.width / 2.0 <= gate_contact.x - gate_contact.width / 2.0 - enclosure
+                && access.x + access.width / 2.0
+                    >= gate_contact.x + gate_contact.width / 2.0 + enclosure
+                && access.y - access.height / 2.0
+                    <= gate_contact.y - gate_contact.height / 2.0 - enclosure
+                && access.y + access.height / 2.0
+                    >= gate_contact.y + gate_contact.height / 2.0 + enclosure,
+            "poly access {access:?} does not enclose gate contact {gate_contact:?}"
+        );
+        let gate_metal = |footprint: &[(PhysicalShape, ObstructionType)]| {
+            footprint
+                .iter()
+                .find(|(shape, _)| {
+                    shape.layer == PhysicalLayer::Metal(1) && shape.net == Some(device.gate_net)
+                })
+                .map(|(shape, _)| shape.y)
+                .unwrap()
+        };
+        assert!(gate_metal(&inward) < gate_metal(&outward));
+    }
+
+    #[test]
+    fn device_active_geometry_tracks_process_rules_and_electrical_width() {
+        let mut rules = PhysicalRuleDeck::default();
+        rules.manufacturing_grid_um = 0.005;
+        rules.diffusion.min_width_um = 0.22;
+        rules.diffusion.min_spacing_um = 0.28;
+        rules.diffusion.min_area_um2 = 0.2025;
+        rules.poly.min_width_um = 0.18;
+        rules.contact.size_um = 0.22;
+        rules.contact.enclosure_um = 0.07;
+        let mut device = PhysicalDevice {
+            component_id: Uuid::new_v4(),
+            name: "M1".into(),
+            physical_group: None,
+            standard_cell_group: None,
+            kind: DeviceKind::Nmos,
+            gate_net: 1,
+            drain_net: 2,
+            source_net: 3,
+            width_um: 1.0,
+            length_um: 0.28,
+        };
+        let offset = device_terminal_offset(&device, &rules);
+        let active_width = device_active_width(&device, &rules);
+        assert!(offset > device.length_um / 2.0 + rules.contact.size_um / 2.0);
+        assert!(active_width >= 2.0 * (offset + rules.contact.size_um / 2.0));
+        assert!((device_diffusion_height(&device, &rules) - 1.0).abs() < 1e-9);
+
+        device.width_um = 2.4;
+        assert!((device_diffusion_height(&device, &rules) - 2.4).abs() < 1e-9);
+        assert_eq!(device_active_width(&device, &rules), active_width);
     }
 
     #[test]

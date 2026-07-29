@@ -9,6 +9,12 @@ pub const DEFAULT_MAX_METAL_LAYERS: u16 = 5;
 pub struct Technology {
     pub format_version: u32,
     pub name: String,
+    #[serde(default = "default_process_id")]
+    pub process_id: String,
+    #[serde(default = "default_deck_revision")]
+    pub deck_revision: String,
+    #[serde(default = "default_deck_source")]
+    pub source: String,
     pub supply_voltage: f64,
     #[serde(default = "default_max_metal_layers")]
     pub max_metal_layers: u16,
@@ -22,6 +28,34 @@ pub struct Technology {
     pub physical_rules: PhysicalRuleDeck,
     #[serde(default)]
     pub physical_planning: PhysicalPlanningRules,
+    #[serde(default)]
+    pub gds_layers: GdsLayerMap,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct GdsLayerMap {
+    pub format_version: u32,
+    pub label_datatype: u16,
+    pub layers: BTreeMap<String, Vec<GdsLayerPurpose>>,
+    /// Process-purpose mappings used only for non-electrical density fill.
+    /// Keeping these separate prevents dummy COMP/poly/metal from being
+    /// interpreted as devices or routed conductors on import.
+    #[serde(default)]
+    pub dummy_layers: BTreeMap<String, Vec<GdsLayerPurpose>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct GdsLayerPurpose {
+    pub purpose: String,
+    pub layer: u16,
+    pub datatype: u16,
+    /// Symmetric process-purpose expansion applied only while streaming GDS.
+    /// This lets one Physical IR shape emit distinct drawn COMP and implant
+    /// envelopes without conflating their manufacturing geometry.
+    #[serde(default)]
+    pub enclosure_um: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -100,9 +134,41 @@ pub struct PhysicalRuleDeck {
     pub gate_extension_um: f64,
     pub well_enclosure_um: f64,
     #[serde(default)]
+    pub max_tap_distance_um: Option<f64>,
+    #[serde(default)]
     pub layer_overrides: BTreeMap<String, LayerRule>,
     #[serde(default)]
     pub via_overrides: BTreeMap<String, CutRule>,
+    #[serde(default)]
+    pub density_fill: DensityFillRuleDeck,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct DensityFillRuleDeck {
+    pub format_version: u32,
+    #[serde(default)]
+    pub layers: BTreeMap<String, DensityFillLayerRule>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct DensityFillLayerRule {
+    pub target_density: f64,
+    #[serde(default)]
+    pub maximum_density: Option<f64>,
+    pub tile_width_um: f64,
+    pub tile_height_um: f64,
+    /// Optional smaller square used only after the primary lattice cannot
+    /// reach target density around existing circuit geometry.
+    #[serde(default)]
+    pub fallback_tile_sizes_um: Vec<f64>,
+    pub fill_spacing_um: f64,
+    pub circuit_spacing_um: f64,
+    /// A dummy layer may require another dummy material under it. GF180 dummy
+    /// poly, for example, must be generated over dummy COMP.
+    #[serde(default)]
+    pub support_layer: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -169,6 +235,9 @@ impl Default for Technology {
         Self {
             format_version: CURRENT_TECHNOLOGY_FORMAT_VERSION,
             name: "OpenChippy EDU CMOS".into(),
+            process_id: "openchippy-edu-cmos".into(),
+            deck_revision: "builtin-v1".into(),
+            source: "OpenChippy built-in educational technology".into(),
             supply_voltage: 1.8,
             max_metal_layers: DEFAULT_MAX_METAL_LAYERS,
             nmos: MosTechnology {
@@ -191,6 +260,66 @@ impl Default for Technology {
             tapeout_window: TapeoutWindow::default(),
             physical_rules: PhysicalRuleDeck::default(),
             physical_planning: PhysicalPlanningRules::educational(DEFAULT_MAX_METAL_LAYERS),
+            gds_layers: GdsLayerMap::educational(DEFAULT_MAX_METAL_LAYERS),
+        }
+    }
+}
+
+impl Default for GdsLayerMap {
+    fn default() -> Self {
+        Self::educational(DEFAULT_MAX_METAL_LAYERS)
+    }
+}
+
+impl GdsLayerMap {
+    pub fn educational(max_metal_layers: u16) -> Self {
+        let mut layers = BTreeMap::new();
+        for (name, layer, datatype) in [
+            ("substrate", 1, 0),
+            ("pwell", 20, 0),
+            ("nwell", 21, 0),
+            ("ndiff", 22, 0),
+            ("pdiff", 22, 1),
+            ("poly", 30, 0),
+            ("contact", 33, 0),
+        ] {
+            layers.insert(
+                name.into(),
+                vec![GdsLayerPurpose {
+                    purpose: name.into(),
+                    layer,
+                    datatype,
+                    enclosure_um: 0.0,
+                }],
+            );
+        }
+        for index in 1..=max_metal_layers {
+            layers.insert(
+                format!("metal{index}"),
+                vec![GdsLayerPurpose {
+                    purpose: format!("metal{index}"),
+                    layer: 34 + (index - 1) * 2,
+                    datatype: 0,
+                    enclosure_um: 0.0,
+                }],
+            );
+            if index < max_metal_layers {
+                layers.insert(
+                    format!("via{index}{}", index + 1),
+                    vec![GdsLayerPurpose {
+                        purpose: format!("via{index}{}", index + 1),
+                        layer: 35 + (index - 1) * 2,
+                        datatype: 0,
+                        enclosure_um: 0.0,
+                    }],
+                );
+            }
+        }
+        Self {
+            format_version: 1,
+            label_datatype: 10,
+            layers,
+            dummy_layers: BTreeMap::new(),
         }
     }
 }
@@ -233,8 +362,10 @@ impl Default for PhysicalRuleDeck {
             },
             gate_extension_um: 0.2,
             well_enclosure_um: 0.3,
+            max_tap_distance_um: None,
             layer_overrides: BTreeMap::new(),
             via_overrides: BTreeMap::new(),
+            density_fill: DensityFillRuleDeck::default(),
         }
     }
 }
@@ -299,6 +430,77 @@ impl PhysicalPlanningRules {
 }
 
 impl Technology {
+    /// Fill mappings that became mandatory after older project snapshots were
+    /// written. Only known process identities are migrated; custom decks must
+    /// remain explicit about manufacturing layers.
+    pub fn migrate_legacy_gds_layers(&mut self) -> bool {
+        if self.process_id != "gf180mcu-3v3-5m-compat" {
+            return false;
+        }
+
+        let mut changed = false;
+        if !self.gds_layers.layers.contains_key("pwell") {
+            self.gds_layers.layers.insert(
+                "pwell".into(),
+                vec![GdsLayerPurpose {
+                    purpose: "lvpwell".into(),
+                    layer: 204,
+                    datatype: 0,
+                    enclosure_um: 0.0,
+                }],
+            );
+            changed = true;
+        }
+        for (logical_layer, process_purpose) in [("ndiff", "nplus"), ("pdiff", "pplus")] {
+            if let Some(purposes) = self.gds_layers.layers.get_mut(logical_layer) {
+                for purpose in purposes
+                    .iter_mut()
+                    .filter(|purpose| purpose.purpose == process_purpose)
+                {
+                    if purpose.enclosure_um != 0.35 {
+                        purpose.enclosure_um = 0.35;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if self.physical_rules.contact.size_um != 0.22 {
+            self.physical_rules.contact.size_um = 0.22;
+            changed = true;
+        }
+        if self.physical_rules.max_tap_distance_um != Some(20.0) {
+            self.physical_rules.max_tap_distance_um = Some(20.0);
+            changed = true;
+        }
+        let default_metal = self.physical_rules.metal.clone();
+        let metal5 = self
+            .physical_rules
+            .layer_overrides
+            .entry("metal5".into())
+            .or_insert(default_metal);
+        if metal5.min_width_um != 0.44
+            || metal5.min_spacing_um != 0.46
+            || metal5.min_area_um2 != 0.5625
+        {
+            metal5.min_width_um = 0.44;
+            metal5.min_spacing_um = 0.46;
+            metal5.min_area_um2 = 0.5625;
+            changed = true;
+        }
+        changed
+    }
+
+    pub fn fingerprint(&self) -> Result<String, String> {
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| format!("technology could not be fingerprinted: {error}"))?;
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        Ok(format!("fnv1a64:{hash:016x}"))
+    }
+
     pub fn validate(&self) -> Result<(), Vec<TechnologyDiagnostic>> {
         let mut diagnostics = Vec::new();
         if self.format_version != CURRENT_TECHNOLOGY_FORMAT_VERSION {
@@ -317,6 +519,19 @@ impl Technology {
                 field: "name".into(),
                 message: "Technology name cannot be blank.".into(),
             });
+        }
+        for (field, value) in [
+            ("process_id", self.process_id.as_str()),
+            ("deck_revision", self.deck_revision.as_str()),
+            ("source", self.source.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                diagnostics.push(TechnologyDiagnostic {
+                    code: "missing_process_metadata",
+                    field: field.into(),
+                    message: format!("{field} cannot be blank."),
+                });
+            }
         }
         if !self.supply_voltage.is_finite() || self.supply_voltage <= 0.0 {
             diagnostics.push(TechnologyDiagnostic {
@@ -356,6 +571,7 @@ impl Technology {
             self.physical_rules.manufacturing_grid_um,
             &mut diagnostics,
         );
+        validate_gds_layers(&self.gds_layers, self.max_metal_layers, &mut diagnostics);
         validate_mos(
             "pmos",
             &self.pmos,
@@ -376,6 +592,9 @@ impl Technology {
         let technology = Technology {
             format_version: file.technology.format_version,
             name: file.technology.name,
+            process_id: file.technology.process_id,
+            deck_revision: file.technology.deck_revision,
+            source: file.technology.source,
             supply_voltage: file.technology.supply_voltage,
             max_metal_layers: file.technology.max_metal_layers,
             nmos: file.nmos,
@@ -384,6 +603,9 @@ impl Technology {
             tapeout_window: file.tapeout_window,
             physical_rules: file.physical_rules,
             physical_planning: file.physical_planning,
+            gds_layers: file
+                .gds_layers
+                .unwrap_or_else(|| GdsLayerMap::educational(file.technology.max_metal_layers)),
         };
         technology.validate().map_err(|diagnostics| {
             diagnostics
@@ -407,6 +629,9 @@ impl Technology {
             technology: TechnologyHeader {
                 format_version: self.format_version,
                 name: self.name.clone(),
+                process_id: self.process_id.clone(),
+                deck_revision: self.deck_revision.clone(),
+                source: self.source.clone(),
                 supply_voltage: self.supply_voltage,
                 max_metal_layers: self.max_metal_layers,
             },
@@ -416,6 +641,7 @@ impl Technology {
             tapeout_window: self.tapeout_window.clone(),
             physical_rules: self.physical_rules.clone(),
             physical_planning: self.physical_planning.clone(),
+            gds_layers: Some(self.gds_layers.clone()),
         })
         .map_err(|error| format!("technology could not be serialized: {error}"))
     }
@@ -435,6 +661,8 @@ struct TechnologyFile {
     physical_rules: PhysicalRuleDeck,
     #[serde(default)]
     physical_planning: PhysicalPlanningRules,
+    #[serde(default)]
+    gds_layers: Option<GdsLayerMap>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -442,8 +670,26 @@ struct TechnologyFile {
 struct TechnologyHeader {
     format_version: u32,
     name: String,
+    #[serde(default = "default_process_id")]
+    process_id: String,
+    #[serde(default = "default_deck_revision")]
+    deck_revision: String,
+    #[serde(default = "default_deck_source")]
+    source: String,
     supply_voltage: f64,
     max_metal_layers: u16,
+}
+
+fn default_process_id() -> String {
+    "legacy-unidentified".into()
+}
+
+fn default_deck_revision() -> String {
+    "legacy".into()
+}
+
+fn default_deck_source() -> String {
+    "embedded project snapshot".into()
 }
 
 const fn default_max_metal_layers() -> u16 {
@@ -579,6 +825,15 @@ fn validate_physical_rules(
             diagnostics,
         );
     }
+    if let Some(distance) = rules.max_tap_distance_um {
+        validate_positive("physical_rules.max_tap_distance_um", distance, diagnostics);
+        validate_on_grid(
+            "physical_rules.max_tap_distance_um",
+            distance,
+            rules.manufacturing_grid_um,
+            diagnostics,
+        );
+    }
     for (name, rule) in [("contact", &rules.contact), ("via", &rules.via)] {
         validate_cut_rule(
             &format!("physical_rules.{name}"),
@@ -639,6 +894,137 @@ fn validate_physical_rules(
             rules.manufacturing_grid_um,
             diagnostics,
         );
+    }
+    validate_density_fill(
+        &rules.density_fill,
+        max_metal_layers,
+        rules.manufacturing_grid_um,
+        diagnostics,
+    );
+}
+
+fn validate_density_fill(
+    fill: &DensityFillRuleDeck,
+    max_metal_layers: u16,
+    grid: f64,
+    diagnostics: &mut Vec<TechnologyDiagnostic>,
+) {
+    if fill.layers.is_empty() {
+        return;
+    }
+    if fill.format_version != 1 {
+        diagnostics.push(TechnologyDiagnostic {
+            code: "unsupported_density_fill_version",
+            field: "physical_rules.density_fill.format_version".into(),
+            message: format!(
+                "Density-fill format {} is unsupported; expected 1.",
+                fill.format_version
+            ),
+        });
+    }
+    let valid_name = |name: &str| {
+        matches!(name, "active" | "poly" | "top_metal")
+            || name
+                .strip_prefix("metal")
+                .and_then(|index| index.parse::<u16>().ok())
+                .is_some_and(|index| (1..=max_metal_layers).contains(&index))
+    };
+    for (name, rule) in &fill.layers {
+        let prefix = format!("physical_rules.density_fill.layers.{name}");
+        if !valid_name(name) {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "invalid_density_fill_layer",
+                field: prefix.clone(),
+                message: "Density fill must name active, poly, metal1..metalN, or top_metal."
+                    .into(),
+            });
+        }
+        if !rule.target_density.is_finite()
+            || rule.target_density <= 0.0
+            || rule.target_density >= 1.0
+        {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "invalid_density_target",
+                field: format!("{prefix}.target_density"),
+                message: "Density target must be finite and strictly between zero and one.".into(),
+            });
+        }
+        if let Some(maximum) = rule.maximum_density {
+            if !maximum.is_finite() || maximum <= rule.target_density || maximum > 1.0 {
+                diagnostics.push(TechnologyDiagnostic {
+                    code: "invalid_density_maximum",
+                    field: format!("{prefix}.maximum_density"),
+                    message: "Maximum density must exceed the target and be at most one.".into(),
+                });
+            }
+        }
+        for (field, value) in [
+            ("tile_width_um", rule.tile_width_um),
+            ("tile_height_um", rule.tile_height_um),
+            ("fill_spacing_um", rule.fill_spacing_um),
+            ("circuit_spacing_um", rule.circuit_spacing_um),
+        ] {
+            validate_positive(&format!("{prefix}.{field}"), value, diagnostics);
+            validate_on_grid(&format!("{prefix}.{field}"), value, grid, diagnostics);
+        }
+        validate_centered_extent_on_grid(
+            &format!("{prefix}.tile_width_um"),
+            rule.tile_width_um,
+            grid,
+            diagnostics,
+        );
+        validate_centered_extent_on_grid(
+            &format!("{prefix}.tile_height_um"),
+            rule.tile_height_um,
+            grid,
+            diagnostics,
+        );
+        let mut previous = rule.tile_width_um.min(rule.tile_height_um);
+        for (index, value) in rule.fallback_tile_sizes_um.iter().copied().enumerate() {
+            validate_positive(
+                &format!("{prefix}.fallback_tile_sizes_um.{index}"),
+                value,
+                diagnostics,
+            );
+            validate_on_grid(
+                &format!("{prefix}.fallback_tile_sizes_um.{index}"),
+                value,
+                grid,
+                diagnostics,
+            );
+            validate_centered_extent_on_grid(
+                &format!("{prefix}.fallback_tile_sizes_um.{index}"),
+                value,
+                grid,
+                diagnostics,
+            );
+            if value >= previous {
+                diagnostics.push(TechnologyDiagnostic {
+                    code: "invalid_density_fallback_tile",
+                    field: format!("{prefix}.fallback_tile_sizes_um.{index}"),
+                    message:
+                        "Fallback fill tiles must be strictly decreasing from the primary tile."
+                            .into(),
+                });
+            }
+            previous = value;
+        }
+        if let Some(support) = &rule.support_layer {
+            if support == name || !valid_name(support) {
+                diagnostics.push(TechnologyDiagnostic {
+                    code: "invalid_density_fill_support",
+                    field: format!("{prefix}.support_layer"),
+                    message: "Density-fill support must name a different configured fill layer."
+                        .into(),
+                });
+            } else if !fill.layers.contains_key(support) {
+                diagnostics.push(TechnologyDiagnostic {
+                    code: "missing_density_fill_support",
+                    field: format!("{prefix}.support_layer"),
+                    message: format!("Density-fill support layer {support} is not configured."),
+                });
+            }
+        }
     }
 }
 
@@ -704,6 +1090,147 @@ fn validate_physical_parasitics(
             *value,
             diagnostics,
         );
+    }
+}
+
+fn validate_gds_layers(
+    mapping: &GdsLayerMap,
+    max_metal_layers: u16,
+    diagnostics: &mut Vec<TechnologyDiagnostic>,
+) {
+    if mapping.format_version != 1 {
+        diagnostics.push(TechnologyDiagnostic {
+            code: "unsupported_gds_layer_map_version",
+            field: "gds_layers.format_version".into(),
+            message: format!(
+                "GDS layer-map format {} is unsupported; expected 1.",
+                mapping.format_version
+            ),
+        });
+    }
+    let mut required = vec![
+        "substrate".to_string(),
+        "pwell".into(),
+        "nwell".into(),
+        "ndiff".into(),
+        "pdiff".into(),
+        "poly".into(),
+        "contact".into(),
+    ];
+    required.extend((1..=max_metal_layers).map(|index| format!("metal{index}")));
+    required.extend((1..max_metal_layers).map(|index| format!("via{index}{}", index + 1)));
+    for name in required {
+        let Some(purposes) = mapping.layers.get(&name) else {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "missing_gds_layer_mapping",
+                field: format!("gds_layers.layers.{name}"),
+                message: "Every generated Physical IR layer requires an explicit GDS mapping."
+                    .into(),
+            });
+            continue;
+        };
+        if name != "substrate" && purposes.is_empty() {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "empty_gds_layer_mapping",
+                field: format!("gds_layers.layers.{name}"),
+                message: "Manufacturing layers must emit at least one GDS layer purpose.".into(),
+            });
+        }
+    }
+    for (name, purposes) in &mapping.layers {
+        let valid_name = matches!(
+            name.as_str(),
+            "substrate" | "pwell" | "nwell" | "ndiff" | "pdiff" | "poly" | "contact"
+        ) || name
+            .strip_prefix("metal")
+            .and_then(|index| index.parse::<u16>().ok())
+            .is_some_and(|index| (1..=max_metal_layers).contains(&index))
+            || (1..max_metal_layers)
+                .map(|lower| format!("via{lower}{}", lower + 1))
+                .any(|candidate| candidate == *name);
+        if !valid_name {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "unknown_gds_source_layer",
+                field: format!("gds_layers.layers.{name}"),
+                message: "GDS mapping names must correspond to generated Physical IR layers."
+                    .into(),
+            });
+        }
+        let mut pairs = std::collections::BTreeSet::new();
+        for (index, purpose) in purposes.iter().enumerate() {
+            let field = format!("gds_layers.layers.{name}.{index}");
+            if purpose.purpose.trim().is_empty() {
+                diagnostics.push(TechnologyDiagnostic {
+                    code: "missing_gds_layer_purpose",
+                    field: format!("{field}.purpose"),
+                    message: "GDS layer purpose cannot be blank.".into(),
+                });
+            }
+            if purpose.layer > i16::MAX as u16 || purpose.datatype > i16::MAX as u16 {
+                diagnostics.push(TechnologyDiagnostic {
+                    code: "gds_layer_value_out_of_range",
+                    field: field.clone(),
+                    message: "GDS layer and datatype must fit the signed 16-bit stream field."
+                        .into(),
+                });
+            }
+            if !purpose.enclosure_um.is_finite() || purpose.enclosure_um < 0.0 {
+                diagnostics.push(TechnologyDiagnostic {
+                    code: "invalid_gds_layer_enclosure",
+                    field: format!("{field}.enclosure_um"),
+                    message: "GDS purpose enclosure must be a finite non-negative value.".into(),
+                });
+            }
+            if !pairs.insert((purpose.layer, purpose.datatype)) {
+                diagnostics.push(TechnologyDiagnostic {
+                    code: "duplicate_gds_layer_purpose",
+                    field,
+                    message: "A Physical IR layer cannot emit the same GDS layer/datatype twice."
+                        .into(),
+                });
+            }
+        }
+    }
+    for (name, purposes) in &mapping.dummy_layers {
+        let configured = name == "top_metal"
+            || matches!(name.as_str(), "active" | "poly")
+            || name
+                .strip_prefix("metal")
+                .and_then(|index| index.parse::<u16>().ok())
+                .is_some_and(|index| (1..=max_metal_layers).contains(&index));
+        if !configured {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "unknown_gds_dummy_layer",
+                field: format!("gds_layers.dummy_layers.{name}"),
+                message: "Dummy mapping must name active, poly, metal1..metalN, or top_metal."
+                    .into(),
+            });
+        }
+        if purposes.len() != 1 {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "invalid_gds_dummy_mapping",
+                field: format!("gds_layers.dummy_layers.{name}"),
+                message: "Each dummy material must emit exactly one GDS layer purpose.".into(),
+            });
+        }
+        for (index, purpose) in purposes.iter().enumerate() {
+            let field = format!("gds_layers.dummy_layers.{name}.{index}");
+            if purpose.purpose.trim().is_empty() {
+                diagnostics.push(TechnologyDiagnostic {
+                    code: "missing_gds_layer_purpose",
+                    field: format!("{field}.purpose"),
+                    message: "GDS layer purpose cannot be blank.".into(),
+                });
+            }
+            if purpose.layer > i16::MAX as u16 || purpose.datatype > i16::MAX as u16 {
+                diagnostics.push(TechnologyDiagnostic {
+                    code: "gds_layer_value_out_of_range",
+                    field,
+                    message: "GDS layer and datatype must fit the signed 16-bit stream field."
+                        .into(),
+                });
+            }
+        }
     }
 }
 
@@ -920,10 +1447,31 @@ fn validate_on_grid(
     }
 }
 
+fn validate_centered_extent_on_grid(
+    field: &str,
+    value: f64,
+    grid: f64,
+    diagnostics: &mut Vec<TechnologyDiagnostic>,
+) {
+    if value.is_finite() && value > 0.0 && grid.is_finite() && grid > 0.0 {
+        let half_extent_grid_units = value / (2.0 * grid);
+        if (half_extent_grid_units - half_extent_grid_units.round()).abs() > 1e-6 {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "density_tile_edges_off_grid",
+                field: field.into(),
+                message: format!(
+                    "Centered density-fill tile edges must align to the {grid} µm manufacturing grid."
+                ),
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CutRule, LayerRule, Technology, CURRENT_TECHNOLOGY_FORMAT_VERSION, DEFAULT_MAX_METAL_LAYERS,
+        CutRule, GdsLayerPurpose, LayerRule, Technology, CURRENT_TECHNOLOGY_FORMAT_VERSION,
+        DEFAULT_MAX_METAL_LAYERS,
     };
 
     #[test]
@@ -940,6 +1488,126 @@ mod tests {
         let serialized = serde_json::to_string(&technology).unwrap();
         let reloaded: Technology = serde_json::from_str(&serialized).unwrap();
         assert_eq!(reloaded, technology);
+        assert_eq!(
+            reloaded.fingerprint().unwrap(),
+            technology.fingerprint().unwrap()
+        );
+        let mut changed = technology.clone();
+        changed.physical_rules.metal.min_spacing_um += changed.physical_rules.manufacturing_grid_um;
+        assert_ne!(
+            changed.fingerprint().unwrap(),
+            technology.fingerprint().unwrap()
+        );
+    }
+
+    #[test]
+    fn gf180_process_examples_are_linked_by_identity_and_fingerprint() {
+        let technology = Technology::from_yaml(include_str!(
+            "../../docs/examples/process_gf180mcu_3v3_5m_dr.yaml"
+        ))
+        .expect("GF180 compatibility rule deck should load");
+        let validation: serde_yaml::Value = serde_yaml::from_str(include_str!(
+            "../../docs/examples/process_gf180mcu_3v3_5m_validation.yaml"
+        ))
+        .expect("GF180 validation record should be valid YAML");
+        let process = &validation["process_validation"]["process"];
+        let record = &validation["process_validation"]["record"];
+
+        assert_eq!(
+            process["process_id"].as_str(),
+            Some(technology.process_id.as_str())
+        );
+        assert_eq!(
+            process["deck_revision"].as_str(),
+            Some(technology.deck_revision.as_str())
+        );
+        assert_eq!(
+            process["deck_fingerprint"].as_str(),
+            Some(technology.fingerprint().unwrap().as_str())
+        );
+        assert_eq!(process["foundry_signoff_deck"].as_bool(), Some(false));
+        assert_eq!(record["overall_status"].as_str(), Some("IMPLEMENTED"));
+        assert_eq!(
+            validation["process_validation"]["signature"]["status"].as_str(),
+            Some("UNSIGNED")
+        );
+        assert_eq!(technology.gds_layers.layers["metal5"][0].layer, 81);
+        assert_eq!(technology.gds_layers.layers["ndiff"].len(), 2);
+        assert_eq!(technology.gds_layers.layers["pdiff"].len(), 2);
+        assert!(technology.gds_layers.layers["substrate"].is_empty());
+    }
+
+    #[test]
+    fn density_fill_rejects_centered_tiles_with_off_grid_edges() {
+        let mut technology = Technology::from_yaml(include_str!(
+            "../../docs/examples/process_gf180mcu_3v3_5m_dr.yaml"
+        ))
+        .expect("GF180 compatibility rule deck should load");
+        technology
+            .physical_rules
+            .density_fill
+            .layers
+            .get_mut("metal1")
+            .expect("GF180 should configure Metal1 fill")
+            .fallback_tile_sizes_um = vec![1.0, 0.5, 0.25, 0.125];
+
+        let diagnostics = technology
+            .validate()
+            .expect_err("a centered 0.125 µm tile cannot land both edges on a 0.005 µm grid");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "density_tile_edges_off_grid"
+                && diagnostic
+                    .field
+                    .ends_with("metal1.fallback_tile_sizes_um.3")
+        }));
+    }
+
+    #[test]
+    fn gds_layer_map_requires_every_generated_process_layer() {
+        let mut technology = Technology::default();
+        technology.gds_layers.layers.remove("via45");
+        let diagnostics = technology.validate().unwrap_err();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "missing_gds_layer_mapping"
+                && diagnostic.field == "gds_layers.layers.via45"
+        }));
+    }
+
+    #[test]
+    fn legacy_gf180_snapshots_receive_the_canonical_manufacturing_contract() {
+        let mut technology = Technology::from_yaml(include_str!(
+            "../../docs/examples/process_gf180mcu_3v3_5m_dr.yaml"
+        ))
+        .unwrap();
+        technology.gds_layers.layers.remove("pwell");
+        technology.gds_layers.layers.get_mut("ndiff").unwrap()[1].enclosure_um = 0.0;
+        technology.gds_layers.layers.get_mut("pdiff").unwrap()[1].enclosure_um = 0.0;
+        technology.physical_rules.contact.size_um = 0.23;
+        technology.physical_rules.layer_overrides.remove("metal5");
+
+        assert!(technology.migrate_legacy_gds_layers());
+        assert_eq!(
+            technology.gds_layers.layers["pwell"],
+            vec![GdsLayerPurpose {
+                purpose: "lvpwell".into(),
+                layer: 204,
+                datatype: 0,
+                enclosure_um: 0.0,
+            }]
+        );
+        assert_eq!(technology.gds_layers.layers["ndiff"][1].enclosure_um, 0.35);
+        assert_eq!(technology.gds_layers.layers["pdiff"][1].enclosure_um, 0.35);
+        assert_eq!(technology.physical_rules.contact.size_um, 0.22);
+        assert_eq!(
+            technology.physical_rules.layer_overrides["metal5"],
+            LayerRule {
+                min_width_um: 0.44,
+                min_spacing_um: 0.46,
+                min_area_um2: 0.5625,
+            }
+        );
+        assert!(technology.validate().is_ok());
+        assert!(!technology.migrate_legacy_gds_layers());
     }
 
     #[test]

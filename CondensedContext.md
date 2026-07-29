@@ -4,17 +4,26 @@
 
 - Context ID: FRESH-001
 - Last Verified Commit: `b5f99fd`
-- Current HEAD: `b5f99fd`
-- Generated: 2026-07-21
-- Status: partial; Milestone 4 is committed, Milestone 5 is complete, and the bounded Milestone 6 RTL subset is complete in uncommitted work.
-- Verify: `src-tauri/src/model.rs`, `src-tauri/src/history.rs`, `src-tauri/src/lib.rs`, `src-tauri/src/technology.rs`, `src-tauri/src/physical_layout.rs`, `src-tauri/src/physical_placement.rs`, `src-tauri/src/physical_detailed_routing.rs`, `src-tauri/src/physical_drc.rs`, `src/types.ts`, `src/backend.ts`, `src/App.tsx`, `src/PhysicalViewport.tsx`, `docs/examples/openchippy-edu-5m.yaml`, `README.md`, `docs/roadmap.md`, `CondensedContext.md`, `CondensedContext.CCF1`
+- Current HEAD: `b9e9ce9`
+- Generated: 2026-07-27
+- Status: partial; current HEAD is newer than the last verified commit and manufacturing MPV-1/MPV-2 work remains uncommitted.
+- Verify: `src-tauri/src/gdsii.rs`, `src-tauri/src/lib.rs`, `src/backend.ts`, `src/types.ts`, `src/App.tsx`, `src/PhysicalViewport.tsx`, `docs/examples/process_gf180mcu_3v3_5m_validation.yaml`, `docs/manufacturing_roadplan.md`, `README.md`, `CondensedContext.md`, `CondensedContext.CCF1`, plus the previously listed uncommitted work.
 - Full Semantic Memory: `CondensedContext.CCF1`
 
 ## Current Focus
 
 - Context ID: ACTIVE-001
 - Confidence: High; verified against Milestone 4 commit `b5f99fd` plus the listed Milestone 5 changes.
-- Milestone 4 is committed, Milestone 5 is complete, and the bounded Milestone 6 subset is ready to commit: structural import/export and simulation, centered logical/physical workspaces, plus `.ochippy` manifests that bind `.chippy` circuit data to digest-validated `.chippy_gds` physical-IR caches. Milestone 7 now owns synthesis together with linked modules, remaining elaboration features, reset/enable expansion, and the bounded `initial` policy.
+- Manufacturing MPV-5 / Physical IR v19 derives legal shared diffusion from matching facing source/drain nets, may mirror electrically symmetric MOS placement, inserts process-bounded well/substrate tap arrays, and expands the active floorplan only within the tapeout window. GF180 implant enclosure is 0.35 µm and maximum tap distance is 20 µm. The exact 4B reference remains native DRC 0, 144/144 MOS, 82/82 closed nets, zero shorts, and LVS matched. Official variant-C DRC improved 375→119 before the latest metal cleanup: all 144 tap and 146 implant findings are gone. Final repair scores all legal fallback paths by length with an 8× device-envelope excursion penalty and coalesces routed-metal gaps while excluding M1 pin landings. v19 supersedes the first v18 cache by snapping the final outline to complete well pitches and rebuilding substrate plus alternating N/P wells across the whole routed outline.
+- `.ochippy` physical artifacts are optional caches: missing, malformed, digest-mismatched, and older-IR `.chippy_gds` files are ignored while the referenced `.chippy` circuit opens and later regenerates physical IR. Manifest path-safety and circuit-file validation remain strict.
+- Physical IR v20 replaces whole-component leaf pruning with a length-weighted shortest terminal route tree, preserves process-valid via enclosures, trims non-M1 overhangs to real attachments, removes the rejected same-net bridge experiment, and permits wider local same-net diffusion sharing between consecutive compatible row devices. Exact GF180 4B improves 5,501→4,068 shapes and 566→1,804 removed routing shapes while native DRC/LVS/connectivity remain clean. Official variant-C DRC measures 43 versus the submitted v19 stream's 231: M1 spacing 9, M2 spacing 9, top-metal spacing 16, plus nine density/DBU findings.
+- Physical IR v22 gives generated geometry explicit backward-compatible purpose provenance and serializes deterministic row/device/terminal topology. Compatible row runs replace per-FET active rectangles with owned maximal islands; native DRC/LVS understand that ownership. A gate-topology candidate plus checked rectilinear poly trees handles opposite-side access. Post-route topology materialization atomically replaces legal facing pairs with one shared diffusion contact/landing while retaining isolated access when M1 clearance blocks sharing. Exact GF180 4B is 3,770 shapes: 38 active islands/all 144 MOS, seven gate straps/14 devices, 98 shared contacts/196 terminals, 1,807 removed routing shapes, native DRC 0, 82/82 nets, zero shorts, and matched LVS. Two exports are byte-identical; official GF180 variant-C DRC improves 43→39. Next: close remaining official metal/density findings and audit route-tree shootouts/redundant vias/envelope excursion.
+- Physical IR v24 interval-packs signal tracks, adds checked cross-row same-cell poly straps, persists route-quality diagnostics, and fills only uncovered same-net landing/route notches as supported composite conductor geometry. Exact GF180 4B is 3,724 shapes: 38 active islands/all 144 MOS, 61 gate straps/122 devices, 99 shared contacts/198 terminals, and 23 route fills. Native DRC is 0, all 82 nets close with zero shorts, LVS recognizes 144/144, and route quality reports zero terminal-free components, duplicate vias, or unlanded vias. Routed area is 1,370.238 µm², bbox 5,408.491 µm², and max terminal excursion 0.905 µm versus v22's 1,602.394/9,004.461/27.33. Two GDS exports are byte-identical (`31398315…`); official GF180 DRC improves 39→9 with all routed metal spacing/width findings closed. Remaining findings are density/min-area/DBU qualification work.
+- Physical IR v25 adds process-owned electrically inert dummy fill with distinct GDS purposes, grid-safe centered primary/fallback tiles, process spacing/support rules, native DRC, and GDS round-trip. Exact GF180 4B has 5,617 shapes/1,893 fills, remains native DRC 0, 82/82 nets, zero shorts, LVS 144/144, and zero terminal-free/duplicate/unlanded route artifacts. Metal1–5/top densities are all above 30%; two exports are byte-identical (`be204ebe…`). Official variant-C DRC improves 9→3: only DCF.1b active density, PL.8 poly density, and DBU remain. Next: replace full-outline alternating wells with topology-owned device banks plus process-legal FEOL field-fill regions.
+- Physical IR v26 bounds alternating wells to the topology-owned device bank and reserves tapeout-contained field bands before fill. Paired 6 × 6 µm GF180 dummy COMP/poly tiles close active, poly, DPF.1, and metal-density rules without changing extraction. Exact 4B remains native DRC 0, 82/82 closed, zero shorts, LVS 144/144, and route-artifact clean at 6,761 shapes/3,038 fills. Two GDS exports are byte-identical (`fb3a882a…`); official variant-C DRC now reports only its known DBU comparison finding. Broader topology-driven compaction and shootout prevention remain active work.
+- Physical IR v27 adds geometry-aware device ordering and hierarchy-aligned PMOS/NMOS leaf-block ordering, then routes both the established and topology candidates before correctness-first selection. Exact GF180 4B selects the topology candidate: overflow 58→28, wire 2,243.390→1,948.150 µm, gate straps 61/122→88/176 devices, and shared terminal access 99/198→101/202. Full-width Manhattan elbow fill keeps the official deck clean except DBU. Native DRC is 0, 82/82 nets close with zero shorts, LVS matches 144/144, and route-artifact counts remain zero at 6,766 shapes. Two GDS exports are byte-identical (`69f5d177…`). A headless Physical IR JSON exporter now supports exact geometry inspection.
+- Physical IR v28 replaces fixed 1.55/0.58/0.55 transistor templates with one process-derived geometry contract shared by planning, placement, device footprints, row topology, contact materialization, and anchors. Electrical width now defines channel/active height; gate length plus process poly/diffusion/contact rules define active width and terminal positions. Mixed 0.7/2.4 µm regression devices are native-DRC/LVS clean and deterministic. Exact GF180 4B remains DRC 0, 82/82 closed, zero shorts, LVS 144/144, and artifact-clean at 6,779 shapes, with 106 shared accesses/212 terminals. Deterministic GDS hash is `51c6cedb…`; official DRC remains DBU-only.
+- Physical IR v30 preserves one shared horizontal center across each logical leaf's PMOS/NMOS occurrences while compacting only the transistors inside each occurrence. Both the compact and conventional finalists receive exhaustive closure before selection. The compact exact GF180 4B candidate now wins at 6,521 shapes: 38 shared active islands/144 MOS, 105 shared accesses/210 terminals, native DRC 0, 82/82 nets, zero shorts, LVS 144/144, and no terminal-free components, duplicate vias, or unlanded vias. Two audits and two GDS exports are byte-identical (`a07d7d3…`, 6,606 boundaries/15 labels/5 structures/4 refs); official variant-C DRC remains DBU-only.
 
 ## Handoff
 
@@ -59,6 +68,7 @@
 - Label commit behavior: click-away blurs the active editor before schematic selection changes, committing component/net/output names to the dirty in-memory project; asynchronous rename completion preserves the user's new selection.
 - Roadmap: Milestone 11.1 adds live physical signal-path visualization after routed connectivity equivalence, including HIGH/LOW/floating/contended/unknown net coloring, conducting-channel illumination, net isolation, and waveform-time scrubbing without regenerating geometry.
 - Roadmap: Milestone 4.1 adds process-owned physical DRC rules and 3D violation overlays for grid, width, spacing, contacts/vias, enclosure, wells, metal geometry, taps, rails, and pin access. It is explicitly a step toward signoff-ready generation; foundry-qualified correlation remains Milestone 9.
+- Manufacturing roadmap MPV-1: rule-derived geometry makes EDU/GF180 NAND and the real 4B project native-DRC clean. Final terminal-core cleanup removes disconnected components plus dead-end branches attached to valid nets while retaining each surviving via with its two smallest adjacent-layer landings; real GF180 4B removed 558 fragments and retained 3,507 shapes at DRC 0/0. Equal-conflict route attempts rank routed area then shape count. Physical IR v5 invalidates older caches and exposes cleanup count. MPV-2 started: deterministic fingerprint plus process ID, deck revision, and source provenance are embedded/exposed. SKY130 YAML remains empty/excluded.
 - Roadmap: Milestones 4.3–4.6 now mirror modern P&R stage boundaries: process-owned track/capacity planning and demand-sized floorplans; congestion-aware placement plus legalization; priority-ordered negotiated global routing with bounded rip-up/reroute and floorplan growth; then pin access, track assignment, detailed search-and-repair, and post-route compaction.
 - Roadmap: Default effort budgets are explicit and configurable: 60–70% device density, at most 75% estimated routing utilization, three aspect candidates, up to three 5–10% directional floorplan growth passes, 30 global-route iterations with three-stall early stop, and ten detailed repair rounds. Candidate ranking is lexicographic: equivalence, legality/DRC, zero overflow, area, routing cost, then aspect.
 - Roadmap: 3D DRC inspection moved to 4.7 so it consumes final routed geometry; persisted grouped waveform buses moved to 4.8. Milestone 5.1 later adds timing costs.
@@ -84,13 +94,45 @@
 - Acceptance: user reports the saved `4B_ADDER` now passes physical DRC after Phases 5–7. Stray visual geometry remains a non-blocking audit target as hierarchy and reporting mature.
 - Performance: exact saved `4B_ADDER` (144 MOS, 82 nets, 18 routed candidates) measures about 14.3 seconds in optimized release and 102 seconds in unoptimized debug after the single-shape/no-clone hot path and grouped device seeding. Async progress and candidate-budget optimization remain needed for development UX.
 - Physical build Phases 9–10: DRC diagnostics carry violation categories and pipeline origins with aggregate build-report counts; power-related routed violations are distinguished through net roles. Entering 3D immediately shows an interactive build overlay while Rust synthesis runs on a blocking worker after releasing the workspace lock. Completion reports elapsed/routing/rejection metrics; failures remain visible and retryable rather than producing a blank scene. Fine-grained live stage callbacks remain future work.
-- Next useful step: commit the Milestone 6 closeout, then begin Milestone 7 with tool discovery and reproducible synthesis jobs. Physical stray-geometry provenance and redundant same-net via consolidation remain separate audit targets.
-- Validation: 121 Rust tests, TypeScript/Vite, and the packaged Tauri release build pass through project-manifest and physical-cache round trips.
+- Next useful step: map imported canonical GDS back into Physical IR and prove native DRC equivalence, while separately correcting the GF180 generator for 0.28 µm channel length, implant enclosure, well/substrate taps, thick-top-metal width/spacing, 0.005 µm grid vertices, and density/fill. MPV-5 must export a real transistor-level reference netlist before official LVS comparison.
+- Validation: all 143 Rust tests pass; frontend and optimized Rust builds pass. The first flattened striped GF180 4B audit recognized 144/144 MOS, closed all 82 nets, and reported zero shorts/warnings; its two well-enclosure edge failures led to an enclosure-aware row-capacity correction. The post-correction exhaustive audit ran beyond the interactive validation window and was stopped, so final real-artifact DRC remains to be confirmed. KLayout/native canonical comparison passes on the archived QD-0001 stream; official GF180 DRC remains separate process-correlation work.
+- KLayout 0.30.8 independently opens and round-trips the corrected GF180 4B_ADDER stream as one top cell plus four referenced full-adder cells: 3,650 boundaries, 15 labels, and 0.001 µm DBU. Its layer inventory confirms COMP/N+/P+, contacts, GF180 Metal1–5 and Via1–4; synthetic substrate and provisional 37/39 mappings are absent. The native report matches and now decodes GDS REAL8 units correctly.
 
 ## Recent Changes
 
 | Date | Tags | Change | Commit | Remote |
 | --- | --- | --- | --- | --- |
+| 2026-07-27 | routing, leaf-access, candidate-policy, qualification | Added an optional leaf-standard-cell-local shared signal escape with atomic grid-safe via stacks, retained established routing as an independently scored candidate, and proved the exact GF180 4B winner remains byte-identical to v30. Rust 169/169, frontend build, native DRC/connectivity/LVS, deterministic audit/GDS, and official DBU-only DRC gates pass. | Uncommitted | Not confirmed |
+| 2026-07-27 | physical-ir-v30, leaf-alignment, topology-compaction, qualification | Replaced independent row recentering with shared PMOS/NMOS leaf centers, bounded exhaustive closure to the strongest compact and conventional finalists, and invalidated v29 caches. The compact exact GF180 4B now wins with native/official DRC, connectivity, LVS, route-artifact, and deterministic regeneration gates intact. | Uncommitted | Not confirmed |
+| 2026-07-27 | physical-ir-v29, full-row-compaction, footprint-provenance, qualification | Compacted complete oriented physical rows against real process footprints, shared admitted compact geometry with detailed routing, persisted compaction provenance, and retained a correctness-first conventional challenger. Exact selected GF180 4B remains DRC/LVS/connectivity clean and deterministic; official DRC is DBU-only. | Uncommitted | Not confirmed |
+| 2026-07-27 | physical-ir-v26, well-banks, feol-field, gf180, official-drc | Restricted wells to topology-owned device banks, reserved legal FEOL field bands, and paired dummy COMP/poly coverage. Exact GF180 4B remains native DRC/LVS/connectivity clean; all process density and routed-geometry checks close, deterministic GDS hashes identically, and the official deck reports only DBU. | Uncommitted | Not confirmed |
+| 2026-07-27 | physical-ir-v25, density-fill, gf180, official-drc | Added process-owned electrically inert dummy fill, purpose-aware GDS import/export, grid-edge validation, and deterministic fallback tiles. Exact GF180 4B remains native DRC/LVS/connectivity clean; every metal density exceeds 30%, two exports hash identically, and official DRC improves 9→3. | Uncommitted | Not confirmed |
+| 2026-07-25 | physical-ir-v24, interval-packing, route-quality, composite-fill, official-drc | Packed non-overlapping signal intervals onto reusable tracks, added 61 legal cross-row gate straps, persisted route-quality diagnostics, and emitted 23 coverage-aware same-net notch fills. Exact GF180 4B remains native DRC/LVS/connectivity clean; official DRC improves 39→9 and deterministic GDS SHA-256 is `313983151abe5a883e3c10dae19cf34ebe8d26464ac7d881cedc27f1cc8b811f`. Rust 153/153 and frontend build pass. | Uncommitted | Not confirmed |
+| 2026-07-25 | physical-ir-v22, topology-contacts, official-drc, determinism | Materialized 98 legal shared diffusion contacts after final routing topology, reducing exact GF180 4B IR to 3,770 shapes while preserving native DRC 0, 82/82 nets, zero shorts, and LVS 144/144. Two GDS exports are byte-identical; official variant-C DRC improves 43→39; Rust 150/150 and frontend build pass. | Uncommitted | Not confirmed |
+| 2026-07-24 | physical-ir-v22, provenance, row-topology, shared-active, shared-poly | Added explicit shape purposes and serialized row topology; replaced per-device diffusion with 38 maximal active islands covering all 144 GF180 4B MOS devices; added a gate-oriented candidate and legal rectilinear poly trees for opposite-side access. | Uncommitted | Not confirmed |
+| 2026-07-24 | roadmap, tapeout-io, perimeter-pins | Added MPV-5.1 for assigning schematic digital input/output symbols to deterministic four-sided tapeout perimeter pins, with per-symbol and bulk scope controls, cross-selected hookup visualization, process-legal placement, escape-capacity reservation, persistence, GDS/LEF agreement, and qualification coverage. | Uncommitted | Not confirmed |
+| 2026-07-24 | physical-ir-v21, topology-geometry, shootout-cleanup | Defined topology-shaped diffusion/poly as a durable manufacturing goal and made final overhang cleanup trim internally generated M1-Mx routes without touching device landings or pins; exact GF180 4B remains clean at 4,065 shapes, 1,807 removed routes, 82/82 nets, and 144/144 MOS. | Uncommitted | Not confirmed |
+| 2026-07-24 | gf180, official-drc, diffusion-planning | Confirmed the v17 desktop GDS byte-for-byte matches the tightened export and reproduces 375 official violations; specified process-derived active spans and legal same-net diffusion sharing as the next device-geometry slice. | Uncommitted | Not confirmed |
+| 2026-07-24 | gf180, gds-contract, official-drc | Added per-purpose implant enclosure, exact GF180 contact cuts, 9K Metal5 rules, containment-aware GDS import, and migration/cache invalidation for older embedded GF180 snapshots; official direct-contract 4B DRC improved 2,760→375 while all 147 Rust tests pass. | Uncommitted | Not confirmed |
+| 2026-07-24 | physical-ir-v16, leaf-locality, drc-closure | Made diffusion landings immutable, scored intra-leaf distance, kept leaf groups contiguous through row wrapping, and invalidated stale v15 physical caches; exact GF180 4B closes 5→0 opens with 0 DRC errors/shorts and native LVS match. | Uncommitted | Not confirmed |
+| 2026-07-24 | physical-routing, staged-search, performance | Replaced three concurrent chip-wide multilayer lattices with parallel bounded screening plus one selected-candidate corridor search; GF180 4B runtime falls from over an hour to ~2:55 with 144/144 MOS, zero shorts, and 12 reported opens. | Uncommitted | Not confirmed |
+| 2026-07-24 | physical-routing, parallelism, performance | Parallelized independent geometry/refinement attempts with a bounded Rayon worker pool while keeping shared-canvas net routing serial and deterministic. | Uncommitted | Not confirmed |
+| 2026-07-24 | physical-ir-v15, topology-placement, orphan-cleanup | Centered the highest-connectivity placement seed in each compatible well region, expanded subsequent devices through nearest sites on both sides, and stopped internal route markers from preserving dead branches. | Uncommitted | Not confirmed |
+| 2026-07-24 | physical-ir-v14, dynamic-poly, connectivity | Replaced fixed full-height gate poly with a device/process-sized core and one-sided generated access extension; made contacts the sole terminal-access marker and analyzed the remaining GF180 net-28 three-island open. | Uncommitted | Not confirmed |
+| 2026-07-24 | physical-build, progress, eta | Added real backend stage events, a continuously updating elapsed timer and weighted ETA, determinate progress, and a live completed/active/pending generation checklist; rebuilt the Apple Silicon app. | Uncommitted | Not confirmed |
+| 2026-07-24 | desktop-build, apple-silicon, startup | Rebuilt the release executable and unsigned Apple Silicon `.app`; launched both and visually confirmed the complete schematic UI with the Rust backend ready instead of a white screen. | Uncommitted | Not confirmed |
+| 2026-07-24 | physical-ir-v13, well-stripes, flattened-placement | Added explicit alternating N/P well fabric and enclosure-aware corner-first placement; made flattened device geometry the default while retaining characterized deterministic macros only for demonstrated physical savings. | Uncommitted | Not confirmed |
+| 2026-07-24 | physical-ir-v12, flexible-poly, standard-cells | Made canonical leaf-cell placement and side-selectable poly access the production baseline, atomically admitted complete local footprints, invalidated v11 caches, and retained the resulting six-error GF180 baseline for direct closure rather than reverting to fixed rectangles. | Uncommitted | Not confirmed |
+| 2026-07-24 | routing, multilayer-a-star, pin-access | Added deterministic no-timeout multilayer A* residual routing, process/fine access lattices, full terminal-metal span sampling, and an upper-layer barrier regression; GF180 4B improves 7→1 open with all geometry/short checks clean, identifying the last defect as sealed local cell pin access. | Uncommitted | Not confirmed |
+| 2026-07-23 | routing, open-nets, layer-search | Changed residual-open repair to progressively compare complete legal routes across reachable layers with length/via/escalation cost and admissible lower-bound pruning; exhaustive GF180 evidence kept 7 opens and proved the remaining cases require a true multilayer track-graph search rather than more dogleg enumeration. | Uncommitted | Not confirmed |
+| 2026-07-23 | routing, power-integrity, primary-sources | Added the primary-source routing architecture: IEEE 1801/2416 scope, foundry-owned EM/current/DFM limits, staged PDN/global/detail routing, current-derived rail/via sizing, IR-drop and EM analysis, and evidence-based claim levels. | Uncommitted | Not confirmed |
+| 2026-07-23 | manufacturing, standard-cells, physical-ir-v11 | Added a packaged 24-cell logical catalog and technology-specific EDU/GF180 physical recipes, embedded generated site-aligned entries in Physical IR, exposed the active library in 3D, and retained the proven production route. | Uncommitted | Not confirmed |
+| 2026-07-23 | manufacturing, mpv-4, official-gf180 | Added canonical GDS import/comparison, proved exact KLayout round-trip equivalence, archived official GF180 DRC failure and 144-MOS extraction evidence, and recorded macOS/KLayout compatibility constraints. | Uncommitted | Not confirmed |
+| 2026-07-23 | manufacturing, mpv-3, gds-hierarchy | Exported physical blocks as referenced GDS structures, added reference/top-cell validation and a standalone artifact validator, and natively validated the saved 4B_ADDER stream. | Uncommitted | Not confirmed |
+| 2026-07-23 | manufacturing, mpv-2, mpv-3, gds-layer-map | Added strict persisted GDS layer-purpose mappings; GF180 export uses official COMP/implant/poly/contact/metal/via assignments, supports one-to-many shape emission, and updates the deck fingerprint. | Uncommitted | Not confirmed |
+| 2026-07-23 | manufacturing, mpv-3, gds-bounds-fix | Fixed 4B-style GDS export rejection by validating binary top-cell bounds against the actual Physical IR shape envelope instead of the provisional floorplan; added an out-of-floorplan regression. | Uncommitted | Not confirmed |
+| 2026-07-23 | manufacturing, mpv-3, gdsii | Added flat binary GDSII export, native structural/count/bounds validation, physical-pin labels, and a guarded 3D-sidebar export flow; documented hierarchy/layer-map/KLayout limits. | Uncommitted | Not confirmed |
+| 2026-07-23 | manufacturing, mpv-2, process-examples | Added the canonical GF180 compatibility process rule-deck and separate conservative validation-record examples, linked by stable identity/revision/fingerprint and covered by Rust regression tests. | Uncommitted | Not confirmed |
 | 2026-07-21 | roadmap, readme, build-docs | Moved deferred RTL linking/elaboration/sequential/testbench work into four Milestone 7 slices; rewrote the README for users with explicit RTL limits, source builds, and Apple Silicon app/DMG packaging. | Uncommitted | Not confirmed |
 | 2026-07-21 | project-manifest, physical-cache, file-formats | Added `.ochippy` manifests, sibling `.chippy` circuits, digest/version-validated `.chippy_gds` physical IR, cached 3D reuse, direct physical export, dual-format opening, and safe included paths. | Uncommitted | Not confirmed |
 | 2026-07-21 | rtl-attributes, strings, concatenation | Added quote-safe synthesis attribute handling and preserved/evaluated concatenation plus parameter-counted replication through parse/export/truth-table/waveform paths. | Uncommitted | Not confirmed |
@@ -188,7 +230,72 @@
 
 ## Open Threads
 
+- Physical IR v31 corrects the route-closure contract: device gate/source/drain
+  geometry and physical boundary pins must join their intended conductor
+  islands, and terminal-to-terminal reachability no longer permits a generated
+  metal branch to end in empty space. Exact canonical GF180 4B_ADDER
+  requalification closes all 144 devices, 82 nets, and route endpoints with
+  native DRC/LVS clean, deterministic GDS, and only the known official-deck DBU
+  comparison marker. Continue topology-aware compaction and flexible
+  poly/diffusion work without weakening this closure contract.
+- Physical IR v32 persists a rectilinear decomposition for topology-owned
+  shared active. Mixed-width adjacent MOS devices now retain their individual
+  process-derived channel heights while sharing legal facing diffusion; the
+  canonical equal-width GF180 4B adder remains byte-identical and officially
+  DRC-qualified. Placement compaction around these variable outlines and
+  topology-derived poly consolidation remain active work.
+- Physical IR v33 atomically reserves each compact topology run's complete
+  shared-active envelope in placement and detailed-routing occupancy before
+  selection. A candidate is acceptable only when geometry DRC, all device
+  terminal attachments, routed-net connectivity, dangling-endpoint audit, and
+  native LVS pass together. Exact GF180 4B evidence is 144/144 devices, 82/82
+  nets, zero missing terminals/opens/shorts/dangling endpoints/native DRC, and
+  LVS matched; Rust 173/173, frontend build, and native release build pass.
+- Physical IR v34 makes cross-row shared-poly membership geometric rather than
+  declarative: deterministic rectilinear trees branch to every claimed gate,
+  candidates that miss any member are rejected, and compact placement reserves
+  the exact tree as a composite same-net conductor while foreign-net poly
+  remains illegal. Exact GF180 4B closure and deterministic GDS are unchanged;
+  Rust 175/175 and the official deck (known DBU marker only) pass.
+- Physical IR v35 withdraws that clean result as sufficient qualification
+  evidence. Shared gate straps now persist exact rectilinear geometry, and
+  native DRC/LVS require the emitted conductor to exist, remain continuous,
+  and reach every claimed device gate access. Re-auditing the canonical GF180
+  4B design initially exposed 88 `CONNECTIVITY.OPEN_GATE_STRAP` defects: final
+  preview admission retained metadata while rejecting componentless poly one
+  rectangle at a time. It now admits each net's complete topology tree
+  transactionally. All 88 straps are emitted; strict native DRC is clean,
+  144/144 devices and 82/82 nets close, LVS matches, deterministic GDS is
+  421,286 bytes/6,566 boundaries with SHA-256 `6b5b546f…`, and the official
+  deck again reports only its known DBU marker.
+- Physical IR v36 removes the conservative active-run bounding box from compact
+  placement. Placement and final preview replay the exact rectilinear island
+  synthesizer and atomically admit edge-abutting active pieces. Native DRC/LVS
+  now emit `CONNECTIVITY.OPEN_ACTIVE_ISLAND` when persisted geometry is absent,
+  disconnected, or fails to reach a claimed device/access. A 0.7/2.4 µm
+  regression preserves both channel heights and a malformed-piece regression
+  fails as required. Equal-width GF1804B remains byte-identical to v35 and
+  officially qualified; Rust 177/177 passes.
+- Physical IR v37 proves every logical MOS gate/source/drain and persisted
+  boundary pin against its exact emitted access geometry. An isolated landing
+  or via stack no longer counts as closure; shared active/poly is accepted only
+  through topology-proven geometry, and supply terminals must reach an explicit
+  `power_rail`. The stricter proof exposed and fixed a real inverter VDD/GND
+  power-fabric open. Canonical GF180 4B_ADDER remains native DRC/LVS clean with
+  144/144 devices and 82/82 nets, deterministic GDS, and only the known
+  official-deck DBU marker. Redundant route-branch and transition-stack
+  compaction remains an active visual and physical-quality task.
 - Keep Milestone 3’s RC model explicitly educational; SPICE/nonlinear analog behavior is out of scope.
 - Explicit persisted net identity, editable physical layout, and full PDK design-rule support remain future architecture work.
 - Group movement, direct wire-to-wire branching, and scalable routing beyond the temporary two-metal heuristic remain editor work.
 - The Three.js bundle still triggers Vite’s 500 kB advisory; optimize when profiling justifies it.
+- Generate locally routed transistor geometry and explicit boundary pins for each
+  packaged cell, beginning with INV/NAND2, before enabling cloned macros in the
+  production candidate set.
+- Implement routing-philosophy RP-1 schemas before changing PDN heuristics:
+  power intent, current/temperature assumptions, process EM limits, per-cut
+  current, resistance, antenna, taps, density, and explicit uncharacterized
+  results.
+- Replace residual-open dogleg enumeration with multilayer A*/Dijkstra over
+  legal track and via states; the full GF180 dogleg search remained at 7 opens
+  with zero geometry errors and zero shorts.

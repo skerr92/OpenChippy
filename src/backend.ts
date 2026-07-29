@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DeviceCharacteristics, LogicState, PhysicalDrcReport, PhysicalLayoutIr, Project, RtlModule, SimulationResult, TruthTableResult, ValidationReport, WaveformConfig, WaveformGroup, WaveformResult, WorkspaceState } from "./types";
+import type { DeviceCharacteristics, LogicState, NativeLvsReport, PhysicalDrcReport, PhysicalLayoutIr, Project, RtlModule, SimulationResult, TruthTableResult, ValidationReport, WaveformConfig, WaveformGroup, WaveformResult, WorkspaceState } from "./types";
 
 const browserFallback = (): WorkspaceState => ({
   project: {
@@ -15,6 +15,9 @@ const browserFallback = (): WorkspaceState => ({
     technology: {
       format_version: 1,
       name: "OpenChippy EDU CMOS",
+      process_id: "openchippy-edu-cmos",
+      deck_revision: "builtin-v1",
+      source: "OpenChippy built-in educational technology",
       supply_voltage: 1.8,
       max_metal_layers: 5,
       nmos: {
@@ -78,6 +81,27 @@ const browserFallback = (): WorkspaceState => ({
           metal3: { pitch_um: .32, offset_um: .16, preferred_direction: "horizontal", capacity_adjustment: .75, reserved_for_power: false },
           metal4: { pitch_um: .32, offset_um: .16, preferred_direction: "vertical", capacity_adjustment: .75, reserved_for_power: false },
           metal5: { pitch_um: .32, offset_um: .16, preferred_direction: "horizontal", capacity_adjustment: .75, reserved_for_power: false },
+        },
+      },
+      gds_layers: {
+        format_version: 1,
+        label_datatype: 10,
+        layers: {
+          substrate: [{ purpose: "substrate_preview", layer: 1, datatype: 0 }],
+          nwell: [{ purpose: "nwell", layer: 21, datatype: 0 }],
+          ndiff: [{ purpose: "ndiff", layer: 22, datatype: 0 }],
+          pdiff: [{ purpose: "pdiff", layer: 22, datatype: 1 }],
+          poly: [{ purpose: "poly", layer: 30, datatype: 0 }],
+          contact: [{ purpose: "contact", layer: 33, datatype: 0 }],
+          metal1: [{ purpose: "metal1", layer: 34, datatype: 0 }],
+          via12: [{ purpose: "via12", layer: 35, datatype: 0 }],
+          metal2: [{ purpose: "metal2", layer: 36, datatype: 0 }],
+          via23: [{ purpose: "via23", layer: 37, datatype: 0 }],
+          metal3: [{ purpose: "metal3", layer: 38, datatype: 0 }],
+          via34: [{ purpose: "via34", layer: 39, datatype: 0 }],
+          metal4: [{ purpose: "metal4", layer: 40, datatype: 0 }],
+          via45: [{ purpose: "via45", layer: 41, datatype: 0 }],
+          metal5: [{ purpose: "metal5", layer: 42, datatype: 0 }],
         },
       },
     },
@@ -219,12 +243,24 @@ export async function validatePhysicalLayout(): Promise<PhysicalDrcReport> {
   return invoke("validate_physical_layout");
 }
 
+export async function validatePhysicalLvs(): Promise<NativeLvsReport> {
+  return invoke("validate_physical_lvs");
+}
+
 export async function inspectPhysicalLayout(): Promise<{ layout: PhysicalLayoutIr; drc: PhysicalDrcReport; buildReport: import("./types").PhysicalBuildReport }> {
   return invoke("inspect_physical_layout");
 }
 
 export async function savePhysicalLayout(path: string): Promise<string> {
   return invoke("save_physical_layout", { path });
+}
+
+export async function exportGdsii(path: string): Promise<import("./types").GdsExportReport> {
+  return invoke("export_gdsii", { path });
+}
+
+export async function exportLef(path: string): Promise<string> {
+  return invoke("export_lef", { path });
 }
 
 export async function savePhysicalDrcReport(path: string, data: string): Promise<string> {

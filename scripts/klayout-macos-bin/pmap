@@ -1,0 +1,4 @@
+#!/bin/sh
+# Compatibility output for GF180 KLayout deck memory logging on macOS.
+# The verification rules use pmap only to decorate log messages.
+printf 'total             unavailable\n'

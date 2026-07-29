@@ -1,0 +1,271 @@
+# OpenChippy IHP SG13G2 compatibility technology profile
+#
+# Target:
+#   - IHP SG13G2 130 nm open-source BiCMOS PDK
+#   - 1.2 V thin-oxide CMOS logic devices
+#   - Five thin routable metal layers (Metal1-Metal5)
+#   - Tiny Tapeout IHP-compatible digital implementation experiments
+#
+# IMPORTANT:
+#   This is an OpenChippy compatibility profile, not a complete IHP-qualified
+#   PDK or signoff rule deck. OpenChippy's format currently reduces many
+#   conditional SG13G2 rules to one conservative scalar per layer class.
+#   Final GDS must still pass the current IHP SG13G2 DRC, LVS, antenna,
+#   density, latch-up, reliability, and Tiny Tapeout submission checks.
+#
+#   The geometry values below primarily use IHP's public precheck/minimal DRC
+#   rules. Those rules are intended for rejection checks and are not a complete
+#   replacement for the main SG13G2 rule deck.
+#
+# Primary sources:
+#   https://ihp-open-pdk-docs.readthedocs.io/en/latest/layout_rules/02_layer_table.html
+#   https://ihp-open-pdk-docs.readthedocs.io/en/latest/verification/drc/01_precheck_drc.html
+#   https://github.com/IHP-GmbH/IHP-Open-PDK
+#   https://tinytapeout.com/specs/analog/
+
+technology:
+  format_version: 1
+  name: IHP SG13G2 1.2V 5M Compatibility
+  process_id: ihp-sg13g2-1v2-5m-compat
+  deck_revision: openchippy-compat-v1
+  source: https://ihp-open-pdk-docs.readthedocs.io/en/latest/verification/drc/01_precheck_drc.html
+  supply_voltage: 1.2
+  max_metal_layers: 5
+
+nmos:
+  # Preliminary nominal values for OpenChippy's educational timing model.
+  # Do not use these as SPICE or signoff characterization.
+  threshold_voltage: 0.40
+  nominal_on_resistance_ohms: 5000.0
+  reference_width_um: 1.0
+  reference_length_um: 0.13
+  gate_capacitance_ff_per_um: 1.8
+  diffusion_capacitance_ff_per_um: 1.0
+
+pmos:
+  # Preliminary nominal values for OpenChippy's educational timing model.
+  # Do not use these as SPICE or signoff characterization.
+  threshold_voltage: -0.42
+  nominal_on_resistance_ohms: 9000.0
+  reference_width_um: 1.0
+  reference_length_um: 0.13
+  gate_capacitance_ff_per_um: 2.0
+  diffusion_capacitance_ff_per_um: 1.2
+
+physical_parasitics:
+  format_version: 1
+
+  # Coarse placeholders for early RC estimation. Replace with characterized
+  # SG13G2 interconnect data or extracted parasitics before timing validation.
+  wire_capacitance_ff_per_um: 0.16
+  via_capacitance_ff: 0.06
+
+  layer_capacitance_ff_per_um:
+    metal1: 0.20
+    metal2: 0.18
+    metal3: 0.16
+    metal4: 0.15
+    metal5: 0.14
+
+  via_capacitance_overrides_ff:
+    via12: 0.070
+    via23: 0.065
+    via34: 0.060
+    via45: 0.060
+
+# SG13G2 layer/datatype assignments from the public IHP layer table.
+# Diffusion emits Activ plus the polarity-specific source/drain implant.
+# The ordinary P-well is implicit in the substrate for standard CMOS use;
+# PWell drawing layer 46/0 is reserved for internal use in the public table.
+gds_layers:
+  format_version: 1
+  label_datatype: 25
+  layers:
+    substrate: []
+    pwell: [{ purpose: lvpwell, layer: 46, datatype: 0 }]
+    nwell: [{ purpose: NWell, layer: 31, datatype: 0 }]
+    ndiff:
+      - { purpose: Activ, layer: 1, datatype: 0 }
+      - { purpose: nSD, layer: 7, datatype: 0, enclosure_um: 0.20 }
+    pdiff:
+      - { purpose: Activ, layer: 1, datatype: 0 }
+      - { purpose: pSD, layer: 14, datatype: 0, enclosure_um: 0.20 }
+    poly: [{ purpose: GatPoly, layer: 5, datatype: 0 }]
+    contact: [{ purpose: Cont, layer: 6, datatype: 0 }]
+    metal1: [{ purpose: Metal1, layer: 8, datatype: 0 }]
+    via12: [{ purpose: Via1, layer: 19, datatype: 0 }]
+    metal2: [{ purpose: Metal2, layer: 10, datatype: 0 }]
+    via23: [{ purpose: Via2, layer: 29, datatype: 0 }]
+    metal3: [{ purpose: Metal3, layer: 30, datatype: 0 }]
+    via34: [{ purpose: Via3, layer: 49, datatype: 0 }]
+    metal4: [{ purpose: Metal4, layer: 50, datatype: 0 }]
+    via45: [{ purpose: Via4, layer: 66, datatype: 0 }]
+    metal5: [{ purpose: Metal5, layer: 67, datatype: 0 }]
+
+physical_rules:
+  format_version: 1
+  database_units_per_micron: 1000
+
+  # Conservative OpenChippy grid. Verify against the exact PDK revision and
+  # imported standard-cell/technology LEF before qualification.
+  manufacturing_grid_um: 0.005
+
+  # IHP precheck rules:
+  #   Act.a minimum width = 0.15 um
+  #   Act.b minimum spacing/notch = 0.21 um
+  # No scalar minimum area is supplied by the minimal precheck rules, so the
+  # value below is a width-times-spacing compatibility proxy.
+  diffusion:
+    min_width_um: 0.15
+    min_spacing_um: 0.21
+    min_area_um2: 0.0315
+
+  # IHP precheck rules:
+  #   Gat.a minimum width = 0.13 um
+  #   Gat.b minimum spacing/notch = 0.18 um
+  # The area value is a compatibility proxy rather than an official rule.
+  poly:
+    min_width_um: 0.13
+    min_spacing_um: 0.18
+    min_area_um2: 0.0234
+
+  # NWell scalar values are conservative compatibility defaults. SG13G2 has
+  # additional conditional device, isolation, and well-to-active rules that
+  # must be checked by the official deck.
+  well:
+    min_width_um: 0.86
+    min_spacing_um: 0.86
+    min_area_um2: 0.7396
+
+  # Default metal rule represents Metal2-Metal5:
+  #   M2-M5 minimum width = 0.20 um
+  #   M2-M5 minimum spacing/notch = 0.21 um
+  # The area value is a width-times-spacing compatibility proxy.
+  metal:
+    min_width_um: 0.20
+    min_spacing_um: 0.21
+    min_area_um2: 0.0420
+
+  # IHP precheck rules:
+  #   Cnt.a fixed width = 0.16 um
+  #   Cnt.b minimum spacing = 0.18 um
+  # Enclosure is a conservative OpenChippy default; validate against the main
+  # DRC deck for Activ, GatPoly, and Metal1-specific enclosure conditions.
+  contact:
+    size_um: 0.16
+    min_spacing_um: 0.18
+    enclosure_um: 0.07
+
+  # IHP precheck rules for Via1-Via4:
+  #   Vn.a fixed width = 0.19 um
+  #   Vn.b minimum spacing = 0.22 um
+  # Enclosure is intentionally conservative and must be verified against the
+  # main rule deck's layer- and geometry-dependent requirements.
+  via:
+    size_um: 0.19
+    min_spacing_um: 0.22
+    enclosure_um: 0.06
+
+  # Conservative compatibility defaults. These are not substitutes for the
+  # conditional gate-over-active and well-over-device rules in the main deck.
+  gate_extension_um: 0.18
+  well_enclosure_um: 0.43
+  max_tap_distance_um: 20.0
+
+  layer_overrides:
+    metal1:
+      # M1.a = 0.16 um; M1.b = 0.18 um.
+      min_width_um: 0.16
+      min_spacing_um: 0.18
+      min_area_um2: 0.0288
+
+    metal2:
+      min_width_um: 0.20
+      min_spacing_um: 0.21
+      min_area_um2: 0.0420
+
+    metal3:
+      min_width_um: 0.20
+      min_spacing_um: 0.21
+      min_area_um2: 0.0420
+
+    metal4:
+      min_width_um: 0.20
+      min_spacing_um: 0.21
+      min_area_um2: 0.0420
+
+    metal5:
+      min_width_um: 0.20
+      min_spacing_um: 0.21
+      min_area_um2: 0.0420
+
+  via_overrides:
+    via12:
+      size_um: 0.19
+      min_spacing_um: 0.22
+      enclosure_um: 0.06
+    via23:
+      size_um: 0.19
+      min_spacing_um: 0.22
+      enclosure_um: 0.06
+    via34:
+      size_um: 0.19
+      min_spacing_um: 0.22
+      enclosure_um: 0.06
+    via45:
+      size_um: 0.19
+      min_spacing_um: 0.22
+      enclosure_um: 0.06
+
+physical_planning:
+  # Compatibility defaults based on the public SG13G2 digital standard-cell
+  # architecture. Verify these values against the exact installed LEF revision.
+  placement_site_width_um: 0.48
+  row_height_um: 3.78
+
+  target_device_density: 0.60
+  target_routing_utilization: 0.70
+  floorplan_growth_factor: 0.10
+  max_floorplan_growth_passes: 4
+
+  global_route_max_iterations: 40
+  global_route_stall_iterations: 4
+  detailed_route_max_iterations: 15
+
+  # Conservative planning pitches; not authoritative LEF routing tracks.
+  # Each pitch is at least the corresponding minimum width plus spacing.
+  routing_layers:
+    metal1:
+      pitch_um: 0.48
+      offset_um: 0.24
+      preferred_direction: horizontal
+      capacity_adjustment: 0.65
+      reserved_for_power: true
+
+    metal2:
+      pitch_um: 0.48
+      offset_um: 0.24
+      preferred_direction: vertical
+      capacity_adjustment: 0.70
+      reserved_for_power: false
+
+    metal3:
+      pitch_um: 0.48
+      offset_um: 0.24
+      preferred_direction: horizontal
+      capacity_adjustment: 0.70
+      reserved_for_power: false
+
+    metal4:
+      pitch_um: 0.48
+      offset_um: 0.24
+      preferred_direction: vertical
+      capacity_adjustment: 0.70
+      reserved_for_power: false
+
+    metal5:
+      pitch_um: 0.48
+      offset_um: 0.24
+      preferred_direction: horizontal
+      capacity_adjustment: 0.70
+      reserved_for_power: false
