@@ -1,0 +1,76 @@
+{
+  "formatVersion": 1,
+  "design": {
+    "name": "4B_ADDER",
+    "gdsPathAtRun": "/Users/sethkerr/Documents/4B_ADDER.gds",
+    "archivedGds": "4B_ADDER.gds",
+    "gdsSha256": "da29b9b44f57f03e01b0b0a5386ec5ccf0143bf25e2b5a12f59bee635e937d21"
+  },
+  "process": {
+    "name": "GF180MCU",
+    "variant": "C",
+    "metalLevel": "5LM",
+    "metalTop": "9K",
+    "mimOption": "B"
+  },
+  "tools": {
+    "klayoutVersion": "0.30.8",
+    "verificationRepository": "globalfoundries-pdk-libs-gf180mcu_fd_pv",
+    "verificationCommit": "c036ebc596ad2199e2d3c7d828cd2ec5af7cb187"
+  },
+  "compatibility": {
+    "officialRuleDeckLogicModified": false,
+    "runnerSyntaxAdapted": true,
+    "notes": [
+      "KLayout 0.30.8 embeds Ruby 2.6.10, so a temporary copy rewrote six endless accessor definitions into equivalent standard method syntax.",
+      "The official LVS logger calls Linux pmap; a PATH-local macOS shim reports memory as unavailable without changing extraction behavior."
+    ]
+  },
+  "drc": {
+    "status": "FAILED",
+    "violationCount": 3839,
+    "report": "official-drc.lyrdb",
+    "reportSha256": "f0b512debd2a707e5bbab63ffcba715d27aeebee5660413d3534542fb495435c",
+    "runMode": "deep",
+    "workers": 1,
+    "threads": 1,
+    "dominantViolations": {
+      "MT.1": 1856,
+      "MT.2a": 467,
+      "NP.5b": 288,
+      "PP.5b": 288,
+      "PP.5dii": 288,
+      "NP.5a": 144,
+      "PL.2_LV": 144,
+      "PP.5a": 144,
+      "DF.13_LV": 72,
+      "DF.14_LV": 72
+    },
+    "confirmatoryRerun": {
+      "date": "2026-07-23",
+      "sourceGdsSha256": "da29b9b44f57f03e01b0b0a5386ec5ccf0143bf25e2b5a12f59bee635e937d21",
+      "violationCount": 3839,
+      "result": "IDENTICAL_COUNTS"
+    }
+  },
+  "openChippyImportAudit": {
+    "status": "FAILED",
+    "shapeCount": 3451,
+    "unmappedLayerPairCount": 0,
+    "violationCount": 4,
+    "violationsByRule": {
+      "GEOMETRY.MIN_SPACING": 4
+    },
+    "notes": "The canonical MPV-4 importer flattened five GDS cells, reversed all GF180 layer mappings, collapsed diffusion purpose pairs, inferred conductor connectivity, and ran native DRC. Exact in-memory pre-export equivalence remains pending because GDSII does not retain OpenChippy component ownership or coincident logical-shape identity."
+  },
+  "lvs": {
+    "status": "EXTRACTION_ONLY",
+    "comparisonStatus": "NOT_RUN",
+    "reason": "OpenChippy does not yet export the transistor-level SPICE/CDL reference required for official LVS comparison.",
+    "extractedMosCount": 144,
+    "extractedNetlist": "official-extracted.cir",
+    "extractedNetlistSha256": "15262076b1ce7aad1b460e54d687c6b0c4d6913b2c03a7bfe0ff2f15ce3c3183",
+    "placeholderReference": "../../4B_ADDER_extraction_stub.spice",
+    "placeholderIsQualificationEvidence": false
+  }
+}

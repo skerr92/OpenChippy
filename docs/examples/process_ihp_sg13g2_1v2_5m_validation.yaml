@@ -1,0 +1,151 @@
+# OpenChippy IHP SG13G2 process-validation record
+#
+# This file records qualification evidence for the exact compatibility rule
+# deck named below. It intentionally begins with conservative NOT_RUN claims:
+# generating a deck from published IHP data is not itself evidence that
+# OpenChippy has loaded, exercised, or correlated it against the IHP tools.
+#
+# The IHP Open PDK currently describes itself as preview/early-access material.
+# This record therefore must not be interpreted as foundry signoff.
+
+process_validation:
+  format_version: 1
+
+  process:
+    process_id: ihp-sg13g2-1v2-5m-compat
+    deck_revision: openchippy-compat-v1
+    deck_file: process_ihp_sg13g2_1v2_5m_dr.yaml
+    deck_fingerprint: "fnv1a64:9e6046013a546854"
+    compatibility_profile: true
+    foundry_signoff_deck: false
+
+  record:
+    record_id: ihp-sg13g2-1v2-5m-compat-validation-v1
+    revision: 1
+    generated_on: "2026-07-27"
+    overall_status: DOCUMENTED
+    highest_supported_claim: DOCUMENTED
+    notes:
+      - The rule deck is derived from the public SG13G2 layer table and minimal precheck/rejection rules.
+      - Filler layer mappings use the published filler datatype 22.
+      - Density limits record the public global and 800 x 800 um window requirements.
+      - OpenChippy parser tests, native DRC tests, GDS round-trip tests, official IHP DRC, and LVS have not yet been run for this deck.
+      - Tiny Tapeout top-level fill and finishing may satisfy requirements that cannot be evaluated inside an individual small macro.
+      - Device timing, resistance, capacitance, and routing parasitic entries remain non-signoff estimates.
+
+  capabilities:
+    - id: CAP-PROCESS-DECK-LOAD
+      description: Parse and validate the versioned IHP compatibility rule deck.
+      status: NOT_RUN
+      evidence: null
+
+    - id: CAP-NATIVE-PHYSICAL-DRC
+      description: Run OpenChippy native physical DRC using the IHP compatibility deck.
+      status: NOT_RUN
+      evidence: null
+
+    - id: CAP-GDSII-EXPORT
+      description: Export SG13G2-mapped GDSII from Physical IR.
+      status: NOT_RUN
+      evidence: null
+
+    - id: CAP-GDSII-ROUND-TRIP
+      description: Export and re-import canonically equivalent SG13G2 GDSII.
+      status: NOT_RUN
+      evidence: null
+
+    - id: CAP-NATIVE-LVS
+      description: Compare physical devices and connectivity with the logical design.
+      status: NOT_RUN
+      evidence: null
+
+    - id: CAP-LEF-EXPORT
+      description: Export LEF macros and verify them with an independent parser.
+      status: NOT_RUN
+      evidence: null
+
+    - id: CAP-EXTERNAL-IHP-CORRELATION
+      description: Correlate generated output with the current official IHP SG13G2 DRC and LVS flows.
+      status: NOT_RUN
+      evidence: null
+
+  qualification_designs:
+    - id: QD-0001
+      name: 4B_ADDER
+      status: NOT_RUN
+      evidence_availability: NONE
+      reproducible_from_repository: false
+      physical_ir:
+        version: null
+        shape_count: null
+        orphan_routing_shapes_removed: null
+        artifact: null
+        digest: null
+      native_drc:
+        status: NOT_RUN
+        errors: null
+        warnings: null
+        artifact: null
+        digest: null
+      native_lvs:
+        status: NOT_RUN
+        artifact: null
+        digest: null
+      gdsii:
+        export_status: NOT_RUN
+        structural_validation_status: NOT_RUN
+        round_trip_status: NOT_RUN
+        external_tool_status: NOT_RUN
+        official_drc_status: NOT_RUN
+        official_drc_errors: null
+        official_lvs_status: NOT_RUN
+        official_extracted_mos_count: null
+        artifact: null
+        digest: null
+      lef:
+        export_status: NOT_RUN
+        external_parse_status: NOT_RUN
+        artifact: null
+        digest: null
+
+  coverage:
+    rules_documented:
+      - GEOMETRY.MANUFACTURING_GRID
+      - GEOMETRY.MIN_WIDTH
+      - GEOMETRY.MIN_AREA
+      - GEOMETRY.MIN_SPACING
+      - CUT.SIZE
+      - CUT.MIN_SPACING
+      - CUT.ENCLOSURE
+      - DEVICE.CONTACT_ENCLOSURE
+      - DEVICE.WELL_CONTAINMENT
+      - DEVICE.GATE_EXTENSION
+      - DENSITY.GLOBAL_MINIMUM
+      - DENSITY.GLOBAL_MAXIMUM
+      - DENSITY.WINDOW_MINIMUM
+      - DENSITY.WINDOW_MAXIMUM
+      - FILL.CIRCUIT_SPACING
+    rules_reference_matched: []
+    rules_manufactured: []
+    rules_silicon_verified: []
+    routing_layers_exercised: []
+    device_types_exercised: []
+    gds_layer_mapping:
+      status: DOCUMENTED
+      source: https://ihp-open-pdk-docs.readthedocs.io/en/latest/layout_rules/02_layer_table.html
+      substrate_preview_exported: false
+      diffusion_expands_to_implants: true
+      filler_datatype: 22
+
+  manufacturing:
+    tapeout_exercised: false
+    manufactured: false
+    silicon_verified: false
+    evidence: []
+
+  signature:
+    algorithm: Ed25519
+    status: UNSIGNED
+    key_id: null
+    signed_manifest: null
+    signature: null

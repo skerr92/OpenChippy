@@ -1,0 +1,6 @@
+* Extraction-only placeholder for the official GF180 LVS deck.
+* This is deliberately not an OpenChippy reference netlist and must never be
+* used as LVS pass evidence. It only lets the deck complete layout extraction
+* until MPV-5 provides a real transistor-level SPICE export.
+.subckt 4B_ADDER
+.ends 4B_ADDER

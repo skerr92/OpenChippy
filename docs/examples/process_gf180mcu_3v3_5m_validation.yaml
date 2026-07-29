@@ -1,0 +1,164 @@
+# OpenChippy process-validation record example
+#
+# This file records what OpenChippy has demonstrated for the exact process
+# rule deck named below. It is intentionally separate from the rule deck:
+# process requirements must not change when qualification evidence changes.
+#
+# Claims are deliberately conservative. This compatibility deck is not a
+# foundry signoff deck. The official GF180 deck has now been run against the
+# archived 4B_ADDER GDS: structural/round-trip checks pass, official DRC fails,
+# and official LVS extraction recognizes 144 MOS devices. Reference-netlist
+# comparison, tapeout, manufacturing, and silicon evidence remain NOT_RUN.
+
+process_validation:
+  format_version: 1
+
+  process:
+    process_id: gf180mcu-3v3-5m-compat
+    deck_revision: openchippy-compat-v1
+    deck_file: process_gf180mcu_3v3_5m_dr.yaml
+    deck_fingerprint: "fnv1a64:7e611063c57c34f0"
+    compatibility_profile: true
+    foundry_signoff_deck: false
+
+  record:
+    record_id: gf180mcu-3v3-5m-compat-validation-v1
+    revision: 1
+    generated_on: "2026-07-23"
+    overall_status: IMPLEMENTED
+    highest_supported_claim: UNIT_TESTED
+    notes:
+      - The deck loads through the current strict OpenChippy technology parser.
+      - EDU and GF180 compatibility NAND regressions pass native DRC.
+      - QD-0001 passes native DRC and its GDS, official report, extracted netlist, hashes, and invocation metadata are checked in.
+      - KLayout opens and canonically round-trips the supported GDS record set.
+      - Official GF180 DRC currently fails with 3839 violations; this is baseline evidence, not a signoff claim.
+      - Official extraction recognizes 144 MOS devices, but a true LVS comparison awaits reference SPICE/CDL export.
+
+  capabilities:
+    - id: CAP-PROCESS-DECK-LOAD
+      description: Parse and validate the versioned process rule deck.
+      status: UNIT_TESTED
+      evidence:
+        kind: RUST_TEST
+        reference: generated_nand_passes_all_example_process_decks
+
+    - id: CAP-NATIVE-PHYSICAL-DRC
+      description: Run OpenChippy native physical DRC on generated Physical IR.
+      status: UNIT_TESTED
+      evidence:
+        kind: RUST_TEST
+        reference: generated_nand_passes_all_example_process_decks
+
+    - id: CAP-GDSII-EXPORT
+      description: Export GDSII from Physical IR.
+      status: IMPLEMENTED
+      evidence:
+        kind: RUST_TEST
+        reference: exports_structurally_valid_gds_with_matching_geometry_counts
+
+    - id: CAP-GDSII-ROUND-TRIP
+      description: Export and re-import canonically equivalent GDSII.
+      status: EXTERNALLY_TESTED
+      evidence:
+        kind: KLAYOUT_ROUND_TRIP
+        reference: qualification/gf180/4B_ADDER/evidence.json
+
+    - id: CAP-NATIVE-LVS
+      description: Compare physical devices and connectivity with the logical design.
+      status: NOT_RUN
+      evidence: null
+
+    - id: CAP-LEF-EXPORT
+      description: Export LEF macros and verify them with an independent parser.
+      status: NOT_RUN
+      evidence: null
+
+    - id: CAP-EXTERNAL-GF180-CORRELATION
+      description: Pass the official selected-process DRC and LVS flow.
+      status: FAILED
+      evidence:
+        kind: OFFICIAL_GF180_BASELINE
+        reference: qualification/gf180/4B_ADDER/evidence.json
+
+  qualification_designs:
+    - id: QD-0001
+      name: 4B_ADDER
+      status: IMPLEMENTED
+      evidence_availability: REPOSITORY
+      reproducible_from_repository: false
+      physical_ir:
+        version: 5
+        shape_count: 3507
+        orphan_routing_shapes_removed: 558
+        artifact: null
+        digest: null
+      native_drc:
+        status: UNIT_TESTED
+        errors: 0
+        warnings: 0
+        artifact: null
+        digest: null
+      native_lvs:
+        status: NOT_RUN
+        artifact: null
+        digest: null
+      gdsii:
+        export_status: IMPLEMENTED
+        structural_validation_status: PASSED
+        round_trip_status: PASSED
+        external_tool_status: PASSED
+        official_drc_status: FAILED
+        official_drc_errors: 3839
+        official_lvs_status: EXTRACTION_ONLY
+        official_extracted_mos_count: 144
+        artifact: qualification/gf180/4B_ADDER/4B_ADDER.gds
+        digest: "sha256:da29b9b44f57f03e01b0b0a5386ec5ccf0143bf25e2b5a12f59bee635e937d21"
+      lef:
+        export_status: NOT_RUN
+        external_parse_status: NOT_RUN
+        artifact: null
+        digest: null
+
+  coverage:
+    rules_documented:
+      - GEOMETRY.MANUFACTURING_GRID
+      - GEOMETRY.MIN_WIDTH
+      - GEOMETRY.MIN_AREA
+      - GEOMETRY.MIN_SPACING
+      - CUT.SIZE
+      - CUT.MIN_SPACING
+      - CUT.ENCLOSURE
+      - DEVICE.CONTACT_ENCLOSURE
+      - DEVICE.WELL_CONTAINMENT
+      - DEVICE.GATE_EXTENSION
+    rules_reference_matched: []
+    rules_manufactured: []
+    rules_silicon_verified: []
+    routing_layers_exercised:
+      - metal1
+      - metal2
+      - metal3
+      - metal4
+      - metal5
+    device_types_exercised:
+      - nmos_3v3_compat
+      - pmos_3v3_compat
+    gds_layer_mapping:
+      status: UNIT_TESTED
+      source: https://gf180mcu-pdk.readthedocs.io/en/latest/physical_verification/design_manual/drm_04_1.html
+      substrate_preview_exported: false
+      diffusion_expands_to_implants: true
+
+  manufacturing:
+    tapeout_exercised: false
+    manufactured: false
+    silicon_verified: false
+    evidence: []
+
+  signature:
+    algorithm: Ed25519
+    status: UNSIGNED
+    key_id: null
+    signed_manifest: null
+    signature: null

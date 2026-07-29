@@ -1,0 +1,263 @@
+# OpenChippy GF180MCU compatibility technology profile
+#
+# Target:
+#   - GlobalFoundries GF180MCU open PDK
+#   - 3.3 V core devices
+#   - Five routable lower metal layers (Metal1-Metal5)
+#
+# IMPORTANT:
+#   This is an OpenChippy compatibility profile, not a complete foundry-qualified
+#   PDK or signoff rule deck. OpenChippy's format currently reduces many
+#   conditional GF180 rules to one conservative scalar per layer class.
+#   Final GDS must still pass the official GF180MCU DRC, LVS, antenna, density,
+#   latch-up, reliability, and tapeout checks.
+#
+# Primary geometric values are derived from the public GF180MCU design manual.
+# Device resistance/capacitance and routing parasitics below are preliminary
+# engineering estimates until OpenChippy can import characterized model data.
+
+technology:
+  format_version: 1
+  name: GF180MCU 3.3V 5M Compatibility
+  process_id: gf180mcu-3v3-5m-compat
+  deck_revision: openchippy-compat-v1
+  source: https://gf180mcu-pdk.readthedocs.io/en/latest/physical_verification/design_manual/Design_Manual.html
+  supply_voltage: 3.3
+  max_metal_layers: 5
+
+nmos:
+  # Preliminary nominal values for OpenChippy's educational timing model.
+  # Do not use these as SPICE or signoff characterization.
+  threshold_voltage: 0.65
+  nominal_on_resistance_ohms: 8000.0
+  reference_width_um: 1.0
+  reference_length_um: 0.28
+  gate_capacitance_ff_per_um: 2.2
+  diffusion_capacitance_ff_per_um: 1.2
+
+pmos:
+  # Preliminary nominal values for OpenChippy's educational timing model.
+  # Do not use these as SPICE or signoff characterization.
+  threshold_voltage: -0.75
+  nominal_on_resistance_ohms: 14000.0
+  reference_width_um: 1.0
+  reference_length_um: 0.28
+  gate_capacitance_ff_per_um: 2.4
+  diffusion_capacitance_ff_per_um: 1.4
+
+physical_parasitics:
+  format_version: 1
+
+  # Coarse placeholders for early RC estimation. Replace with values extracted
+  # from the selected GF180 interconnect stack and corner.
+  wire_capacitance_ff_per_um: 0.20
+  via_capacitance_ff: 0.08
+
+  layer_capacitance_ff_per_um:
+    metal1: 0.24
+    metal2: 0.22
+    metal3: 0.20
+    metal4: 0.18
+    metal5: 0.16
+
+  via_capacitance_overrides_ff:
+    via12: 0.090
+    via23: 0.085
+    via34: 0.080
+    via45: 0.075
+
+# GF180 layer/datatype assignments from the public drawn-layer table.
+# Diffusion emits both COMP and the polarity-specific implant. The synthetic
+# OpenChippy substrate canvas is intentionally omitted from manufacturing GDS.
+gds_layers:
+  format_version: 1
+  label_datatype: 10
+  layers:
+    substrate: []
+    pwell: [{ purpose: lvpwell, layer: 204, datatype: 0 }]
+    nwell: [{ purpose: nwell, layer: 21, datatype: 0 }]
+    ndiff:
+      - { purpose: comp, layer: 22, datatype: 0 }
+      - { purpose: nplus, layer: 32, datatype: 0, enclosure_um: 0.35 }
+    pdiff:
+      - { purpose: comp, layer: 22, datatype: 0 }
+      - { purpose: pplus, layer: 31, datatype: 0, enclosure_um: 0.35 }
+    poly: [{ purpose: poly2, layer: 30, datatype: 0 }]
+    contact: [{ purpose: contact, layer: 33, datatype: 0 }]
+    metal1: [{ purpose: metal1, layer: 34, datatype: 0 }]
+    via12: [{ purpose: via1, layer: 35, datatype: 0 }]
+    metal2: [{ purpose: metal2, layer: 36, datatype: 0 }]
+    via23: [{ purpose: via2, layer: 38, datatype: 0 }]
+    metal3: [{ purpose: metal3, layer: 42, datatype: 0 }]
+    via34: [{ purpose: via3, layer: 40, datatype: 0 }]
+    metal4: [{ purpose: metal4, layer: 46, datatype: 0 }]
+    via45: [{ purpose: via4, layer: 41, datatype: 0 }]
+    metal5: [{ purpose: metal5, layer: 81, datatype: 0 }]
+
+physical_rules:
+  format_version: 1
+  database_units_per_micron: 1000
+
+  # GF180 digital-library documentation specifies a 0.005 um layer grid.
+  manufacturing_grid_um: 0.005
+
+  # COMP/active, 3.3 V rules:
+  #   DF.1a width = 0.22 um
+  #   DF.3a spacing = 0.28 um
+  #   DF.9 area = 0.2025 um^2
+  diffusion:
+    min_width_um: 0.22
+    min_spacing_um: 0.28
+    min_area_um2: 0.2025
+
+  # Poly2, 3.3 V rules:
+  #   PL.1 interconnect width = 0.18 um
+  #   PL.3a spacing = 0.24 um
+  # OpenChippy requires a scalar minimum area; 0.0432 um^2 is a conservative
+  # width-times-spacing proxy, not an official GF180 Poly2 area rule.
+  poly:
+    min_width_um: 0.18
+    min_spacing_um: 0.24
+    min_area_um2: 0.0432
+
+  # Nwell rules, 3.3 V:
+  #   NW.1a width = 0.86 um
+  #   NW.2b different-potential spacing = 1.40 um
+  # The minimum area is a compatibility approximation.
+  well:
+    min_width_um: 0.86
+    min_spacing_um: 1.40
+    min_area_um2: 0.7396
+
+  # Default metal rule is Metal2-Metal5. Metal1 is overridden below.
+  #   Mn.1 width = 0.28 um for M2-M5
+  #   Mn.2a spacing = 0.28 um for M2-M5
+  #   Mn.3 minimum area = 0.1444 um^2
+  metal:
+    min_width_um: 0.28
+    min_spacing_um: 0.28
+    min_area_um2: 0.1444
+
+  # Contact:
+  #   CO.1 size = 0.22 um
+  #   CO.2a spacing = 0.25 um
+  #   CO.3/CO.4 Poly2 or COMP enclosure = 0.07 um
+  contact:
+    size_um: 0.22
+    min_spacing_um: 0.25
+    enclosure_um: 0.07
+
+  # Via1-Via5:
+  #   Vn.1 size = 0.26 um
+  #   Vn.2a spacing = 0.26 um
+  # Use 0.06 um enclosure to avoid relying on conditional zero/0.01 um
+  # end-of-line exceptions.
+  via:
+    size_um: 0.26
+    min_spacing_um: 0.26
+    enclosure_um: 0.06
+
+  # PL.4 Poly2 extension beyond COMP.
+  gate_extension_um: 0.22
+
+  # DF.4c Nwell overlap of PCOMP for 3.3 V devices.
+  well_enclosure_um: 0.43
+  max_tap_distance_um: 20.0
+
+  layer_overrides:
+    metal1:
+      min_width_um: 0.23
+      min_spacing_um: 0.23
+      min_area_um2: 0.1444
+
+    metal2:
+      min_width_um: 0.28
+      min_spacing_um: 0.28
+      min_area_um2: 0.1444
+
+    metal3:
+      min_width_um: 0.28
+      min_spacing_um: 0.28
+      min_area_um2: 0.1444
+
+    metal4:
+      min_width_um: 0.28
+      min_spacing_um: 0.28
+      min_area_um2: 0.1444
+
+    metal5:
+      min_width_um: 0.44
+      min_spacing_um: 0.46
+      min_area_um2: 0.5625
+
+  via_overrides:
+    via12:
+      size_um: 0.26
+      min_spacing_um: 0.26
+      enclosure_um: 0.06
+    via23:
+      size_um: 0.26
+      min_spacing_um: 0.26
+      enclosure_um: 0.06
+    via34:
+      size_um: 0.26
+      min_spacing_um: 0.26
+      enclosure_um: 0.06
+    via45:
+      size_um: 0.26
+      min_spacing_um: 0.26
+      enclosure_um: 0.06
+
+physical_planning:
+  # Based on the public GF180 9-track 5 V library's 0.56 um pin grid and
+  # 5.04 um cell height. These values are useful defaults but do not force
+  # OpenChippy cells to match that library.
+  placement_site_width_um: 0.56
+  row_height_um: 5.04
+
+  target_device_density: 0.60
+  target_routing_utilization: 0.70
+  floorplan_growth_factor: 0.10
+  max_floorplan_growth_passes: 4
+
+  global_route_max_iterations: 40
+  global_route_stall_iterations: 4
+  detailed_route_max_iterations: 15
+
+  # Pitches are conservative OpenChippy planning pitches, not official LEF
+  # tracks. Each is at least minimum width + minimum spacing.
+  routing_layers:
+    metal1:
+      pitch_um: 0.56
+      offset_um: 0.28
+      preferred_direction: horizontal
+      capacity_adjustment: 0.65
+      reserved_for_power: true
+
+    metal2:
+      pitch_um: 0.56
+      offset_um: 0.28
+      preferred_direction: vertical
+      capacity_adjustment: 0.70
+      reserved_for_power: false
+
+    metal3:
+      pitch_um: 0.56
+      offset_um: 0.28
+      preferred_direction: horizontal
+      capacity_adjustment: 0.70
+      reserved_for_power: false
+
+    metal4:
+      pitch_um: 0.56
+      offset_um: 0.28
+      preferred_direction: vertical
+      capacity_adjustment: 0.70
+      reserved_for_power: false
+
+    metal5:
+      pitch_um: 0.56
+      offset_um: 0.28
+      preferred_direction: horizontal
+      capacity_adjustment: 0.70
+      reserved_for_power: false

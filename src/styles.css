@@ -326,14 +326,22 @@ button.logic-pill { cursor: pointer; }
 .physical-build-overlay { position: absolute; inset: 0; z-index: 4; display: grid; place-items: center; background: rgba(5, 13, 10, .82); backdrop-filter: blur(3px); }
 .physical-build-card { display: flex; width: min(420px, 78%); padding: 28px; flex-direction: column; gap: 12px; border: 1px solid #376555; border-radius: 8px; background: #0b1814; box-shadow: 0 18px 60px #0009; color: #8aa097; font: 10px ui-monospace, monospace; }
 .physical-build-card strong { color: #d9ebe4; font-size: 18px; }
-.physical-build-card ol { display: flex; margin: 0; padding-left: 20px; flex-direction: column; gap: 7px; }
+.physical-build-card ol { display: flex; margin: 0; padding: 0; flex-direction: column; gap: 7px; list-style: none; }
 .physical-build-card small { color: #58736a; }
 .physical-build-card.failed { border-color: #824944; }
 .physical-build-card.failed strong { color: #ff847a; }
 .physical-build-card button { align-self: flex-start; padding: 7px 14px; border: 1px solid #477565; border-radius: 4px; background: #152a23; color: #a9d6c7; cursor: pointer; }
 .physical-build-progress { height: 6px; overflow: hidden; border-radius: 4px; background: #14251f; }
-.physical-build-progress i { display: block; width: 38%; height: 100%; border-radius: inherit; background: #62d7af; animation: physical-build-progress 1.3s ease-in-out infinite alternate; }
-@keyframes physical-build-progress { to { transform: translateX(165%); } }
+.physical-build-progress i { display: block; height: 100%; border-radius: inherit; background: #62d7af; transition: width .25s ease; }
+.physical-build-timing { display: flex; justify-content: space-between; gap: 18px; color: #698078; }
+.physical-build-timing span { display: flex; flex-direction: column; gap: 3px; }
+.physical-build-timing b { color: #c5d9d1; font-weight: 600; }
+.physical-build-checklist li { display: flex; align-items: center; gap: 9px; color: #597069; }
+.physical-build-checklist li i { width: 12px; color: #476159; font-style: normal; text-align: center; }
+.physical-build-checklist li.active { color: #c4d8d0; }
+.physical-build-checklist li.active i { color: #e6b85d; }
+.physical-build-checklist li.complete { color: #87ae9f; }
+.physical-build-checklist li.complete i { color: #62d7af; }
 .physical-build-statistics { display: flex; margin-top: 7px; padding: 8px; flex-direction: column; gap: 3px; border: 1px solid #294139; border-radius: 4px; background: #091411; color: #778d85; font: 7px ui-monospace, monospace; }
 .physical-build-statistics span { display: flex; justify-content: space-between; }
 .physical-build-statistics b { color: #aec0b9; }

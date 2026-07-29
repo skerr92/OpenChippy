@@ -27,6 +27,10 @@ simulator, or production place-and-route software.
   signals, and user-defined binary or hexadecimal buses.
 - Load a technology YAML file or use the included five-metal educational process. See
   [the example technology file](docs/examples/openchippy-edu-5m.yaml).
+- Physical IR snapshots include a packaged 24-cell library for the educational
+  process and GF180MCU compatibility profile. It covers common logic gates,
+  inverter/buffer, transmission gate, latches and flip-flops, multiplexers, and
+  decoders. GF180 output still requires official foundry DRC/LVS.
 - Generate a compact physical layout, inspect process layers in 3D, run physical design
   checks, isolate violations, and export a report.
 - Import a useful, deliberately limited subset of Verilog, inspect its logical structure,
@@ -45,8 +49,32 @@ OpenChippy refuses to display the stale layout. A matching cache lets the 3D vie
 without repeating placement and routing. Existing standalone `.chippy` files remain
 supported.
 
-`.chippy_gds` is currently OpenChippy's versioned physical-layout format. Despite the
-name, it is not yet a foundry-ready binary GDSII stream.
+`.chippy_gds` is OpenChippy's versioned physical-layout cache. The 3D workspace
+can separately export an initial binary `.gds` stream and validates its record
+structure and geometry counts before saving. GDS layer/datatype assignments
+come from the active process deck; GF180 diffusion expands into COMP plus its
+polarity-specific implant and excludes the synthetic substrate preview. The
+exporter is still early: complete reusable hierarchy, external KLayout
+validation, and foundry signoff remain manufacturing-roadmap work. Physical
+blocks are now emitted as referenced GDS structures, although shared canonical
+cells and non-zero transforms are still under development.
+Physical power routing is distributed across occupied placement rows instead
+of being forced through a single VDD/GND pair; devices use the nearest matching
+rail, leaving upper routing capacity available for signal closure.
+For designs built from reusable blocks, the physical planner is gaining a
+standard-cell path. Its staging implementation gives identical blocks
+canonical device-relative placement, typed rectangular keepouts, and
+next-hop-aware ordering. It is not yet enabled in production generation while
+pre-routed local geometry and explicit boundary-pin templates are completed.
+Nested blocks are resolved from the bottom up: a full adder built from reusable
+NANDs identifies each NAND as the physical cell, while the full-adder boundary
+remains available for higher-level floorplanning.
+
+The 3D workspace can also export an early LEF macro view containing the
+Physical IR dimensions, input/output/power pin rectangles, symmetry, and metal
+obstructions. Process-derived placement-site dimensions are included, and the
+GF180 four-bit-adder example parses in KLayout with matching bounds and all
+physical pin labels. Broader tool qualification remains in progress.
 
 ## RTL support and limitations
 
