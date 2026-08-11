@@ -1,7 +1,7 @@
 # CondensedContext
 <!-- CCF/1 -->
 @legend c=confidence; lvl=compression-level; fid=fidelity; imp=importance; vol=volatility; cost=expansion-cost; lv=last-verified; st=freshness; aliases from @path.
-@fresh id=FRESH-001 lv=2b9a6cad6f0dcf30432dad86e7c2809865a682a1 head=2b9a6cad6f0dcf30432dad86e7c2809865a682a1 gen=2026-08-11 st=partial verify=CC,CCF
+@fresh id=FRESH-001 lv=34d386a9396635b6569f0e372bbd23e17027d521 head=34d386a9396635b6569f0e372bbd23e17027d521 gen=2026-08-11 st=partial verify=CC,CCF
 @path CC=CondensedContext.md
 @path CCF=CondensedContext.CCF1
 @path ROAD=docs/roadmap.md
@@ -35,8 +35,9 @@
 @path GFVAL=docs/examples/process_gf180mcu_3v3_5m_validation.yaml
 @path GDS=src-tauri/src/gdsii.rs
 @path CSS=src/styles.css
-@focus id=ACTIVE-001 c=H :: PhysicalIRv45 preserves terminal identity and cell-bounded FEOL sharing, removes topology-internal access stacks, restores+audits per-material GF180 dummy fill, and repairs foundry-width landing necks; exact legacy GF1804B native DRC/connectivity/LVS+official geometry/process DRC clean; next=sliding-window density quality with timing-aware keepouts.
-@handoff id=HANDOFF-001 c=H :: state=PhysicalIRv38-v45+README/manufacturing docs committed at 2b9a6ca; context tracking update pending; next=commit context then sliding-window density; val=2026-08-11 npm-build-pass(bundle-warning)+rust184/184-pass via direct stable cargo; empty doctest phase hung/stopped; historical-v45 native-clean+deterministic-GDS+official-DBU-marker-only.
+@focus id=ACTIVE-001 c=H :: PhysicalIRv46 adds compatible global/window min-preferred-max density contracts, boolean-union measurement, half-window edge-anchored fill closure, maximum admission, and persisted audit/viewer reports; generic circuit/device keepouts enforced; next=commit+exact GF1804B requalification,then process-owned protected-net spacing classes.
+@handoff id=HANDOFF-001 c=H :: state=v38-v45=2b9a6ca,context=0afe816,v46-density=34d386a; context tracking pending; next=commit context then exact GF1804B native/deterministic/official correlation; val=2026-08-11 rust185/185+frontend-build+fmt+diff-check pass; focused density zero-under/over+max+determinism pass.
+@chg date=2026-08-11 tags=physical-ir-v46,density,sliding-window files=PHY,TECH,LIB,PDRC,PHVIEW,TYPES,GFVAL,MROAD,README,CC,CCF commit=34d386a remote=not-confirmed :: add process-configurable global/window density bounds, preferred-target closure, boolean-union measurement, persisted reports, viewer/audit exposure, and linked GF180 fingerprint evidence.
 @chg date=2026-08-11 tags=physical-ir-v38-v45,baseline,docs files=README,MROAD,GDS,LIB,PDRC,PHY,PPLACE,TECH,PHVIEW commit=2b9a6ca remote=not-confirmed :: reviewed and committed terminal-preserving routing, topology-aware DRC, GF180 manufacturing migration/fill visibility, foundry-width neck repair, and current public qualification wording.
 @fact id=PRODUCT-001 c=H :: OpenChippy=education-first desktop VLSI studio; Rust owns authoritative models/services; React/Three.js own interaction and visualization.
 @constraint id=CONSTRAINT-001 c=H :: preserve user changes; source of truth=code; avoid later-milestone expansion without user scope.
