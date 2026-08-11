@@ -1755,6 +1755,7 @@ mod tests {
                 shapes_outside_floorplan: 0,
                 shapes_outside_tapeout: 0,
             },
+            density: Default::default(),
             bounds: PhysicalBounds {
                 min_x: -2.0,
                 min_y: -2.0,

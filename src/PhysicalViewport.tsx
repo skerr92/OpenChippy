@@ -444,6 +444,14 @@ export default function PhysicalViewport({
             <span key={`fill-${layer}`}>{layer} fill · {count}</span>
           ))}
           {layout && dummyFillCount === 0 && <strong>No dummy fill in this Physical IR</strong>}
+          {layout?.density.layers.map((density) => (
+            <span key={`density-${density.material}`}>
+              {density.material} density · global {(density.achievedGlobalDensity * 100).toFixed(1)}%
+              {` · windows ${(density.achievedMinimumWindowDensity * 100).toFixed(1)}–${(density.achievedMaximumWindowDensity * 100).toFixed(1)}%`}
+              {density.underfilledWindowCount > 0 ? ` · ${density.underfilledWindowCount} under` : ""}
+              {density.overfilledWindowCount > 0 ? ` · ${density.overfilledWindowCount} over` : ""}
+            </span>
+          ))}
           <span>{layout ? `deck ${layout.technologyFingerprint}` : ""}</span>
           {layout && (() => {
             const candidate = layout.planning.candidates[layout.planning.selectedCandidate];

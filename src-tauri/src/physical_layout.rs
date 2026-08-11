@@ -16,11 +16,10 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use uuid::Uuid;
 
-// Version 40 makes standard-cell identity a hard sharing boundary. Same-net
-// terminals in separate instances may meet only through routed conductors;
-// shared diffusion/contact and poly straps are synthesized solely inside one
-// explicit leaf cell. Version 39's independent route anchors remain active.
-pub const CURRENT_PHYSICAL_IR_VERSION: u32 = 45;
+// Version 46 persists process density coverage measured globally and over
+// sliding windows. Version 45's terminal-preserving manufacturing baseline
+// remains otherwise unchanged.
+pub const CURRENT_PHYSICAL_IR_VERSION: u32 = 46;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +38,8 @@ pub struct PhysicalLayoutIr {
     pub detailed_routing: DetailedRoutingReport,
     pub timing: PhysicalTimingReport,
     pub tapeout: PhysicalTapeoutReport,
+    #[serde(default)]
+    pub density: PhysicalDensityReport,
     pub bounds: PhysicalBounds,
     pub shapes: Vec<PhysicalShape>,
     #[serde(default)]
@@ -49,6 +50,32 @@ pub struct PhysicalLayoutIr {
     pub physical_blocks: Vec<PhysicalBlockImplementation>,
     #[serde(default)]
     pub standard_cell_library: LibrarySummary,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalDensityReport {
+    pub layers: Vec<PhysicalDensityLayerReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalDensityLayerReport {
+    pub material: String,
+    pub preferred_density: f64,
+    pub minimum_global_density: f64,
+    pub maximum_global_density: Option<f64>,
+    pub achieved_global_density: f64,
+    pub minimum_window_density: f64,
+    pub maximum_window_density: Option<f64>,
+    pub achieved_minimum_window_density: f64,
+    pub achieved_maximum_window_density: f64,
+    pub window_width_um: f64,
+    pub window_height_um: f64,
+    pub window_count: usize,
+    pub underfilled_window_count: usize,
+    pub overfilled_window_count: usize,
+    pub dummy_shape_count: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -5481,9 +5508,8 @@ fn fill_same_net_metal_notches_once(
                     let landing_min_x = landing.x - landing.width / 2.0;
                     let landing_max_x = landing.x + landing.width / 2.0;
                     if landing.width + EPSILON >= rule.min_width_um {
-                        let shared_center = (left_min_x.max(right_min_x)
-                            + left_max_x.min(right_max_x))
-                            / 2.0;
+                        let shared_center =
+                            (left_min_x.max(right_min_x) + left_max_x.min(right_max_x)) / 2.0;
                         let min_x = (shared_center - rule.min_width_um / 2.0)
                             .clamp(landing_min_x, landing_max_x - rule.min_width_um);
                         fill_bounds.push((
@@ -5510,9 +5536,8 @@ fn fill_same_net_metal_notches_once(
                     let landing_min_y = landing.y - landing.height / 2.0;
                     let landing_max_y = landing.y + landing.height / 2.0;
                     if landing.height + EPSILON >= rule.min_width_um {
-                        let shared_center = (left_min_y.max(right_min_y)
-                            + left_max_y.min(right_max_y))
-                            / 2.0;
+                        let shared_center =
+                            (left_min_y.max(right_min_y) + left_max_y.min(right_max_y)) / 2.0;
                         let min_y = (shared_center - rule.min_width_um / 2.0)
                             .clamp(landing_min_y, landing_max_y - rule.min_width_um);
                         fill_bounds.push((
@@ -6207,20 +6232,139 @@ fn density_fill_obstacle(
     relevant && rectangles_within(candidate, shape, rule.circuit_spacing_um)
 }
 
+fn density_material_shape(material: &str, layer: PhysicalLayer, shape: &PhysicalShape) -> bool {
+    match material {
+        "active" => matches!(shape.layer, PhysicalLayer::Ndiff | PhysicalLayer::Pdiff),
+        _ => shape.layer == layer,
+    }
+}
+
+fn rectangle_union_area(
+    shapes: &[PhysicalShape],
+    material: &str,
+    layer: PhysicalLayer,
+    bounds: &PhysicalBounds,
+) -> f64 {
+    let rectangles = shapes
+        .iter()
+        .filter(|shape| density_material_shape(material, layer, shape))
+        .filter_map(|shape| {
+            let min_x = (shape.x - shape.width / 2.0).max(bounds.min_x);
+            let max_x = (shape.x + shape.width / 2.0).min(bounds.max_x);
+            let min_y = (shape.y - shape.height / 2.0).max(bounds.min_y);
+            let max_y = (shape.y + shape.height / 2.0).min(bounds.max_y);
+            (max_x > min_x && max_y > min_y).then_some((min_x, min_y, max_x, max_y))
+        })
+        .collect::<Vec<_>>();
+    let mut xs = rectangles
+        .iter()
+        .flat_map(|rectangle| [rectangle.0, rectangle.2])
+        .collect::<Vec<_>>();
+    xs.sort_by(f64::total_cmp);
+    xs.dedup_by(|left, right| (*left - *right).abs() <= 1e-9);
+    xs.windows(2)
+        .map(|x| {
+            let width = x[1] - x[0];
+            if width <= 0.0 {
+                return 0.0;
+            }
+            let mut intervals = rectangles
+                .iter()
+                .filter(|rectangle| rectangle.0 < x[1] && rectangle.2 > x[0])
+                .map(|rectangle| (rectangle.1, rectangle.3))
+                .collect::<Vec<_>>();
+            intervals.sort_by(|left, right| left.0.total_cmp(&right.0));
+            let mut covered_y = 0.0;
+            let mut merged: Option<(f64, f64)> = None;
+            for (start, end) in intervals {
+                match merged {
+                    Some((prior_start, prior_end)) if start <= prior_end + 1e-9 => {
+                        merged = Some((prior_start, prior_end.max(end)));
+                    }
+                    Some((prior_start, prior_end)) => {
+                        covered_y += prior_end - prior_start;
+                        merged = Some((start, end));
+                    }
+                    None => merged = Some((start, end)),
+                }
+            }
+            if let Some((start, end)) = merged {
+                covered_y += end - start;
+            }
+            width * covered_y
+        })
+        .sum()
+}
+
+fn sliding_density_windows(
+    bounds: &PhysicalBounds,
+    requested_width: Option<f64>,
+    requested_height: Option<f64>,
+) -> Vec<PhysicalBounds> {
+    let design_width = bounds.max_x - bounds.min_x;
+    let design_height = bounds.max_y - bounds.min_y;
+    let width = requested_width.unwrap_or(design_width).min(design_width);
+    let height = requested_height.unwrap_or(design_height).min(design_height);
+    let axis_origins = |minimum: f64, maximum: f64, extent: f64| {
+        let mut origins = vec![minimum];
+        let last = maximum - extent;
+        let step = extent / 2.0;
+        let mut cursor = minimum + step;
+        while cursor < last - 1e-9 {
+            origins.push(cursor);
+            cursor += step;
+        }
+        if last > minimum + 1e-9 {
+            origins.push(last);
+        }
+        origins
+    };
+    let xs = axis_origins(bounds.min_x, bounds.max_x, width);
+    let ys = axis_origins(bounds.min_y, bounds.max_y, height);
+    ys.into_iter()
+        .flat_map(|min_y| {
+            xs.iter().copied().map(move |min_x| PhysicalBounds {
+                min_x,
+                min_y,
+                max_x: min_x + width,
+                max_y: min_y + height,
+            })
+        })
+        .collect()
+}
+
+fn overlap_area(shape: &PhysicalShape, bounds: &PhysicalBounds) -> f64 {
+    let width = (shape.x + shape.width / 2.0).min(bounds.max_x)
+        - (shape.x - shape.width / 2.0).max(bounds.min_x);
+    let height = (shape.y + shape.height / 2.0).min(bounds.max_y)
+        - (shape.y - shape.height / 2.0).max(bounds.min_y);
+    width.max(0.0) * height.max(0.0)
+}
+
 /// Add deterministic process-owned density geometry only after electrical
-/// routing, cleanup, and final floorplan expansion. These shapes deliberately
-/// carry no net or component identity and therefore cannot change extraction.
+/// routing, cleanup, and final floorplan expansion. Existing circuit geometry
+/// is measured as a boolean union; legal fill then targets the weakest sliding
+/// windows without exceeding configured global or local maxima.
 fn add_process_density_fill(
     shapes: &mut Vec<PhysicalShape>,
     bounds: &PhysicalBounds,
     technology: &Technology,
-) {
+) -> PhysicalDensityReport {
     let rules = &technology.physical_rules.density_fill;
     if rules.layers.is_empty() {
-        return;
+        return PhysicalDensityReport::default();
     }
     let grid = technology.physical_rules.manufacturing_grid_um;
     let area = (bounds.max_x - bounds.min_x) * (bounds.max_y - bounds.min_y);
+    let windows = sliding_density_windows(
+        bounds,
+        rules.evaluation_window_width_um,
+        rules.evaluation_window_height_um,
+    );
+    let window_area = windows.first().map_or(area, |window| {
+        (window.max_x - window.min_x) * (window.max_y - window.min_y)
+    });
+    let mut report = PhysicalDensityReport::default();
     let mut ordered = rules.layers.keys().cloned().collect::<Vec<_>>();
     ordered.sort_by_key(|name| match name.as_str() {
         "active" => (0, 0),
@@ -6238,8 +6382,15 @@ fn add_process_density_fill(
         let Some(layer) = density_fill_layer(&name, technology) else {
             continue;
         };
-        let target_area = area * rule.target_density;
-        let mut emitted_area = 0.0;
+        let minimum_global = rule.minimum_global_density.unwrap_or(rule.target_density);
+        let maximum_global = rule.maximum_global_density.or(rule.maximum_density);
+        let minimum_window = rule.minimum_window_density.unwrap_or(minimum_global);
+        let maximum_window = rule.maximum_window_density.or(maximum_global);
+        let mut covered_global = rectangle_union_area(shapes, &name, layer, bounds);
+        let mut covered_windows = windows
+            .iter()
+            .map(|window| rectangle_union_area(shapes, &name, layer, window))
+            .collect::<Vec<_>>();
         let mut candidates = Vec::new();
         if rule.support_layer.as_deref() == Some("active") {
             for support in shapes.iter().filter(|shape| {
@@ -6298,7 +6449,11 @@ fn add_process_density_fill(
             // density target. Every accepted support tile must receive its
             // covering material even after the supported layer reaches its
             // minimum density.
-            if rule.support_layer.is_none() && emitted_area + 1e-9 >= target_area {
+            let global_at_preferred = covered_global + 1e-9 >= area * rule.target_density;
+            let windows_at_preferred = covered_windows
+                .iter()
+                .all(|covered| *covered + 1e-9 >= window_area * rule.target_density);
+            if rule.support_layer.is_none() && global_at_preferred && windows_at_preferred {
                 break;
             }
             let candidate = PhysicalShape {
@@ -6317,10 +6472,92 @@ fn add_process_density_fill(
             {
                 continue;
             }
-            emitted_area += candidate.width * candidate.height;
+            let candidate_area = candidate.width * candidate.height;
+            if maximum_global
+                .is_some_and(|maximum| covered_global + candidate_area > area * maximum + 1e-9)
+            {
+                continue;
+            }
+            let overlaps = windows
+                .iter()
+                .map(|window| overlap_area(&candidate, window))
+                .collect::<Vec<_>>();
+            if maximum_window.is_some_and(|maximum| {
+                covered_windows
+                    .iter()
+                    .zip(&overlaps)
+                    .any(|(covered, overlap)| covered + overlap > window_area * maximum + 1e-9)
+            }) {
+                continue;
+            }
+            let improves_preferred_window =
+                covered_windows
+                    .iter()
+                    .zip(&overlaps)
+                    .any(|(covered, overlap)| {
+                        *overlap > 0.0 && *covered + 1e-9 < window_area * rule.target_density
+                    });
+            if rule.support_layer.is_none() && global_at_preferred && !improves_preferred_window {
+                continue;
+            }
+            covered_global += candidate_area;
+            for (covered, overlap) in covered_windows.iter_mut().zip(overlaps) {
+                *covered += overlap;
+            }
             shapes.push(candidate);
         }
+        let achieved_global_density = covered_global / area;
+        let window_densities = covered_windows
+            .iter()
+            .map(|covered| covered / window_area)
+            .collect::<Vec<_>>();
+        let achieved_minimum_window_density = window_densities
+            .iter()
+            .copied()
+            .min_by(f64::total_cmp)
+            .unwrap_or(achieved_global_density);
+        let achieved_maximum_window_density = window_densities
+            .iter()
+            .copied()
+            .max_by(f64::total_cmp)
+            .unwrap_or(achieved_global_density);
+        report.layers.push(PhysicalDensityLayerReport {
+            material: name.clone(),
+            preferred_density: rule.target_density,
+            minimum_global_density: minimum_global,
+            maximum_global_density: maximum_global,
+            achieved_global_density,
+            minimum_window_density: minimum_window,
+            maximum_window_density: maximum_window,
+            achieved_minimum_window_density,
+            achieved_maximum_window_density,
+            window_width_um: windows
+                .first()
+                .map_or(0.0, |window| window.max_x - window.min_x),
+            window_height_um: windows
+                .first()
+                .map_or(0.0, |window| window.max_y - window.min_y),
+            window_count: windows.len(),
+            underfilled_window_count: window_densities
+                .iter()
+                .filter(|density| **density + 1e-9 < minimum_window)
+                .count(),
+            overfilled_window_count: maximum_window.map_or(0, |maximum| {
+                window_densities
+                    .iter()
+                    .filter(|density| **density > maximum + 1e-9)
+                    .count()
+            }),
+            dummy_shape_count: shapes
+                .iter()
+                .filter(|shape| {
+                    shape.purpose == PhysicalShapePurpose::DummyFill
+                        && density_material_shape(&name, layer, shape)
+                })
+                .count(),
+        });
     }
+    report
 }
 
 fn expand_floorplan_to_geometry(
@@ -7456,7 +7693,7 @@ fn normalize_with_progress(
         &project.technology.physical_rules,
     );
     fill_same_net_metal_notches(&mut shapes, &project.technology.physical_rules);
-    add_process_density_fill(&mut shapes, &bounds, &project.technology);
+    let density = add_process_density_fill(&mut shapes, &bounds, &project.technology);
     let density_fill_counts = process_density_fill_counts(&shapes, &project.technology);
     let missing_density_layers = density_fill_counts
         .iter()
@@ -7487,6 +7724,7 @@ fn normalize_with_progress(
         detailed_routing,
         timing,
         tapeout,
+        density,
         bounds,
         shapes,
         row_topology,
@@ -7574,10 +7812,34 @@ mod tests {
 
     #[test]
     fn process_density_fill_is_deterministic_and_electrically_inert() {
-        let technology = Technology::from_yaml(include_str!(
+        let mut technology = Technology::from_yaml(include_str!(
             "../../docs/examples/process_gf180mcu_3v3_5m_dr.yaml"
         ))
         .unwrap();
+        technology
+            .physical_rules
+            .density_fill
+            .layers
+            .retain(|name, _| name == "metal1");
+        technology
+            .physical_rules
+            .density_fill
+            .evaluation_window_width_um = Some(10.0);
+        technology
+            .physical_rules
+            .density_fill
+            .evaluation_window_height_um = Some(10.0);
+        let metal = technology
+            .physical_rules
+            .density_fill
+            .layers
+            .get_mut("metal1")
+            .unwrap();
+        metal.target_density = 0.20;
+        metal.minimum_global_density = Some(0.10);
+        metal.maximum_global_density = Some(0.40);
+        metal.minimum_window_density = Some(0.10);
+        metal.maximum_window_density = Some(0.40);
         let bounds = PhysicalBounds {
             min_x: 0.0,
             min_y: 0.0,
@@ -7596,9 +7858,20 @@ mod tests {
         };
         let mut first = vec![electrical.clone()];
         let mut second = vec![electrical];
-        add_process_density_fill(&mut first, &bounds, &technology);
-        add_process_density_fill(&mut second, &bounds, &technology);
+        let first_report = add_process_density_fill(&mut first, &bounds, &technology);
+        let second_report = add_process_density_fill(&mut second, &bounds, &technology);
         assert_eq!(first, second);
+        assert_eq!(first_report, second_report);
+        let density = &first_report.layers[0];
+        assert!(density.window_count > 1);
+        assert!(density.achieved_global_density >= density.minimum_global_density);
+        assert_eq!(density.underfilled_window_count, 0);
+        assert_eq!(density.overfilled_window_count, 0);
+        assert!(density.achieved_global_density <= density.maximum_global_density.unwrap() + 1e-9);
+        assert!(
+            density.achieved_maximum_window_density
+                <= density.maximum_window_density.unwrap() + 1e-9
+        );
         let dummy = first
             .iter()
             .filter(|shape| shape.purpose == PhysicalShapePurpose::DummyFill)
@@ -7609,7 +7882,7 @@ mod tests {
             .all(|shape| shape.net.is_none() && shape.component_id.is_none()));
         assert!(dummy
             .iter()
-            .any(|shape| shape.layer == PhysicalLayer::Metal(6)));
+            .all(|shape| shape.layer == PhysicalLayer::Metal(1)));
         assert_eq!(
             route_quality(&first, technology.physical_rules.manufacturing_grid_um)
                 .routed_shape_area_um2,

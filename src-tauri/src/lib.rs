@@ -85,6 +85,7 @@ pub struct PhysicalAuditSummary {
     pub shape_count: usize,
     pub shape_purposes: BTreeMap<String, usize>,
     pub dummy_fill_by_layer: BTreeMap<String, usize>,
+    pub density_layers: Vec<physical_layout::PhysicalDensityLayerReport>,
     pub row_count: usize,
     pub active_island_count: usize,
     pub shared_active_island_count: usize,
@@ -210,6 +211,7 @@ pub fn audit_physical_sources(
         shape_count: layout.shapes.len(),
         shape_purposes,
         dummy_fill_by_layer,
+        density_layers: layout.density.layers.clone(),
         row_count: layout.row_topology.len(),
         active_island_count: layout
             .row_topology

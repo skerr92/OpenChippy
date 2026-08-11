@@ -148,15 +148,29 @@ pub struct PhysicalRuleDeck {
 pub struct DensityFillRuleDeck {
     pub format_version: u32,
     #[serde(default)]
+    pub evaluation_window_width_um: Option<f64>,
+    #[serde(default)]
+    pub evaluation_window_height_um: Option<f64>,
+    #[serde(default)]
     pub layers: BTreeMap<String, DensityFillLayerRule>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct DensityFillLayerRule {
+    /// Preferred post-fill density. Existing v1 decks used this as their only
+    /// target, so it remains the backward-compatible preferred value.
     pub target_density: f64,
     #[serde(default)]
     pub maximum_density: Option<f64>,
+    #[serde(default)]
+    pub minimum_global_density: Option<f64>,
+    #[serde(default)]
+    pub maximum_global_density: Option<f64>,
+    #[serde(default)]
+    pub minimum_window_density: Option<f64>,
+    #[serde(default)]
+    pub maximum_window_density: Option<f64>,
     pub tile_width_um: f64,
     pub tile_height_um: f64,
     /// Optional smaller square used only after the primary lattice cannot
@@ -952,6 +966,35 @@ fn validate_density_fill(
             ),
         });
     }
+    match (
+        fill.evaluation_window_width_um,
+        fill.evaluation_window_height_um,
+    ) {
+        (Some(width), Some(height)) => {
+            for (field, value) in [
+                ("evaluation_window_width_um", width),
+                ("evaluation_window_height_um", height),
+            ] {
+                validate_positive(
+                    &format!("physical_rules.density_fill.{field}"),
+                    value,
+                    diagnostics,
+                );
+                validate_on_grid(
+                    &format!("physical_rules.density_fill.{field}"),
+                    value,
+                    grid,
+                    diagnostics,
+                );
+            }
+        }
+        (None, None) => {}
+        _ => diagnostics.push(TechnologyDiagnostic {
+            code: "incomplete_density_window",
+            field: "physical_rules.density_fill".into(),
+            message: "Density evaluation windows require both width and height.".into(),
+        }),
+    }
     let valid_name = |name: &str| {
         matches!(name, "active" | "poly" | "top_metal")
             || name
@@ -987,6 +1030,48 @@ fn validate_density_fill(
                     message: "Maximum density must exceed the target and be at most one.".into(),
                 });
             }
+        }
+        let minimum_global = rule.minimum_global_density.unwrap_or(rule.target_density);
+        let maximum_global = rule.maximum_global_density.or(rule.maximum_density);
+        let minimum_window = rule.minimum_window_density.unwrap_or(minimum_global);
+        let maximum_window = rule.maximum_window_density.or(maximum_global);
+        for (field, value) in [
+            ("minimum_global_density", minimum_global),
+            ("minimum_window_density", minimum_window),
+        ] {
+            if !value.is_finite() || value <= 0.0 || value > rule.target_density {
+                diagnostics.push(TechnologyDiagnostic {
+                    code: "invalid_density_minimum",
+                    field: format!("{prefix}.{field}"),
+                    message: "Density minimum must be finite, positive, and no greater than the preferred target.".into(),
+                });
+            }
+        }
+        for (field, maximum, minimum) in [
+            ("maximum_global_density", maximum_global, minimum_global),
+            ("maximum_window_density", maximum_window, minimum_window),
+        ] {
+            if maximum.is_some_and(|value| {
+                !value.is_finite() || value < rule.target_density || value <= minimum || value > 1.0
+            }) {
+                diagnostics.push(TechnologyDiagnostic {
+                    code: "invalid_density_maximum",
+                    field: format!("{prefix}.{field}"),
+                    message: "Density maximum must be finite, at least the preferred target, greater than the minimum, and at most one.".into(),
+                });
+            }
+        }
+        if (rule.minimum_window_density.is_some() || rule.maximum_window_density.is_some())
+            && (fill.evaluation_window_width_um.is_none()
+                || fill.evaluation_window_height_um.is_none())
+        {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "missing_density_window",
+                field: prefix.clone(),
+                message:
+                    "Window density limits require deck-level evaluation window width and height."
+                        .into(),
+            });
         }
         for (field, value) in [
             ("tile_width_um", rule.tile_width_um),
@@ -1874,6 +1959,48 @@ pmos:
         assert!(diagnostics
             .iter()
             .any(|diagnostic| { diagnostic.field == "tapeout_window.edge_margin_um" }));
+    }
+
+    #[test]
+    fn density_window_contract_loads_and_validates() {
+        let mut technology = Technology::from_yaml(include_str!(
+            "../../docs/examples/process_gf180mcu_3v3_5m_dr.yaml"
+        ))
+        .unwrap();
+        technology
+            .physical_rules
+            .density_fill
+            .evaluation_window_width_um = Some(80.0);
+        technology
+            .physical_rules
+            .density_fill
+            .evaluation_window_height_um = Some(80.0);
+        let metal1 = technology
+            .physical_rules
+            .density_fill
+            .layers
+            .get_mut("metal1")
+            .unwrap();
+        metal1.minimum_global_density = Some(0.30);
+        metal1.maximum_global_density = Some(0.70);
+        metal1.minimum_window_density = Some(0.25);
+        metal1.maximum_window_density = Some(0.75);
+        technology.validate().unwrap();
+        let fill = &technology.physical_rules.density_fill;
+        assert_eq!(fill.evaluation_window_width_um, Some(80.0));
+        assert_eq!(fill.evaluation_window_height_um, Some(80.0));
+        assert_eq!(fill.layers["metal1"].minimum_window_density, Some(0.25));
+        assert_eq!(fill.layers["metal1"].maximum_window_density, Some(0.75));
+
+        let mut incomplete = technology;
+        incomplete
+            .physical_rules
+            .density_fill
+            .evaluation_window_height_um = None;
+        let diagnostics = incomplete.validate().unwrap_err();
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "incomplete_density_window"));
     }
 
     #[test]

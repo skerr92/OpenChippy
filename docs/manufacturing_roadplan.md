@@ -1454,3 +1454,24 @@ The ultimate goal is to build confidence incrementally through measurable qualif
 #### Density quality follow-up
 
 Replace global minimum-only fill closure with process-configurable sliding-window closure. Each layer should define minimum, preferred, and maximum density; generation should approach the preferred value with a safety margin instead of either stopping at the absolute minimum or maximizing occupancy. Candidate fill must remain timing-aware and respect signal, clock, power, antenna, and device keepouts because unnecessary fill increases coupling and parasitic capacitance. Report worst-window density, underfilled windows, overfilled windows, and achieved distribution per layer.
+
+### Physical IR v46 — sliding-window density closure
+
+- Extend the version-1 density contract without breaking existing decks:
+  `target_density` remains the preferred target, while optional global and
+  window minima/maxima plus deck-level evaluation-window dimensions express
+  qualification limits. Reject incomplete window dimensions and inconsistent
+  minimum/preferred/maximum ordering.
+- Measure the boolean union of existing electrical geometry before adding
+  fill. Evaluate windows at half-window strides with explicit edge anchoring,
+  prioritize legal candidates that improve a below-preferred window, stop once
+  global and local preferred targets are met, and reject candidates that would
+  exceed configured global or window maxima.
+- Persist per-material global density, minimum/maximum achieved window density,
+  window size/count, underfilled/overfilled counts, and dummy-shape counts in
+  Physical IR and the headless audit. Display the same summary in the physical
+  viewer instead of treating visible fill as proof of density closure.
+- Existing circuit and device spacing remains a hard fill keepout. Dedicated
+  critical-net, clock/power, antenna, and coupling-aware keepout classes remain
+  a follow-up because those require process parasitic limits rather than an
+  invented universal distance.

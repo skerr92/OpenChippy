@@ -6,9 +6,10 @@
 #
 # Claims are deliberately conservative. This compatibility deck is not a
 # foundry signoff deck. The official GF180 deck has now been run against the
-# archived 4B_ADDER GDS: structural/round-trip checks pass, official DRC fails,
-# and official LVS extraction recognizes 144 MOS devices. Reference-netlist
-# comparison, tapeout, manufacturing, and silicon evidence remain NOT_RUN.
+# exact 4B_ADDER GDS: structural/round-trip checks pass, official geometry and
+# process DRC is clean apart from the known direct-float DBU comparison marker,
+# and native LVS closes 144 MOS devices and 82 nets. Tapeout, manufacturing,
+# and silicon evidence remain NOT_RUN.
 
 process_validation:
   format_version: 1
@@ -17,23 +18,23 @@ process_validation:
     process_id: gf180mcu-3v3-5m-compat
     deck_revision: openchippy-compat-v1
     deck_file: process_gf180mcu_3v3_5m_dr.yaml
-    deck_fingerprint: "fnv1a64:7e611063c57c34f0"
+    deck_fingerprint: "fnv1a64:c739268436df11f1"
     compatibility_profile: true
     foundry_signoff_deck: false
 
   record:
     record_id: gf180mcu-3v3-5m-compat-validation-v1
-    revision: 1
-    generated_on: "2026-07-23"
+    revision: 2
+    generated_on: "2026-08-11"
     overall_status: IMPLEMENTED
     highest_supported_claim: UNIT_TESTED
     notes:
       - The deck loads through the current strict OpenChippy technology parser.
       - EDU and GF180 compatibility NAND regressions pass native DRC.
-      - QD-0001 passes native DRC and its GDS, official report, extracted netlist, hashes, and invocation metadata are checked in.
+      - QD-0001 passes native DRC/connectivity/LVS and its deterministic GDS has been checked with the official variant-C 5LM/9K deck.
       - KLayout opens and canonically round-trips the supported GDS record set.
-      - Official GF180 DRC currently fails with 3839 violations; this is baseline evidence, not a signoff claim.
-      - Official extraction recognizes 144 MOS devices, but a true LVS comparison awaits reference SPICE/CDL export.
+      - Official GF180 geometry/process DRC is clean; the remaining DBU marker comes from an exact floating-point comparison in the deck/tool combination and is retained as correlation evidence.
+      - Native LVS recognizes and matches 144 MOS devices and 82 nets; independent foundry LVS/reference-netlist qualification remains future work.
 
   capabilities:
     - id: CAP-PROCESS-DECK-LOAD

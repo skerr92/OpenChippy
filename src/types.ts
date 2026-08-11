@@ -503,6 +503,25 @@ export type PhysicalLayoutIr = {
     shapesOutsideFloorplan: number;
     shapesOutsideTapeout: number;
   };
+  density: {
+    layers: Array<{
+      material: string;
+      preferredDensity: number;
+      minimumGlobalDensity: number;
+      maximumGlobalDensity: number | null;
+      achievedGlobalDensity: number;
+      minimumWindowDensity: number;
+      maximumWindowDensity: number | null;
+      achievedMinimumWindowDensity: number;
+      achievedMaximumWindowDensity: number;
+      windowWidthUm: number;
+      windowHeightUm: number;
+      windowCount: number;
+      underfilledWindowCount: number;
+      overfilledWindowCount: number;
+      dummyShapeCount: number;
+    }>;
+  };
   bounds: {
     minX: number;
     minY: number;
