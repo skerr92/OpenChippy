@@ -4,10 +4,10 @@
 
 - Context ID: FRESH-001
 - Last Verified Commit: `34d386a9396635b6569f0e372bbd23e17027d521`
-- Current HEAD: `34d386a9396635b6569f0e372bbd23e17027d521`
+- Current HEAD: context-only successor of `34d386a9396635b6569f0e372bbd23e17027d521`
 - Generated: 2026-08-11
-- Status: partial; Physical IR v46 is committed and verified, while the two CondensedContext files await their tracking commit.
-- Files requiring verification: `CondensedContext.md` and `CondensedContext.CCF1`.
+- Status: fresh; Physical IR v46 is verified at the listed commit and later commits change context only.
+- Files requiring verification: None.
 - Full semantic memory: `CondensedContext.CCF1`
 
 ## Current Focus
@@ -21,8 +21,8 @@
 ## Handoff
 
 - Context ID: HANDOFF-001
-- Last known state: v38-v45 is committed at `2b9a6ca`, compact context at `0afe816`, and validated v46 density closure is committed at `34d386a`.
-- Next useful step: commit this context tracking update, then regenerate the exact GF180 4B design and correlate its persisted density report and GDS against the official deck before adding process-owned protected-net keepout classes.
+- Last known state: v38-v45 is committed at `2b9a6ca`, compact context at `0afe816`, validated v46 density closure is committed at `34d386a`, and context tracking is committed separately.
+- Next useful step: regenerate the exact GF180 4B design and correlate its persisted density report and GDS against the official deck before adding process-owned protected-net keepout classes.
 - Validation: `cargo test --lib` passes 185/185 on 2026-08-11; `npm run build` passes with only the existing bundle-size warning; `cargo fmt --check`/`git diff --check` are clean. Focused tests prove deterministic inert fill, zero configured under/overfilled windows, maximum admission, and density-contract validation.
 
 ## Recent Changes

@@ -1,7 +1,7 @@
 # CondensedContext
 <!-- CCF/1 -->
 @legend c=confidence; lvl=compression-level; fid=fidelity; imp=importance; vol=volatility; cost=expansion-cost; lv=last-verified; st=freshness; aliases from @path.
-@fresh id=FRESH-001 lv=34d386a9396635b6569f0e372bbd23e17027d521 head=34d386a9396635b6569f0e372bbd23e17027d521 gen=2026-08-11 st=partial verify=CC,CCF
+@fresh id=FRESH-001 lv=34d386a9396635b6569f0e372bbd23e17027d521 head=context-only-successor gen=2026-08-11 st=fresh verify=none
 @path CC=CondensedContext.md
 @path CCF=CondensedContext.CCF1
 @path ROAD=docs/roadmap.md
@@ -36,7 +36,7 @@
 @path GDS=src-tauri/src/gdsii.rs
 @path CSS=src/styles.css
 @focus id=ACTIVE-001 c=H :: PhysicalIRv46 adds compatible global/window min-preferred-max density contracts, boolean-union measurement, half-window edge-anchored fill closure, maximum admission, and persisted audit/viewer reports; generic circuit/device keepouts enforced; next=commit+exact GF1804B requalification,then process-owned protected-net spacing classes.
-@handoff id=HANDOFF-001 c=H :: state=v38-v45=2b9a6ca,context=0afe816,v46-density=34d386a; context tracking pending; next=commit context then exact GF1804B native/deterministic/official correlation; val=2026-08-11 rust185/185+frontend-build+fmt+diff-check pass; focused density zero-under/over+max+determinism pass.
+@handoff id=HANDOFF-001 c=H :: state=v38-v45=2b9a6ca,context=0afe816,v46-density=34d386a,tracking committed separately; next=exact GF1804B native/deterministic/official correlation then protected-net spacing classes; val=2026-08-11 rust185/185+frontend-build+fmt+diff-check pass; focused density zero-under/over+max+determinism pass.
 @chg date=2026-08-11 tags=physical-ir-v46,density,sliding-window files=PHY,TECH,LIB,PDRC,PHVIEW,TYPES,GFVAL,MROAD,README,CC,CCF commit=34d386a remote=not-confirmed :: add process-configurable global/window density bounds, preferred-target closure, boolean-union measurement, persisted reports, viewer/audit exposure, and linked GF180 fingerprint evidence.
 @chg date=2026-08-11 tags=physical-ir-v38-v45,baseline,docs files=README,MROAD,GDS,LIB,PDRC,PHY,PPLACE,TECH,PHVIEW commit=2b9a6ca remote=not-confirmed :: reviewed and committed terminal-preserving routing, topology-aware DRC, GF180 manufacturing migration/fill visibility, foundry-width neck repair, and current public qualification wording.
 @fact id=PRODUCT-001 c=H :: OpenChippy=education-first desktop VLSI studio; Rust owns authoritative models/services; React/Three.js own interaction and visualization.
