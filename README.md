@@ -44,20 +44,25 @@ New projects save as an `.ochippy` manifest. It lists the files that belong to t
 - `.chippy_gds` contains the generated physical layout used by the 3D viewer.
 - `chippyblocks/` contains reusable `.chippyblock` files stored beside the project.
 
-The cached physical file is tied to the circuit it came from. If they no longer match,
-OpenChippy refuses to display the stale layout. A matching cache lets the 3D view reopen
-without repeating placement and routing. Existing standalone `.chippy` files remain
-supported.
+The cached physical file is tied to the circuit and effective technology contract it came
+from. If they no longer match, OpenChippy refuses to display the stale layout. A matching
+cache lets the 3D view reopen without repeating placement and routing. Existing standalone
+`.chippy` files remain supported, including narrowly identified legacy GF180 snapshots whose
+missing packaged manufacturing mappings can be restored safely.
 
 `.chippy_gds` is OpenChippy's versioned physical-layout cache. The 3D workspace
 can separately export an initial binary `.gds` stream and validates its record
 structure and geometry counts before saving. GDS layer/datatype assignments
 come from the active process deck; GF180 diffusion expands into COMP plus its
 polarity-specific implant and excludes the synthetic substrate preview. The
-exporter is still early: complete reusable hierarchy, external KLayout
-validation, and foundry signoff remain manufacturing-roadmap work. Physical
-blocks are now emitted as referenced GDS structures, although shared canonical
-cells and non-zero transforms are still under development.
+exporter remains an early interoperability path rather than a signoff replacement.
+Physical blocks are emitted as referenced GDS structures, although shared canonical cells
+and non-zero transforms are still under development. The exact GF180 four-bit-adder
+qualification design has deterministic GDS output, clean native DRC/connectivity/LVS, and
+no geometry or process findings under the official variant-C 5LM/9K KLayout deck; the deck's
+direct floating-point DBU comparison still produces a known tool-version-specific marker.
+Broader process coverage, extraction correlation, reusable hierarchy qualification, and
+fabricated-silicon evidence remain manufacturing-roadmap work.
 Physical power routing is distributed across occupied placement rows instead
 of being forced through a single VDD/GND pair; devices use the nearest matching
 rail, leaving upper routing capacity available for signal closure.
@@ -183,8 +188,9 @@ cargo test --manifest-path src-tauri/Cargo.toml
 npm run tauri -- build
 ```
 
-The current baseline is 121 passing Rust tests plus successful frontend and Tauri release
-builds.
+The current baseline is 184 passing Rust tests plus successful frontend and Tauri release
+builds. Some physical-layout regressions are intentionally heavyweight and may take more
+than a minute on a development machine.
 
 ## Contributing
 

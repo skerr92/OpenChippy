@@ -84,6 +84,7 @@ pub struct PhysicalAuditSummary {
     pub topology_compacted: bool,
     pub shape_count: usize,
     pub shape_purposes: BTreeMap<String, usize>,
+    pub dummy_fill_by_layer: BTreeMap<String, usize>,
     pub row_count: usize,
     pub active_island_count: usize,
     pub shared_active_island_count: usize,
@@ -117,7 +118,8 @@ pub fn audit_physical_sources(
 ) -> Result<PhysicalAuditSummary, String> {
     let mut project: Project = serde_json::from_str(project_source)
         .map_err(|error| format!("project JSON is invalid: {error}"))?;
-    let technology = Technology::from_yaml(technology_source)?;
+    let mut technology = Technology::from_yaml(technology_source)?;
+    technology.migrate_legacy_gds_layers();
     project.set_technology(technology.clone());
     let layout = physical_layout::normalize_project(&project)?;
     let report = physical_drc::validate(&layout, &technology);
@@ -149,10 +151,27 @@ pub fn audit_physical_sources(
     let mut by_rule = BTreeMap::new();
     let mut by_layer = BTreeMap::new();
     let mut shape_purposes = BTreeMap::new();
+    let mut dummy_fill_by_layer = BTreeMap::new();
     for shape in &layout.shapes {
         *shape_purposes
             .entry(shape.purpose.as_str().to_string())
             .or_insert(0) += 1;
+        if shape.purpose == physical_layout::PhysicalShapePurpose::DummyFill {
+            let layer = match shape.layer {
+                physical_layout::PhysicalLayer::Substrate => "substrate".to_string(),
+                physical_layout::PhysicalLayer::Pwell => "pwell".to_string(),
+                physical_layout::PhysicalLayer::Nwell => "nwell".to_string(),
+                physical_layout::PhysicalLayer::Ndiff => "ndiff".to_string(),
+                physical_layout::PhysicalLayer::Pdiff => "pdiff".to_string(),
+                physical_layout::PhysicalLayer::Poly => "poly".to_string(),
+                physical_layout::PhysicalLayer::Metal(index) => format!("metal{index}"),
+                physical_layout::PhysicalLayer::Contact => "contact".to_string(),
+                physical_layout::PhysicalLayer::Via(index) => {
+                    format!("via{}{next}", index, next = index + 1)
+                }
+            };
+            *dummy_fill_by_layer.entry(layer).or_insert(0) += 1;
+        }
     }
     for diagnostic in &report.diagnostics {
         *by_rule.entry(diagnostic.rule_id.to_string()).or_insert(0) += 1;
@@ -190,6 +209,7 @@ pub fn audit_physical_sources(
             .topology_compacted,
         shape_count: layout.shapes.len(),
         shape_purposes,
+        dummy_fill_by_layer,
         row_count: layout.row_topology.len(),
         active_island_count: layout
             .row_topology
@@ -252,7 +272,9 @@ pub fn generate_physical_ir_sources(
 ) -> Result<PhysicalLayoutIr, String> {
     let mut project: Project = serde_json::from_str(project_source)
         .map_err(|error| format!("project JSON is invalid: {error}"))?;
-    project.set_technology(Technology::from_yaml(technology_source)?);
+    let mut technology = Technology::from_yaml(technology_source)?;
+    technology.migrate_legacy_gds_layers();
+    project.set_technology(technology);
     physical_layout::normalize_project(&project)
 }
 
@@ -262,7 +284,8 @@ pub fn audit_physical_drc_sources(
 ) -> Result<PhysicalDrcReport, String> {
     let mut project: Project = serde_json::from_str(project_source)
         .map_err(|error| format!("project JSON is invalid: {error}"))?;
-    let technology = Technology::from_yaml(technology_source)?;
+    let mut technology = Technology::from_yaml(technology_source)?;
+    technology.migrate_legacy_gds_layers();
     project.set_technology(technology.clone());
     Ok(physical_drc::validate(
         &physical_layout::normalize_project(&project)?,
@@ -273,7 +296,9 @@ pub fn audit_physical_drc_sources(
 pub fn export_lef_sources(project_source: &str, technology_source: &str) -> Result<String, String> {
     let mut project: Project = serde_json::from_str(project_source)
         .map_err(|error| format!("project JSON is invalid: {error}"))?;
-    project.set_technology(Technology::from_yaml(technology_source)?);
+    let mut technology = Technology::from_yaml(technology_source)?;
+    technology.migrate_legacy_gds_layers();
+    project.set_technology(technology);
     lef::export(&physical_layout::normalize_project(&project)?)
 }
 
@@ -283,7 +308,8 @@ pub fn export_gds_sources(
 ) -> Result<(Vec<u8>, GdsExportReport), String> {
     let mut project: Project = serde_json::from_str(project_source)
         .map_err(|error| format!("project JSON is invalid: {error}"))?;
-    let technology = Technology::from_yaml(technology_source)?;
+    let mut technology = Technology::from_yaml(technology_source)?;
+    technology.migrate_legacy_gds_layers();
     project.set_technology(technology.clone());
     let layout = physical_layout::normalize_project(&project)?;
     gdsii::export(
@@ -317,7 +343,9 @@ struct PhysicalArtifact {
 }
 
 fn project_digest(project: &Project) -> Result<String, ProjectError> {
-    let bytes = serde_json::to_vec(project)?;
+    let mut effective_project = project.clone();
+    effective_project.technology.migrate_legacy_gds_layers();
+    let bytes = serde_json::to_vec(&effective_project)?;
     let mut hash = 0xcbf29ce484222325u64;
     for byte in bytes {
         hash ^= u64::from(byte);
@@ -1025,7 +1053,8 @@ async fn inspect_physical_layout(
             .workspace
             .lock()
             .map_err(|_| ProjectError::StateUnavailable)?;
-        let project = workspace.history.current();
+        let mut project = workspace.history.current();
+        project.technology.migrate_legacy_gds_layers();
         let cached = matching_cached_layout(&workspace.physical_cache, &project);
         (project, cached)
     };

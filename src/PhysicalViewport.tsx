@@ -43,12 +43,12 @@ const BASE_LAYERS: Record<string, LayerStyle> = {
 
 const METAL_COLORS = ["#5fa8e7", "#b66ee8", "#ee6fa7", "#79c968", "#e4aa54", "#67c9ce"];
 
-function createLayers(maxMetalLayers: number): Record<string, LayerStyle> {
+function createLayers(maxMetalLayers: number, renderedMetalLayers = maxMetalLayers): Record<string, LayerStyle> {
   const layers = { ...BASE_LAYERS };
-  for (let index = 1; index <= maxMetalLayers; index += 1) {
+  for (let index = 1; index <= renderedMetalLayers; index += 1) {
     const elevation = .48 + (index - 1) * .24;
     layers[`metal${index}`] = {
-      label: `Metal ${index}`,
+      label: index > maxMetalLayers ? "Top-metal fill" : `Metal ${index}`,
       color: METAL_COLORS[(index - 1) % METAL_COLORS.length],
       elevation,
       thickness: .13,
@@ -97,7 +97,17 @@ export default function PhysicalViewport({
   const cameraSnapshot = useRef<CameraSnapshot | null>(null);
   const cameraLayout = useRef<PhysicalLayoutIr | null>(null);
   const selectRef = useRef(onSelect);
-  const layers = useMemo(() => createLayers(layout?.maxMetalLayers ?? 5), [layout?.maxMetalLayers]);
+  const renderedMetalLayers = useMemo(() => {
+    const routable = layout?.maxMetalLayers ?? 5;
+    return layout?.shapes.reduce((maximum, shape) => {
+      const match = /^metal(\d+)$/.exec(shape.layer);
+      return match ? Math.max(maximum, Number(match[1])) : maximum;
+    }, routable) ?? routable;
+  }, [layout]);
+  const layers = useMemo(
+    () => createLayers(layout?.maxMetalLayers ?? 5, renderedMetalLayers),
+    [layout?.maxMetalLayers, renderedMetalLayers],
+  );
   const [visibleLayers, setVisibleLayers] = useState<Set<LayerName>>(
     () => new Set(Object.keys(createLayers(5))),
   );
@@ -114,6 +124,16 @@ export default function PhysicalViewport({
   const [drcSeverity, setDrcSeverity] = useState("all");
   const [drcNet, setDrcNet] = useState("all");
   const [showBlockRegions, setShowBlockRegions] = useState(true);
+  const [showDummyFill, setShowDummyFill] = useState(true);
+  const [soloDummyFill, setSoloDummyFill] = useState(false);
+  const dummyFillByLayer = useMemo(() => {
+    const counts: Record<string, number> = {};
+    layout?.shapes.forEach((shape) => {
+      if (shape.purpose === "dummy_fill") counts[shape.layer] = (counts[shape.layer] ?? 0) + 1;
+    });
+    return counts;
+  }, [layout]);
+  const dummyFillCount = Object.values(dummyFillByLayer).reduce((sum, count) => sum + count, 0);
   selectRef.current = onSelect;
 
   useEffect(() => {
@@ -163,6 +183,8 @@ export default function PhysicalViewport({
     const highlightedBox = new THREE.Box3();
     layout.shapes.forEach((shape, shapeIndex) => {
         if (!visibleLayers.has(shape.layer)) return;
+        const dummyFill = shape.purpose === "dummy_fill";
+        if (dummyFill ? !showDummyFill : soloDummyFill) return;
         const layer = layers[shape.layer];
         if (!layer) return;
         const geometry = new THREE.BoxGeometry(
@@ -172,10 +194,13 @@ export default function PhysicalViewport({
         );
         const selected = shape.componentId ? selectedIds.includes(shape.componentId) : false;
         const violation = highlightedIndices.has(shapeIndex);
+        const baseColor = dummyFill
+          ? new THREE.Color(layer.color).lerp(new THREE.Color("#fff2a8"), .3)
+          : new THREE.Color(layer.color);
         const material = new THREE.MeshStandardMaterial({
-          color: violation ? "#ff5252" : selected ? "#ffd277" : layer.color,
-          emissive: violation ? "#7a0909" : "#000000",
-          emissiveIntensity: violation ? 1.8 : 0,
+          color: violation ? "#ff5252" : selected ? "#ffd277" : baseColor,
+          emissive: violation ? "#7a0909" : dummyFill ? baseColor : "#000000",
+          emissiveIntensity: violation ? 1.8 : dummyFill ? .18 : 0,
           transparent: shape.layer === "nwell" || shape.layer === "substrate",
           opacity: shape.layer === "nwell" ? .48 : shape.layer === "substrate" ? .9 : 1,
           roughness: .5,
@@ -335,7 +360,7 @@ export default function PhysicalViewport({
       renderer.dispose();
       renderer.domElement.remove();
     };
-  }, [layout, selectedIds, visibleLayers, layers, selectedDrc, showBlockRegions]);
+  }, [layout, selectedIds, visibleLayers, layers, selectedDrc, showBlockRegions, showDummyFill, soloDummyFill]);
 
   const toggleLayer = (layer: LayerName) => {
     setVisibleLayers((current) => {
@@ -414,6 +439,11 @@ export default function PhysicalViewport({
           <span>{layout ? `${layout.devices.length} MOS` : "Generating…"}</span>
           <span>{layout ? `${layout.nets.length} nets · ${layout.pins.length} pins` : ""}</span>
           <span>{layout ? `${layout.maxMetalLayers} routing metals` : ""}</span>
+          {layout && <span>{dummyFillCount} dummy-fill shapes</span>}
+          {layout && Object.entries(dummyFillByLayer).map(([layer, count]) => (
+            <span key={`fill-${layer}`}>{layer} fill · {count}</span>
+          ))}
+          {layout && dummyFillCount === 0 && <strong>No dummy fill in this Physical IR</strong>}
           <span>{layout ? `deck ${layout.technologyFingerprint}` : ""}</span>
           {layout && (() => {
             const candidate = layout.planning.candidates[layout.planning.selectedCandidate];
@@ -527,6 +557,15 @@ export default function PhysicalViewport({
         <button className="physical-reset" disabled={!layout} onClick={onExportLef}>Export LEF macro…</button>
         <p className="physical-sidebar-section">Layers</p>
         <button className="physical-reset" onClick={showAllLayers}>Show all layers</button>
+        <button className="physical-reset" onClick={() => setShowDummyFill((current) => !current)}>
+          {showDummyFill ? "Hide" : "Show"} dummy fill
+        </button>
+        <button className="physical-reset" onClick={() => {
+          setSoloDummyFill((current) => !current);
+          setShowDummyFill(true);
+        }}>
+          {soloDummyFill ? "Show electrical geometry" : "Solo dummy fill"}
+        </button>
         <div className="physical-layers">
           {Object.entries(layers).map(([name, layer]) => (
             <label key={name}>

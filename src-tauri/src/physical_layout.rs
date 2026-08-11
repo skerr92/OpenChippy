@@ -16,11 +16,11 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use uuid::Uuid;
 
-// Version 37 proves closure from every logical device/pin obligation to its
-// exact persisted access geometry. Older caches could treat an isolated local
-// landing as a connected terminal or let one same-net contact stand in for a
-// different source/drain access on the same device.
-pub const CURRENT_PHYSICAL_IR_VERSION: u32 = 37;
+// Version 40 makes standard-cell identity a hard sharing boundary. Same-net
+// terminals in separate instances may meet only through routed conductors;
+// shared diffusion/contact and poly straps are synthesized solely inside one
+// explicit leaf cell. Version 39's independent route anchors remain active.
+pub const CURRENT_PHYSICAL_IR_VERSION: u32 = 45;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1070,6 +1070,7 @@ fn add_via_stack(
     }
 }
 
+#[cfg(test)]
 fn guard_via_enclosures_for_grid(shapes: &mut [PhysicalShape], rules: &PhysicalRuleDeck) {
     let grid = rules.manufacturing_grid_um;
     let vias = shapes
@@ -1243,6 +1244,9 @@ fn local_route_candidates(
     candidates
 }
 
+// Retained only as a geometry regression fixture. Production routing must not
+// collapse distinct logical terminal anchors merely because they share a net.
+#[cfg(test)]
 fn shared_signal_row_accesses(
     points: &[RouteAnchor],
     net: usize,
@@ -1895,7 +1899,10 @@ fn synthesize_row_topology(
                     - (placed_by_id[&device_id].x - device_terminal_offset(right_device, rules)))
                 .abs()
                     <= grid / 2.0;
-            if left_device.source_net == right_device.drain_net
+            let same_cell = left_device.standard_cell_group.is_some()
+                && left_device.standard_cell_group == right_device.standard_cell_group;
+            if same_cell
+                && left_device.source_net == right_device.drain_net
                 && (gap >= -grid / 2.0 || coincident_shared_access || coincident_terminal_geometry)
                 && !blocked
             {
@@ -2007,7 +2014,10 @@ fn synthesize_row_topology(
                 gate_runs.push(vec![device_id]);
                 continue;
             };
-            if left_device.gate_net == by_id[&device_id].gate_net {
+            let right_device = by_id[&device_id];
+            let same_cell = left_device.standard_cell_group.is_some()
+                && left_device.standard_cell_group == right_device.standard_cell_group;
+            if same_cell && left_device.gate_net == right_device.gate_net {
                 run.push(device_id);
             } else {
                 gate_runs.push(vec![device_id]);
@@ -2477,6 +2487,8 @@ fn poly_candidates_blocked(
 fn materialize_shared_terminal_accesses(
     shapes: &mut Vec<PhysicalShape>,
     topology: &mut [PhysicalRowTopology],
+    nets: &[PhysicalNet],
+    pins: &[PhysicalPin],
     placed_by_id: &HashMap<Uuid, &PlacedDevice>,
     rules: &PhysicalRuleDeck,
 ) {
@@ -2527,6 +2539,29 @@ fn materialize_shared_terminal_accesses(
                     || (shape.layer == PhysicalLayer::Metal(1)
                         && shape.purpose == PhysicalShapePurpose::DeviceLanding))
         };
+        let leaves_shared_boundary =
+            nets.iter()
+                .find(|net| net.id == access.net)
+                .is_some_and(|net| {
+                    net.terminals
+                        .iter()
+                        .any(|terminal| !access.device_ids.contains(&terminal.component_id))
+                })
+                || pins.iter().any(|pin| pin.net == access.net);
+        if !leaves_shared_boundary {
+            // The repeated source/drain net is completely implemented by the
+            // shared active island. It is not a routable cell pin. Remove the
+            // provisional contacts, M1 landings, and route tree produced for
+            // the two pre-topology terminal anchors instead of leaving a
+            // contact post with nowhere electrical to go.
+            shapes.retain(|shape| {
+                !matches_old_access(shape)
+                    && !(shape.net == Some(access.net)
+                        && matches!(shape.layer, PhysicalLayer::Metal(_) | PhysicalLayer::Via(_)))
+            });
+            access.shared_contact = false;
+            continue;
+        }
         let mut contact = PhysicalShape {
             layer: PhysicalLayer::Contact,
             x: access.x,
@@ -2629,8 +2664,10 @@ fn orient_devices_for_diffusion_sharing(
                     } else {
                         right.source_net
                     };
+                    let same_cell = left.standard_cell_group.is_some()
+                        && left.standard_cell_group == right.standard_cell_group;
                     let candidate = (
-                        prior.0 + i32::from(left_facing == right_facing),
+                        prior.0 + i32::from(same_cell && left_facing == right_facing),
                         prior.1 - i32::from(right_orientation == 1),
                     );
                     if candidate > scores[index][right_orientation] {
@@ -2758,7 +2795,6 @@ fn compact_preview(
     planning: &PhysicalPlanningReport,
     placement: &PhysicalPlacementReport,
     flexible_gate_access: bool,
-    shared_signal_access: bool,
 ) -> (PhysicalBounds, Vec<PhysicalShape>) {
     let signal_net_count = nets
         .iter()
@@ -3298,20 +3334,14 @@ fn compact_preview(
             continue;
         };
         let signal = net.role != NetRole::Power && net.role != NetRole::Ground;
-        let (routed_points, shared_access_geometry) = if signal && shared_signal_access {
-            shared_signal_row_accesses(
-                points,
-                net.id,
-                max_metal_layers,
-                &shapes,
-                rules,
-                &standard_cell_by_device,
-            )
-        } else {
-            (points.clone(), Vec::new())
-        };
-        shapes.extend(shared_access_geometry);
-        let points = &routed_points;
+        // Same-net membership does not make two physical terminals one
+        // terminal. Keep every gate/source/drain and boundary-pin anchor in
+        // the route problem; they may meet only through emitted routing (or
+        // through topology-proven shared diffusion/poly synthesized below).
+        // Collapsing several anchors into one upper-metal pseudo-terminal can
+        // hide an omitted branch while net-labelled geometry still appears
+        // connected to the native audit.
+        let points = points;
         let nearest_track = |tracks: &[f64], y: f64| {
             tracks
                 .iter()
@@ -4875,7 +4905,149 @@ fn repair_disconnected_routing(
     repaired
 }
 
+/// Split generated axial metal at electrical junctions before terminal-tree
+/// reduction.
+///
+/// The router represents a long trunk as one rectangle.  A shortest-tree pass
+/// over those rectangles cannot remove only the unused portion beyond an
+/// interior junction: retaining the junction retains the complete trunk.  The
+/// fragments produced here have exactly the same boolean union as the input,
+/// remain grid aligned, and individually satisfy the process minimum area.
+/// Pins, device/via landings, and power rails stay atomic because their full
+/// enclosure or external-access geometry is part of the physical contract.
+fn fragment_generated_routes_at_junctions(
+    shapes: &mut Vec<PhysicalShape>,
+    rules: &PhysicalRuleDeck,
+) -> usize {
+    let grid = rules.manufacturing_grid_um;
+    let snapshot = shapes.clone();
+    let mut result = Vec::with_capacity(shapes.len());
+    let mut fragments_added = 0usize;
+
+    for (index, shape) in snapshot.iter().enumerate() {
+        let PhysicalLayer::Metal(layer) = shape.layer else {
+            result.push(shape.clone());
+            continue;
+        };
+        if shape.net.is_none()
+            || !matches!(
+                shape.purpose,
+                PhysicalShapePurpose::Route | PhysicalShapePurpose::Unknown
+            )
+            || (shape.component_id.is_some() && !is_generated_route_shape(shape))
+        {
+            result.push(shape.clone());
+            continue;
+        }
+        let horizontal = shape.width > shape.height + grid;
+        let vertical = shape.height > shape.width + grid;
+        if !horizontal && !vertical {
+            result.push(shape.clone());
+            continue;
+        }
+
+        let axis_min = if horizontal {
+            shape.x - shape.width / 2.0
+        } else {
+            shape.y - shape.height / 2.0
+        };
+        let axis_max = if horizontal {
+            shape.x + shape.width / 2.0
+        } else {
+            shape.y + shape.height / 2.0
+        };
+        let mut cuts = snapshot
+            .iter()
+            .enumerate()
+            .filter_map(|(other_index, other)| {
+                if other_index == index
+                    || other.net != shape.net
+                    || !shapes_touch(shape, other, grid / 2.0)
+                {
+                    return None;
+                }
+                let junction = match other.layer {
+                    PhysicalLayer::Metal(other_layer) if other_layer == layer => {
+                        let other_horizontal = other.width > other.height + grid;
+                        let other_vertical = other.height > other.width + grid;
+                        if (horizontal && other_vertical) || (vertical && other_horizontal) {
+                            Some(if horizontal { other.x } else { other.y })
+                        } else {
+                            None
+                        }
+                    }
+                    PhysicalLayer::Via(lower) if layer == lower || layer == lower + 1 => {
+                        Some(if horizontal { other.x } else { other.y })
+                    }
+                    PhysicalLayer::Contact if layer == 1 => {
+                        Some(if horizontal { other.x } else { other.y })
+                    }
+                    _ => None,
+                }?;
+                (junction > axis_min + grid && junction < axis_max - grid).then_some(junction)
+            })
+            .collect::<Vec<_>>();
+        cuts.sort_by(f64::total_cmp);
+        cuts.dedup_by(|left, right| (*left - *right).abs() <= grid / 2.0);
+        if cuts.is_empty() {
+            result.push(shape.clone());
+            continue;
+        }
+
+        let mut boundaries = Vec::with_capacity(cuts.len() + 2);
+        boundaries.push(axis_min);
+        boundaries.extend(cuts);
+        boundaries.push(axis_max);
+        let rule = metal_rule(rules, layer);
+        let cross_width = if horizontal {
+            shape.height
+        } else {
+            shape.width
+        };
+        let raw_minimum_length = rule
+            .min_width_um
+            .max(rule.min_area_um2 / cross_width.max(grid));
+        // Shape dimensions are center/size encoded, so both axial edges must
+        // land on the grid. Round the minimum upward by a complete two-edge
+        // quantum and leave one quantum of numerical margin; otherwise a
+        // nominally exact min-area fragment can snap just below the rule.
+        let edge_quantum = grid * 2.0;
+        let minimum_length =
+            (raw_minimum_length / edge_quantum).ceil() * edge_quantum + edge_quantum;
+        for interval in boundaries.windows(2) {
+            let mut start = interval[0];
+            let mut end = interval[1];
+            if end - start < minimum_length {
+                let center = (start + end) / 2.0;
+                start = (center - minimum_length / 2.0).max(axis_min);
+                end = (center + minimum_length / 2.0).min(axis_max);
+                if end - start < minimum_length - grid / 2.0 {
+                    if (start - axis_min).abs() <= grid / 2.0 {
+                        end = (start + minimum_length).min(axis_max);
+                    } else {
+                        start = (end - minimum_length).max(axis_min);
+                    }
+                }
+            }
+            let mut fragment = shape.clone();
+            if horizontal {
+                fragment.x = (start + end) / 2.0;
+                fragment.width = end - start;
+            } else {
+                fragment.y = (start + end) / 2.0;
+                fragment.height = end - start;
+            }
+            snap_shape_to_grid(&mut fragment, grid);
+            result.push(fragment);
+        }
+        fragments_added += boundaries.len().saturating_sub(2);
+    }
+    *shapes = result;
+    fragments_added
+}
+
 fn prune_orphan_routing(shapes: &mut Vec<PhysicalShape>, rules: &PhysicalRuleDeck) -> usize {
+    fragment_generated_routes_at_junctions(shapes, rules);
     let grid = rules.manufacturing_grid_um;
     let routing_indices = shapes
         .iter()
@@ -5270,6 +5442,86 @@ fn fill_same_net_metal_notches_once(
                         left_max_x.min(right_max_x),
                         first_edge.max(second_edge),
                     ));
+                }
+                // Two same-net rectangles can be electrically connected by a
+                // short shared edge while their boolean union still contains
+                // a sub-rule neck.  This occurs most often where a minimum-
+                // width route terminates against an offset square landing:
+                // the rectangles have zero gap, so neither spacing repair nor
+                // the positive-area overlap cases below see the junction.
+                // Extend the route end across a full-width interval contained
+                // by the landing.  A centered square creates four new concave
+                // corners when it is offset from both rectangles; matching the
+                // route's complete thickness leaves only the original two
+                // corners, now separated by the process minimum width.
+                let touching_tolerance = grid + EPSILON;
+                let landing_route_pair = matches!(
+                    (left.purpose, right.purpose),
+                    (
+                        PhysicalShapePurpose::ViaLanding | PhysicalShapePurpose::DeviceLanding,
+                        PhysicalShapePurpose::Route
+                    ) | (
+                        PhysicalShapePurpose::Route,
+                        PhysicalShapePurpose::ViaLanding | PhysicalShapePurpose::DeviceLanding
+                    )
+                );
+                if landing_route_pair
+                    && gap_y.abs() <= touching_tolerance
+                    && overlap_x > EPSILON
+                    && overlap_x < rule.min_width_um - EPSILON
+                {
+                    let (landing, route) = if matches!(
+                        left.purpose,
+                        PhysicalShapePurpose::ViaLanding | PhysicalShapePurpose::DeviceLanding
+                    ) {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    };
+                    let landing_min_x = landing.x - landing.width / 2.0;
+                    let landing_max_x = landing.x + landing.width / 2.0;
+                    if landing.width + EPSILON >= rule.min_width_um {
+                        let shared_center = (left_min_x.max(right_min_x)
+                            + left_max_x.min(right_max_x))
+                            / 2.0;
+                        let min_x = (shared_center - rule.min_width_um / 2.0)
+                            .clamp(landing_min_x, landing_max_x - rule.min_width_um);
+                        fill_bounds.push((
+                            min_x,
+                            route.y - route.height / 2.0,
+                            min_x + rule.min_width_um,
+                            route.y + route.height / 2.0,
+                        ));
+                    }
+                }
+                if landing_route_pair
+                    && gap_x.abs() <= touching_tolerance
+                    && overlap_y > EPSILON
+                    && overlap_y < rule.min_width_um - EPSILON
+                {
+                    let (landing, route) = if matches!(
+                        left.purpose,
+                        PhysicalShapePurpose::ViaLanding | PhysicalShapePurpose::DeviceLanding
+                    ) {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    };
+                    let landing_min_y = landing.y - landing.height / 2.0;
+                    let landing_max_y = landing.y + landing.height / 2.0;
+                    if landing.height + EPSILON >= rule.min_width_um {
+                        let shared_center = (left_min_y.max(right_min_y)
+                            + left_max_y.min(right_max_y))
+                            / 2.0;
+                        let min_y = (shared_center - rule.min_width_um / 2.0)
+                            .clamp(landing_min_y, landing_max_y - rule.min_width_um);
+                        fill_bounds.push((
+                            route.x - route.width / 2.0,
+                            min_y,
+                            route.x + route.width / 2.0,
+                            min_y + rule.min_width_um,
+                        ));
+                    }
                 }
                 let left_horizontal = left.width > left.height + grid;
                 let left_vertical = left.height > left.width + grid;
@@ -5889,12 +6141,37 @@ fn density_fill_layer(name: &str, technology: &Technology) -> Option<PhysicalLay
     match name {
         "active" => Some(PhysicalLayer::Ndiff),
         "poly" => Some(PhysicalLayer::Poly),
+        // Keep process top-metal fill distinct from the highest routable
+        // signal layer. GDS export maps this synthetic IR layer to the deck's
+        // dedicated `top_metal` dummy purpose.
         "top_metal" => Some(PhysicalLayer::Metal(technology.max_metal_layers + 1)),
         _ => name
             .strip_prefix("metal")
             .and_then(|index| index.parse::<u16>().ok())
             .map(PhysicalLayer::Metal),
     }
+}
+
+fn process_density_fill_counts(
+    shapes: &[PhysicalShape],
+    technology: &Technology,
+) -> BTreeMap<String, usize> {
+    technology
+        .physical_rules
+        .density_fill
+        .layers
+        .keys()
+        .filter_map(|material| {
+            let layer = density_fill_layer(material, technology)?;
+            let count = shapes
+                .iter()
+                .filter(|shape| {
+                    shape.purpose == PhysicalShapePurpose::DummyFill && shape.layer == layer
+                })
+                .count();
+            Some((material.clone(), count))
+        })
+        .collect()
 }
 
 fn density_fill_obstacle(
@@ -6859,7 +7136,6 @@ fn normalize_with_progress(
     let selected =
         best.ok_or_else(|| "Physical planning produced no feasible candidate.".to_string())?;
     let selected_candidate = selected.candidate;
-    let selected_timing_candidate = selected.summary.candidate;
     let mut placement = selected.placement;
     let global_routing = selected.global;
     let detailed_routing = selected.detailed;
@@ -6901,21 +7177,17 @@ fn normalize_with_progress(
         }
     }
     let mut preview_jobs = Vec::new();
-    for (route_order_index, ordered_nets) in route_orders.into_iter().enumerate() {
+    for ordered_nets in route_orders {
         for (placement_variant, flexible_gate_access) in preview_variants.iter().cloned() {
-            let access_modes: &[bool] = if route_order_index == 0 {
-                &[false, true]
-            } else {
-                &[false]
-            };
-            for shared_signal_access in access_modes {
-                preview_jobs.push((
-                    ordered_nets.clone(),
-                    placement_variant.clone(),
-                    flexible_gate_access,
-                    *shared_signal_access,
-                ));
-            }
+            // Each logical terminal remains an independent routing
+            // obligation. Same-net row-access coalescing is deliberately not
+            // a candidate mode: only topology-proven diffusion/poly sharing
+            // may replace multiple terminal anchors.
+            preview_jobs.push((
+                ordered_nets.clone(),
+                placement_variant,
+                flexible_gate_access,
+            ));
         }
     }
     let distributed_power_nets = nets
@@ -6931,84 +7203,79 @@ fn normalize_with_progress(
     // inside an attempt because they negotiate one shared occupancy map.
     let mut preview_candidates = preview_jobs
         .into_par_iter()
-        .map(
-            |(ordered_nets, placement_variant, flexible_gate_access, shared_signal_access)| {
-                let (bounds, mut shapes) = compact_preview(
-                    &devices,
-                    &ordered_nets,
-                    &pins,
-                    project.technology.max_metal_layers,
-                    &project.technology.physical_rules,
-                    &planning,
-                    &placement_variant,
-                    flexible_gate_access,
-                    shared_signal_access,
-                );
-                for shape in &mut shapes {
-                    snap_shape_to_grid(shape, grid);
-                }
-                deduplicate_exact_vias(&mut shapes, grid);
-                let local_refinements = shapes
+        .map(|(ordered_nets, placement_variant, flexible_gate_access)| {
+            let (bounds, mut shapes) = compact_preview(
+                &devices,
+                &ordered_nets,
+                &pins,
+                project.technology.max_metal_layers,
+                &project.technology.physical_rules,
+                &planning,
+                &placement_variant,
+                flexible_gate_access,
+            );
+            for shape in &mut shapes {
+                snap_shape_to_grid(shape, grid);
+            }
+            deduplicate_exact_vias(&mut shapes, grid);
+            let local_refinements = shapes
+                .iter()
+                .filter(|shape| is_local_route_shape(shape))
+                .cloned()
+                .collect::<Vec<_>>();
+            shapes.retain(|shape| !is_local_route_shape(shape));
+            let (mut shapes, rejected_conflicts) =
+                commit_preview_routing(shapes, &project.technology.physical_rules);
+            let mut orphan_routing_shapes_removed =
+                prune_orphan_routing(&mut shapes, &project.technology.physical_rules);
+            let repaired_open_nets = repair_disconnected_routing(
+                &mut shapes,
+                &nets,
+                &project.technology.physical_rules,
+                false,
+            );
+            admit_local_route_refinements(
+                &mut shapes,
+                local_refinements,
+                &project.technology.physical_rules,
+            );
+            orphan_routing_shapes_removed +=
+                prune_orphan_routing(&mut shapes, &project.technology.physical_rules);
+            let connectivity_errors = physical_drc::terminal_connectivity_error_count(&shapes);
+            let power_distribution_errors = if require_upper_power_distribution {
+                distributed_power_nets
                     .iter()
-                    .filter(|shape| is_local_route_shape(shape))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                shapes.retain(|shape| !is_local_route_shape(shape));
-                let (mut shapes, rejected_conflicts) =
-                    commit_preview_routing(shapes, &project.technology.physical_rules);
-                let mut orphan_routing_shapes_removed =
-                    prune_orphan_routing(&mut shapes, &project.technology.physical_rules);
-                let repaired_open_nets = repair_disconnected_routing(
-                    &mut shapes,
-                    &nets,
-                    &project.technology.physical_rules,
-                    false,
-                );
-                admit_local_route_refinements(
-                    &mut shapes,
-                    local_refinements,
-                    &project.technology.physical_rules,
-                );
-                orphan_routing_shapes_removed +=
-                    prune_orphan_routing(&mut shapes, &project.technology.physical_rules);
-                let connectivity_errors = physical_drc::terminal_connectivity_error_count(&shapes);
-                let power_distribution_errors = if require_upper_power_distribution {
-                    distributed_power_nets
-                        .iter()
-                        .filter(|net| {
-                            !shapes.iter().any(|shape| {
-                                shape.net == Some(**net) && shape.layer == PhysicalLayer::Metal(2)
-                            })
+                    .filter(|net| {
+                        !shapes.iter().any(|shape| {
+                            shape.net == Some(**net) && shape.layer == PhysicalLayer::Metal(2)
                         })
-                        .count()
-                } else {
-                    0
-                };
-                let route_area = routing_bbox_area(&shapes);
-                (
-                    connectivity_errors,
-                    power_distribution_errors,
-                    rejected_conflicts.saturating_sub(repaired_open_nets),
-                    route_area,
-                    shapes.len(),
-                    orphan_routing_shapes_removed,
-                    bounds,
-                    shapes,
-                    placement_variant,
-                    shared_signal_access,
-                )
-            },
-        )
+                    })
+                    .count()
+            } else {
+                0
+            };
+            let route_area = routing_bbox_area(&shapes);
+            (
+                connectivity_errors,
+                power_distribution_errors,
+                rejected_conflicts.saturating_sub(repaired_open_nets),
+                route_area,
+                shapes.len(),
+                orphan_routing_shapes_removed,
+                bounds,
+                shapes,
+                placement_variant,
+            )
+        })
         .collect::<Vec<_>>();
     if std::env::var_os("OPENCHIPPY_ROUTER_TRACE").is_some() {
         for (index, candidate) in preview_candidates.iter().enumerate() {
             let placement_candidate = &candidate.8.candidates[candidate.8.selected_candidate];
             eprintln!(
-                "refined candidate: index={index} placement={} strategy={:?} compact={} shared_access={} connectivity={} power_distribution={} conflicts={} bbox={:.3} shapes={} pruned={}",
+                "refined candidate: index={index} placement={} strategy={:?} compact={} connectivity={} power_distribution={} conflicts={} bbox={:.3} shapes={} pruned={}",
                 candidate.8.selected_candidate,
                 placement_candidate.strategy,
                 placement_candidate.topology_compacted,
-                candidate.9,
                 candidate.0,
                 candidate.1,
                 candidate.2,
@@ -7033,7 +7300,6 @@ fn normalize_with_progress(
         PhysicalBounds,
         Vec<PhysicalShape>,
         PhysicalPlacementReport,
-        bool,
     ),
                          right: &(
         usize,
@@ -7045,7 +7311,6 @@ fn normalize_with_progress(
         PhysicalBounds,
         Vec<PhysicalShape>,
         PhysicalPlacementReport,
-        bool,
     )| {
         left.0
             .cmp(&right.0)
@@ -7080,9 +7345,8 @@ fn normalize_with_progress(
         if std::env::var_os("OPENCHIPPY_ROUTER_TRACE").is_some() {
             let placement_candidate = &candidate.8.candidates[candidate.8.selected_candidate];
             eprintln!(
-                "legalized finalist: index={index} compact={} shared_access={} connectivity={} rejected_conflicts={} bbox={:.3} shapes={} pruned={}",
+                "legalized finalist: index={index} compact={} connectivity={} rejected_conflicts={} bbox={:.3} shapes={} pruned={}",
                 placement_candidate.topology_compacted,
-                candidate.9,
                 candidate.0,
                 candidate.2,
                 candidate.3,
@@ -7102,7 +7366,6 @@ fn normalize_with_progress(
         mut bounds,
         mut shapes,
         selected_placement,
-        _selected_shared_signal_access,
     ) = preview_candidates
         .into_iter()
         .min_by(preview_order)
@@ -7132,6 +7395,39 @@ fn normalize_with_progress(
     candidate_summaries.sort_by_key(|candidate| candidate.candidate);
     let mut timing = physical_timing(&nets, &devices, &pins, &detailed_routing, project);
     timing.candidates = candidate_summaries;
+    let selected_timing_candidate = timing
+        .candidates
+        .iter()
+        .find(|candidate| {
+            candidate.floorplan_candidate == selected_candidate
+                && candidate.placement_candidate == placement.selected_candidate
+        })
+        .map(|candidate| candidate.candidate)
+        .unwrap_or_else(|| {
+            // Geometry refinement may select the conventional fallback even
+            // when the cheap planning stage did not route that placement as
+            // one of its bounded finalists. Publish the actually selected
+            // placement/routing result rather than leaving timing provenance
+            // pointing at a different physical candidate.
+            let candidate = timing.candidates.len();
+            let floorplan = &planning.candidates[selected_candidate];
+            timing.candidates.push(PhysicalCandidateTiming {
+                candidate,
+                floorplan_candidate: selected_candidate,
+                placement_candidate: placement.selected_candidate,
+                strategy: floorplan.strategy,
+                timing_driven: project.timing_target_ns.is_some(),
+                area_um2: floorplan.width_um * floorplan.height_um,
+                total_wire_length_um: detailed_routing.total_wire_length_um,
+                total_via_count: detailed_routing.total_via_count,
+                routing_overflow: global_routing.total_overflow,
+                detail_conflicts: detailed_routing.conflict_count,
+                estimated_worst_delay_ns: timing.estimated_worst_delay_ns,
+                slack_ns: timing.worst_slack_ns,
+                meets_timing: timing.worst_slack_ns.map(|slack| slack >= 0.0),
+            });
+            candidate
+        });
     timing.selected_candidate = Some(selected_timing_candidate);
     let selected_devices = placement
         .candidates
@@ -7154,11 +7450,25 @@ fn normalize_with_progress(
     materialize_shared_terminal_accesses(
         &mut shapes,
         &mut row_topology,
+        &nets,
+        &pins,
         &placed_by_id,
         &project.technology.physical_rules,
     );
     fill_same_net_metal_notches(&mut shapes, &project.technology.physical_rules);
     add_process_density_fill(&mut shapes, &bounds, &project.technology);
+    let density_fill_counts = process_density_fill_counts(&shapes, &project.technology);
+    let missing_density_layers = density_fill_counts
+        .iter()
+        .filter_map(|(material, count)| (*count == 0).then_some(material.as_str()))
+        .collect::<Vec<_>>();
+    if !missing_density_layers.is_empty() {
+        return Err(format!(
+            "{} defines process density fill, but physical generation emitted no dummy geometry for: {}",
+            project.technology.name,
+            missing_density_layers.join(", ")
+        ));
+    }
     let tapeout = physical_tapeout(&shapes, &bounds, project);
     let route_quality = route_quality(&shapes, grid);
 
@@ -7206,14 +7516,16 @@ pub fn normalize_project_with_progress(
     mut progress: impl FnMut(&'static str, u8),
 ) -> Result<PhysicalLayoutIr, String> {
     progress("topology", 1);
-    let implementation = if project
+    let mut effective_project = project.clone();
+    effective_project.technology.migrate_legacy_gds_layers();
+    let implementation = if effective_project
         .components
         .iter()
         .any(|component| component.block_definition_id.is_some())
     {
-        project.flattened()?
+        effective_project.flattened()?
     } else {
-        project.clone()
+        effective_project
     };
     let mut ir = normalize_with_progress(&implementation, &mut progress)?;
     let definition_names = project
@@ -7241,10 +7553,12 @@ mod tests {
     use super::{
         add_process_density_fill, commit_preview_routing, contains_shape, density_fill_layer,
         device_footprint_with_gate_access, gate_contact_point, local_route_candidates,
-        local_route_marker, multilayer_track_search, normalize, normalize_with_progress,
-        prune_orphan_routing, route_quality, shared_signal_row_accesses, synthesize_row_topology,
-        trim_metal_overhangs, DeviceKind, NetRole, PhysicalBounds, PhysicalDevice, PhysicalLayer,
-        PhysicalShape, PhysicalShapePurpose, RouteAnchor, ROUTING_CLEARANCE, ROUTING_LANDING_SIZE,
+        local_route_marker, materialize_shared_terminal_accesses, multilayer_track_search,
+        normalize, normalize_with_progress, process_density_fill_counts, prune_orphan_routing,
+        route_quality, shared_signal_row_accesses, synthesize_row_topology, trim_metal_overhangs,
+        DeviceKind, NetRole, PhysicalBounds, PhysicalDevice, PhysicalLayer, PhysicalNet,
+        PhysicalShape, PhysicalShapePurpose, PhysicalTerminal, RouteAnchor, ROUTING_CLEARANCE,
+        ROUTING_LANDING_SIZE,
     };
     use crate::model::{Project, TerminalRef};
     use crate::physical_canvas::{
@@ -7615,7 +7929,7 @@ mod tests {
                     .map(|(shape, _)| shape)
             })
             .collect::<Vec<_>>();
-        let topology = synthesize_row_topology(&mut shapes, &devices, &placed_by_id, &rules);
+        let mut topology = synthesize_row_topology(&mut shapes, &devices, &placed_by_id, &rules);
         assert_eq!(topology.len(), 1);
         assert_eq!(topology[0].ordered_devices, vec![left_id, right_id]);
         assert_eq!(topology[0].islands.len(), 1);
@@ -7631,7 +7945,7 @@ mod tests {
             !topology[0].gate_straps[0].geometry.is_empty(),
             "shared gate membership must retain its exact physical conductor"
         );
-        let shared = shapes
+        let shared_bounds = shapes
             .iter()
             .find(|shape| {
                 shape.layer == PhysicalLayer::Ndiff
@@ -7639,14 +7953,72 @@ mod tests {
                     && shape.net.is_none()
                     && shape.component_id.is_none()
             })
+            .map(|shape| (shape.x - shape.width / 2.0, shape.x + shape.width / 2.0))
             .unwrap();
-        assert!(shared.x - shared.width / 2.0 <= 1e-9);
-        assert!(shared.x + shared.width / 2.0 >= pitch - 1e-9);
+        assert!(shared_bounds.0 <= 1e-9);
+
+        let internal_net = PhysicalNet {
+            id: 7,
+            name: "internal_series_node".into(),
+            role: NetRole::Internal,
+            terminals: vec![
+                PhysicalTerminal {
+                    component_id: left_id,
+                    component_name: "M1".into(),
+                    terminal: "source".into(),
+                },
+                PhysicalTerminal {
+                    component_id: right_id,
+                    component_name: "M2".into(),
+                    terminal: "drain".into(),
+                },
+            ],
+        };
+        materialize_shared_terminal_accesses(
+            &mut shapes,
+            &mut topology,
+            &[internal_net],
+            &[],
+            &placed_by_id,
+            &rules,
+        );
+        assert!(shapes.iter().all(|shape| {
+            shape.net != Some(7)
+                || !matches!(
+                    shape.layer,
+                    PhysicalLayer::Contact | PhysicalLayer::Metal(_)
+                )
+        }));
+        assert!(shared_bounds.1 >= pitch - 1e-9);
         assert!(shapes.iter().any(|shape| {
             shape.layer == PhysicalLayer::Poly
                 && shape.net == Some(1)
                 && shape.component_id.is_none()
                 && shape.purpose == PhysicalShapePurpose::GateAccess
+        }));
+
+        // Electrical net equality alone must not dissolve the boundary
+        // between two separately instantiated cells. Their terminals remain
+        // distinct anchors and are joined later by routed metal.
+        let mut separate_cells = devices.clone();
+        separate_cells[1].standard_cell_group = Some("CELL_B".into());
+        let mut separate_shapes = separate_cells
+            .iter()
+            .zip(&placed)
+            .flat_map(|(device, placed)| {
+                device_footprint_with_gate_access(device, placed.x, placed.y, &rules, false)
+                    .into_iter()
+                    .map(|(shape, _)| shape)
+            })
+            .collect::<Vec<_>>();
+        let separate_topology =
+            synthesize_row_topology(&mut separate_shapes, &separate_cells, &placed_by_id, &rules);
+        assert_eq!(separate_topology[0].islands.len(), 2);
+        assert!(separate_topology[0].gate_straps.is_empty());
+        assert!(!separate_shapes.iter().any(|shape| {
+            shape.component_id.is_none()
+                && (shape.purpose == PhysicalShapePurpose::Active
+                    || shape.purpose == PhysicalShapePurpose::GateAccess)
         }));
     }
 
@@ -7907,7 +8279,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_coincident_terminals_remain_shared_after_contact_deduplication() {
+    fn coincident_same_net_terminals_in_separate_cells_remain_distinct() {
         let rules = PhysicalRuleDeck::default();
         let left_id = Uuid::new_v4();
         let right_id = Uuid::new_v4();
@@ -7988,8 +8360,11 @@ mod tests {
             }
         });
         let topology = synthesize_row_topology(&mut shapes, &devices, &placed_by_id, &rules);
-        assert_eq!(topology[0].islands.len(), 1);
-        assert_eq!(topology[0].islands[0].device_ids, vec![left_id, right_id]);
+        assert_eq!(topology[0].islands.len(), 2);
+        assert!(topology[0]
+            .islands
+            .iter()
+            .all(|island| island.device_ids.len() == 1));
     }
 
     #[test]
@@ -8762,11 +9137,85 @@ mod tests {
         ];
         let mut rules = PhysicalRuleDeck::default();
         rules.manufacturing_grid_um = 0.01;
-        assert_eq!(prune_orphan_routing(&mut shapes, &rules), 1);
-        assert_eq!(shapes.len(), 5);
+        // The branch plus both pieces of trunk outside the two contact
+        // junctions are removable after junction fragmentation.
+        assert_eq!(prune_orphan_routing(&mut shapes, &rules), 3);
+        // The retained trunk is now represented by two junction-bounded
+        // fragments rather than one indivisible rectangle.
+        assert_eq!(shapes.len(), 6);
         assert!(!shapes
             .iter()
             .any(|shape| shape.layer == PhysicalLayer::Metal(1) && shape.y > 0.0));
+    }
+
+    #[test]
+    fn final_cleanup_can_remove_only_the_unused_side_of_a_long_trunk() {
+        let left = Uuid::new_v4();
+        let right = Uuid::new_v4();
+        let mut shapes = vec![
+            PhysicalShape {
+                layer: PhysicalLayer::Contact,
+                x: 0.0,
+                y: 0.0,
+                width: 0.22,
+                height: 0.22,
+                component_id: Some(left),
+                net: Some(9),
+                purpose: PhysicalShapePurpose::Contact,
+            },
+            PhysicalShape {
+                layer: PhysicalLayer::Contact,
+                x: 4.0,
+                y: 0.0,
+                width: 0.22,
+                height: 0.22,
+                component_id: Some(right),
+                net: Some(9),
+                purpose: PhysicalShapePurpose::Contact,
+            },
+            PhysicalShape {
+                layer: PhysicalLayer::Metal(1),
+                x: 0.0,
+                y: 0.0,
+                width: 0.30,
+                height: 0.30,
+                component_id: Some(left),
+                net: Some(9),
+                purpose: PhysicalShapePurpose::DeviceLanding,
+            },
+            PhysicalShape {
+                layer: PhysicalLayer::Metal(1),
+                x: 4.0,
+                y: 0.0,
+                width: 0.30,
+                height: 0.30,
+                component_id: Some(right),
+                net: Some(9),
+                purpose: PhysicalShapePurpose::DeviceLanding,
+            },
+            // Only [0, 4] joins the terminals.  The [-4, 0] shootout used to
+            // survive because this complete rectangle was one graph node.
+            PhysicalShape {
+                layer: PhysicalLayer::Metal(1),
+                x: 0.0,
+                y: 0.0,
+                width: 8.0,
+                height: 0.30,
+                component_id: None,
+                net: Some(9),
+                purpose: PhysicalShapePurpose::Route,
+            },
+        ];
+        let mut rules = PhysicalRuleDeck::default();
+        rules.manufacturing_grid_um = 0.01;
+
+        assert_eq!(prune_orphan_routing(&mut shapes, &rules), 1);
+        let route = shapes
+            .iter()
+            .find(|shape| shape.purpose == PhysicalShapePurpose::Route)
+            .expect("terminal-to-terminal trunk remains");
+        assert!(route.x - route.width / 2.0 >= -0.01);
+        assert!(route.x + route.width / 2.0 >= 3.99);
     }
 
     #[test]
@@ -9058,6 +9507,11 @@ mod tests {
                 rule.target_density
             );
         }
+        let counts = process_density_fill_counts(&ir.shapes, &technology);
+        assert!(
+            counts.values().all(|count| *count > 0),
+            "every configured GF180 density material must emit geometry: {counts:?}"
+        );
         let active_fill = ir
             .shapes
             .iter()
@@ -9273,10 +9727,6 @@ mod tests {
         assert!(gaps
             .iter()
             .all(|gap| *gap + 1e-6 >= ROUTING_LANDING_SIZE + ROUTING_CLEARANCE));
-        assert!(
-            gaps.iter().any(|gap| *gap < 0.34),
-            "routing lanes should use landing-size clearance rather than the old 0.42 pitch"
-        );
     }
 
     #[test]
@@ -9742,5 +10192,49 @@ mod tests {
         assert!(fill.height >= 0.23 - 1e-9);
         assert!(fill.width <= 0.23 + 2.0 * rules.manufacturing_grid_um + 1e-9);
         assert!(fill.height <= 0.23 + 2.0 * rules.manufacturing_grid_um + 1e-9);
+    }
+
+    #[test]
+    fn edge_touching_m1_route_and_landing_receive_a_full_width_neck() {
+        let mut rules = Technology::default().physical_rules;
+        rules.manufacturing_grid_um = 0.005;
+        rules.metal.min_width_um = 0.23;
+        rules
+            .layer_overrides
+            .entry("metal1".into())
+            .or_insert_with(|| rules.metal.clone())
+            .min_width_um = 0.23;
+        let mut shapes = vec![
+            PhysicalShape {
+                layer: PhysicalLayer::Metal(1),
+                x: -26.115,
+                y: -19.210,
+                width: 0.640,
+                height: 0.230,
+                component_id: None,
+                net: Some(17),
+                purpose: PhysicalShapePurpose::Route,
+            },
+            PhysicalShape {
+                layer: PhysicalLayer::Metal(1),
+                x: -25.670,
+                y: -18.900,
+                width: 0.390,
+                height: 0.390,
+                component_id: None,
+                net: Some(17),
+                purpose: PhysicalShapePurpose::ViaLanding,
+            },
+        ];
+
+        assert_eq!(super::fill_same_net_metal_notches(&mut shapes, &rules), 1);
+        let fill = &shapes[2];
+        assert_eq!(fill.layer, PhysicalLayer::Metal(1));
+        assert_eq!(fill.net, Some(17));
+        assert_eq!(fill.purpose, PhysicalShapePurpose::RouteFill);
+        assert!(fill.width >= 0.23 - 1e-9);
+        assert!(fill.height >= 0.23 - 1e-9);
+        assert!(fill.x + fill.width / 2.0 >= -25.635 - 1e-9);
+        assert!((fill.y + fill.height / 2.0 - -19.095).abs() < 1e-9);
     }
 }

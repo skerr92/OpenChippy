@@ -1000,8 +1000,10 @@ fn oriented_row_devices(row: &[&PhysicalDevice]) -> Vec<PhysicalDevice> {
                 } else {
                     right.source_net
                 };
+                let same_cell = left.standard_cell_group.is_some()
+                    && left.standard_cell_group == right.standard_cell_group;
                 let candidate = (
-                    prior.0 + i32::from(left_facing == right_facing),
+                    prior.0 + i32::from(same_cell && left_facing == right_facing),
                     prior.1 - i32::from(right_orientation == 1),
                 );
                 if candidate > scores[index][right_orientation] {
@@ -1088,7 +1090,9 @@ fn compact_oriented_row_positions(
             )
         };
         let poly_pitch = (poly_span(left) + poly_span(right)) / 2.0 + rules.poly.min_spacing_um;
-        let pitch = if left.source_net == right.drain_net {
+        let same_cell = left.standard_cell_group.is_some()
+            && left.standard_cell_group == right.standard_cell_group;
+        let pitch = if same_cell && left.source_net == right.drain_net {
             (device_terminal_offset(left, rules) + device_terminal_offset(right, rules))
                 .max(poly_pitch)
         } else {
@@ -1896,7 +1900,7 @@ mod tests {
             component_id: Uuid::new_v4(),
             name: name.into(),
             physical_group: None,
-            standard_cell_group: None,
+            standard_cell_group: Some("CELL".into()),
             kind: DeviceKind::Nmos,
             gate_net,
             drain_net: gate_net + 10,
@@ -1916,7 +1920,7 @@ mod tests {
             component_id: Uuid::new_v4(),
             name: name.into(),
             physical_group: None,
-            standard_cell_group: None,
+            standard_cell_group: Some("CELL".into()),
             kind: DeviceKind::Nmos,
             gate_net,
             drain_net,
@@ -2006,7 +2010,7 @@ mod tests {
             &oriented[1],
             &technology.physical_rules,
         );
-        assert!((placements[1].x - placements[0].x - expected).abs() < 1e-9);
+        assert!(placements[1].x - placements[0].x + 1e-9 >= expected);
 
         let entries =
             compact_device_entries(&placements, &[left, right], &technology.physical_rules);

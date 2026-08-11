@@ -746,6 +746,13 @@ fn validate_logical_terminal_obligations(ir: &PhysicalLayoutIr, report: &mut Phy
                     + usize::from(device.source_net == net.id)
             })
             .sum::<usize>();
+        let internal_active_terminals = ir
+            .row_topology
+            .iter()
+            .flat_map(|row| &row.islands)
+            .flat_map(|island| &island.accesses)
+            .find(|access| topology_internal_access(ir, access) && access.net == net.id)
+            .map_or(0, |access| access.device_ids.len());
         // Only persisted pin geometry is an electrical obligation. VDD/GND
         // schematic source symbols currently become distributed power fabric,
         // not perimeter pin shapes; counting their logical symbols here would
@@ -759,7 +766,9 @@ fn validate_logical_terminal_obligations(ir: &PhysicalLayoutIr, report: &mut Phy
             net.role,
             crate::physical_layout::NetRole::Power | crate::physical_layout::NetRole::Ground
         ));
-        let expected = expected_device_terminals + expected_pins + expected_power_fabric;
+        let expected = expected_device_terminals.saturating_sub(internal_active_terminals)
+            + expected_pins
+            + expected_power_fabric;
         if expected == 0 {
             continue;
         }
@@ -914,34 +923,40 @@ pub(crate) fn missing_device_terminal_attachments(
             .collect::<Vec<_>>();
         for (terminal, expected_net) in [("drain", device.drain_net), ("source", device.source_net)]
         {
-            let contact = island
+            let access = island
                 .accesses
                 .iter()
                 .filter(|access| {
                     access.net == expected_net && access.device_ids.contains(&device.component_id)
                 })
-                .find_map(|access| {
-                    ir.shapes.iter().enumerate().find(|(_, shape)| {
-                        shape.layer == PhysicalLayer::Contact
-                            && shape.purpose == PhysicalShapePurpose::Contact
-                            && shape.net == Some(expected_net)
-                            && (if access.shared_contact {
-                                shape.component_id.is_none()
-                                    && (shape.x - access.x).abs() <= EPSILON
-                                    && (shape.y - access.y).abs() <= EPSILON
-                            } else {
-                                shape.component_id == Some(device.component_id)
-                            })
-                            && active
-                                .iter()
-                                .any(|(_, active_shape)| shapes_touch(shape, active_shape))
-                            && ir.shapes.iter().any(|landing| {
-                                landing.layer == PhysicalLayer::Metal(1)
-                                    && landing.net == shape.net
-                                    && shapes_touch(landing, shape)
-                            })
-                    })
+                .find(|access| {
+                    access.net == expected_net && access.device_ids.contains(&device.component_id)
                 });
+            if access.is_some_and(|access| topology_internal_access(ir, access)) {
+                continue;
+            }
+            let contact = access.and_then(|access| {
+                ir.shapes.iter().enumerate().find(|(_, shape)| {
+                    shape.layer == PhysicalLayer::Contact
+                        && shape.purpose == PhysicalShapePurpose::Contact
+                        && shape.net == Some(expected_net)
+                        && (if access.shared_contact {
+                            shape.component_id.is_none()
+                                && (shape.x - access.x).abs() <= EPSILON
+                                && (shape.y - access.y).abs() <= EPSILON
+                        } else {
+                            shape.component_id == Some(device.component_id)
+                        })
+                        && active
+                            .iter()
+                            .any(|(_, active_shape)| shapes_touch(shape, active_shape))
+                        && ir.shapes.iter().any(|landing| {
+                            landing.layer == PhysicalLayer::Metal(1)
+                                && landing.net == shape.net
+                                && shapes_touch(landing, shape)
+                        })
+                })
+            });
             if contact.is_none() {
                 missing.push(MissingDeviceTerminalAttachment {
                     component_id: device.component_id,
@@ -952,6 +967,39 @@ pub(crate) fn missing_device_terminal_attachments(
         }
     }
     missing
+}
+
+/// A repeated source/drain boundary wholly contained by one persisted active
+/// island is electrically closed in diffusion and must not be manufactured as
+/// a contact/M1 pin. This exemption is intentionally narrow: every logical
+/// terminal on the net must be one of the access members and no boundary pin
+/// may expose the net outside the island.
+fn topology_internal_access(
+    ir: &PhysicalLayoutIr,
+    access: &crate::physical_layout::PhysicalTerminalAccess,
+) -> bool {
+    if access.device_ids.len() < 2
+        || access.shared_contact
+        || ir.shapes.iter().any(|shape| {
+            shape.net == Some(access.net) && shape.purpose == PhysicalShapePurpose::Pin
+        })
+    {
+        return false;
+    }
+    let terminal_devices = ir
+        .devices
+        .iter()
+        .flat_map(|device| {
+            [device.gate_net, device.drain_net, device.source_net]
+                .into_iter()
+                .filter(move |net| *net == access.net)
+                .map(move |_| device.component_id)
+        })
+        .collect::<Vec<_>>();
+    terminal_devices.len() == access.device_ids.len()
+        && terminal_devices
+            .iter()
+            .all(|device_id| access.device_ids.contains(device_id))
 }
 
 fn validate_device_terminal_attachments(ir: &PhysicalLayoutIr, report: &mut PhysicalDrcReport) {
@@ -1966,6 +2014,63 @@ mod tests {
                     x: 0.0,
                     y: 0.0,
                     shared_contact: true,
+                }],
+                bounds: PhysicalBounds {
+                    min_x: -1.0,
+                    min_y: -0.5,
+                    max_x: 1.0,
+                    max_y: 0.5,
+                },
+                geometry: vec![],
+            }],
+            gate_straps: vec![],
+        });
+
+        let mut report = PhysicalDrcReport::default();
+        validate_logical_terminal_obligations(&ir, &mut report);
+        assert!(report.diagnostics.is_empty(), "{:#?}", report.diagnostics);
+    }
+
+    #[test]
+    fn topology_internal_diffusion_node_requires_no_contact_or_metal_pin() {
+        let left = uuid::Uuid::new_v4();
+        let right = uuid::Uuid::new_v4();
+        let mut ir = layout(vec![]);
+        ir.devices = [left, right]
+            .into_iter()
+            .map(|component_id| PhysicalDevice {
+                component_id,
+                name: format!("M{component_id}"),
+                physical_group: None,
+                standard_cell_group: Some("CELL".into()),
+                kind: DeviceKind::Nmos,
+                gate_net: 8,
+                drain_net: 7,
+                source_net: 9,
+                width_um: 1.0,
+                length_um: 0.18,
+            })
+            .collect();
+        ir.nets.push(PhysicalNet {
+            id: 7,
+            name: "internal_shared_active".into(),
+            role: NetRole::Internal,
+            terminals: vec![],
+        });
+        ir.row_topology.push(PhysicalRowTopology {
+            kind: DeviceKind::Nmos,
+            y: 0.0,
+            ordered_devices: vec![left, right],
+            islands: vec![PhysicalActiveIsland {
+                layer: PhysicalLayer::Ndiff,
+                device_ids: vec![left, right],
+                terminal_nets: vec![9, 7, 9],
+                accesses: vec![PhysicalTerminalAccess {
+                    net: 7,
+                    device_ids: vec![left, right],
+                    x: 0.0,
+                    y: 0.0,
+                    shared_contact: false,
                 }],
                 bounds: PhysicalBounds {
                     min_x: -1.0,

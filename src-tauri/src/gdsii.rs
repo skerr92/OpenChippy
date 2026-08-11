@@ -803,6 +803,7 @@ mod tests {
         // expansion on a deliberately tiny inverter. Density closure is
         // covered by the full-floorplan GF180 regressions in physical_layout.
         technology.physical_rules.density_fill.layers.clear();
+        technology.process_id = "gf180mcu-gds-mapping-fixture".into();
         let mut project = inverter();
         project.technology = technology.clone();
         let ir = physical_layout::normalize_project(&project).unwrap();

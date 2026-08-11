@@ -434,11 +434,41 @@ impl Technology {
     /// written. Only known process identities are migrated; custom decks must
     /// remain explicit about manufacturing layers.
     pub fn migrate_legacy_gds_layers(&mut self) -> bool {
-        if self.process_id != "gf180mcu-3v3-5m-compat" {
+        let normalized_name = self
+            .name
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        let legacy_named_gf180 = self.process_id == "legacy-unidentified"
+            && normalized_name.starts_with("gf180mcu")
+            && normalized_name.contains("5m");
+        if self.process_id != "gf180mcu-3v3-5m-compat" && !legacy_named_gf180 {
             return false;
         }
 
         let mut changed = false;
+        // Projects persist the selected technology snapshot. Older GF180
+        // snapshots predate density rules and dummy-purpose mappings; keeping
+        // those empty silently disables manufacturing fill after reopening a
+        // perfectly valid design. Hydrate only missing contracts from the
+        // packaged deck while preserving any explicit user overrides.
+        if self.physical_rules.density_fill.layers.is_empty()
+            || self.gds_layers.dummy_layers.is_empty()
+        {
+            let canonical = Technology::from_yaml(include_str!(
+                "../../docs/examples/process_gf180mcu_3v3_5m_dr.yaml"
+            ))
+            .expect("packaged GF180 technology must remain valid");
+            if self.physical_rules.density_fill.layers.is_empty() {
+                self.physical_rules.density_fill = canonical.physical_rules.density_fill;
+                changed = true;
+            }
+            if self.gds_layers.dummy_layers.is_empty() {
+                self.gds_layers.dummy_layers = canonical.gds_layers.dummy_layers;
+                changed = true;
+            }
+        }
         if !self.gds_layers.layers.contains_key("pwell") {
             self.gds_layers.layers.insert(
                 "pwell".into(),
@@ -1584,6 +1614,8 @@ mod tests {
         technology.gds_layers.layers.get_mut("pdiff").unwrap()[1].enclosure_um = 0.0;
         technology.physical_rules.contact.size_um = 0.23;
         technology.physical_rules.layer_overrides.remove("metal5");
+        technology.physical_rules.density_fill.layers.clear();
+        technology.gds_layers.dummy_layers.clear();
 
         assert!(technology.migrate_legacy_gds_layers());
         assert_eq!(
@@ -1598,6 +1630,8 @@ mod tests {
         assert_eq!(technology.gds_layers.layers["ndiff"][1].enclosure_um, 0.35);
         assert_eq!(technology.gds_layers.layers["pdiff"][1].enclosure_um, 0.35);
         assert_eq!(technology.physical_rules.contact.size_um, 0.22);
+        assert!(!technology.physical_rules.density_fill.layers.is_empty());
+        assert!(!technology.gds_layers.dummy_layers.is_empty());
         assert_eq!(
             technology.physical_rules.layer_overrides["metal5"],
             LayerRule {
@@ -1608,6 +1642,23 @@ mod tests {
         );
         assert!(technology.validate().is_ok());
         assert!(!technology.migrate_legacy_gds_layers());
+    }
+
+    #[test]
+    fn legacy_unidentified_gf180_snapshot_receives_manufacturing_fill() {
+        let mut technology = Technology::from_yaml(include_str!(
+            "../../docs/examples/process_gf180mcu_3v3_5m_dr.yaml"
+        ))
+        .unwrap();
+        technology.process_id = "legacy-unidentified".into();
+        technology.deck_revision = "legacy".into();
+        technology.source = "embedded project snapshot".into();
+        technology.physical_rules.density_fill.layers.clear();
+        technology.gds_layers.dummy_layers.clear();
+
+        assert!(technology.migrate_legacy_gds_layers());
+        assert!(!technology.physical_rules.density_fill.layers.is_empty());
+        assert!(!technology.gds_layers.dummy_layers.is_empty());
     }
 
     #[test]

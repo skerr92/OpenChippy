@@ -1349,6 +1349,56 @@ native DRC/LVS audit, but visual route cleanup remains active: terminal-free
 shootouts, redundant transition stacks, and unnecessary long branches must
 continue to be compacted rather than hidden by aggregate pass counts.
 
+Physical IR v38 makes generated routing junction-addressable before pruning.
+Axial route rectangles are split at same-net perpendicular metal junctions,
+legal via transitions, and M1 contacts while pins, device/via landings, and
+power rails remain immutable. Each fragment is independently quantized above
+the process minimum-area requirement. The terminal-tree reducer can therefore
+discard only an unused tail or alternate branch rather than retaining a whole
+long rectangle because its middle is required. On the canonical GF180
+4B_ADDER, routed metal area decreases from 1640.0914 to 1501.11875 µm² (about
+8.5%) while native DRC remains clean, LVS still closes all 144 devices and 82
+nets, route-quality reports no terminal-free components, duplicate/unlanded
+vias, or unjustified endpoints, and the official deck again reports only its
+known DBU comparator marker. Further transition-stack and path-length
+compaction remains active work.
+
+Physical IR v39 removes same-net row-access coalescing from production routing.
+That optimization could replace several distinct device-terminal anchors inside
+one logical block with a single synthetic upper-metal anchor. Although the
+emitted bus connected the named net, it weakened the physical contract by
+allowing one access point to stand in for several input/output or MOS terminal
+obligations. Every ordinary gate, source, drain, and boundary pin now remains
+an independent routing anchor through detailed routing and terminal-tree
+cleanup. Multiple anchors may meet through emitted metal, while replacement by
+one physical access remains legal only for topology-proven shared diffusion or
+an explicitly synthesized shared-poly strap. The IR version bump invalidates
+cached layouts that contain the retired pseudo-terminal construction.
+
+Physical IR v40 applies the same terminal-identity rule to front-end geometry.
+Same-net adjacency is no longer sufficient to merge source/drain diffusion,
+replace two contacts with one shared cut, or synthesize a shared-poly strap.
+Those transformations require both devices to belong to the same explicit leaf
+standard-cell instance. Terminals in separate logical objects remain separate
+physical anchors and connect only through emitted routing, even when their net
+IDs match. Source/drain orientation likewise receives no sharing preference
+across a cell boundary.
+
+Well compaction must not enlarge a transistor's active region in the channel-
+width direction merely to consume empty stripe area: that changes effective
+MOS width, drive, and parasitics. A later well-fitting slice should instead
+derive each well boundary from the enclosed active envelope plus the selected
+process's minimum well enclosure and spacing, with wider devices represented by
+their requested width or legal fingering.
+
+Diffusion optimization should nevertheless be timing-driven. The optimizer
+will evaluate process-legal drive-strength/width and finger-count candidates,
+regenerate active, poly, contacts, placement, and routing for each candidate,
+and score whole-path delay together with input capacitance, routed parasitics,
+area, congestion, power, DRC, and LVS. A selected geometry change must update
+the electrical device parameters in Physical IR; post-route shape stretching
+that is invisible to timing and extraction is forbidden.
+
 Correct device extraction and zero shorts are hard gates. Open connectivity and
 manufacturing-rule diagnostics remain explicit defects, but a pass that exposes
 them is retained as diagnostic evidence rather than automatically reverted.
@@ -1360,3 +1410,47 @@ Instead, OpenChippy should make evidence-based claims:
 > "These specific process rules, physical implementation capabilities, GDSII generation, GDSII interoperability, LEF generation, manufacturing workflows, and silicon qualification steps have been independently verified."
 
 The ultimate goal is to build confidence incrementally through measurable qualification designs, culminating in successful fabrication and verified silicon.
+
+### Physical IR v41 — topology-internal access removal and fill visibility
+
+- Treat a repeated source/drain net that is fully contained by one proven shared-diffusion island as internal active connectivity, not as a routable cell pin. Remove its provisional contacts, M1 landings, vias, and metal tree; preserve a physical access only when the net reaches another terminal or a boundary pin.
+- Preserve the process distinction between the highest routable signal metal and dedicated top-metal dummy fill in Physical IR and GDSII. The 3D viewer must discover and render process-owned synthetic fill layers even though they are not routable layers.
+- Requalify regenerated GF180 layouts with native DRC/connectivity/LVS and the official density checks; visual presence of fill is diagnostic, not proof of density compliance.
+
+### Physical IR v42 — topology-aware DRC and legacy GF180 fill hydration
+
+- Native DRC treats a fully contained repeated source/drain boundary as two terminal obligations closed by persisted shared-active geometry. It must not demand a contact or Metal 1 landing unless that net leaves the active island.
+- Reopened projects carrying the canonical GF180 process identity inherit missing packaged density-fill rules and dummy-layer mappings from the current compatibility deck. Explicit non-empty project rules remain authoritative.
+- Qualification must report both the native connectivity/LVS result and the number of emitted process-owned fill shapes so an empty legacy fill contract cannot masquerade as a clean design.
+
+### Physical IR v43 — generation-time fill contract
+
+- Apply known-process manufacturing migrations inside physical generation and project hashing, not only while opening a file. This covers projects already resident in application state and prevents stale no-fill caches from matching the effective process contract.
+- Fail physical generation when a non-empty density-fill deck emits zero dummy-fill shapes. A nominally complete IR may not silently omit the process-owned fill stage.
+- Render dummy-fill shapes with a visible material treatment and discover synthetic top-metal fill layers independently of the routable layer count.
+
+### Physical IR v44 — per-material fill proof and legacy process identity
+
+- Require nonzero emitted dummy geometry for every material configured by the
+  effective process fill deck and expose those counts independently in audit
+  output and the physical-layout viewer.
+- Narrowly recognize legacy GF180MCU 5M project snapshots whose process ID was
+  not persisted, then apply the packaged manufacturing mappings consistently
+  across generation, caching, native DRC/LVS, LEF, and GDSII export.
+
+### Physical IR v45 — foundry-width-safe conductor junctions
+
+- Treat a zero-gap, short shared edge between a routed metal segment and its
+  landing as a potential foundry minimum-width neck, even though native
+  connectivity sees one continuous net.
+- Repair only the route-end projection, matching its complete thickness and
+  establishing a process-minimum overlap inside the landing. Reject the repair
+  when it approaches a foreign net; do not use a centered square that creates
+  new concave-corner violations.
+- Requalify the exact GF180 4B adder through native DRC, terminal closure, LVS,
+  deterministic GDS structure validation, and the official variant-C 5LM/9K
+  KLayout deck.
+
+#### Density quality follow-up
+
+Replace global minimum-only fill closure with process-configurable sliding-window closure. Each layer should define minimum, preferred, and maximum density; generation should approach the preferred value with a safety margin instead of either stopping at the absolute minimum or maximizing occupancy. Candidate fill must remain timing-aware and respect signal, clock, power, antenna, and device keepouts because unnecessary fill increases coupling and parasitic capacitance. Report worst-window density, underfilled windows, overfilled windows, and achieved distribution per layer.
