@@ -155,6 +155,11 @@ pub struct WaveformResult {
 
 type TerminalKey = (Uuid, String);
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SimulationMemory {
+    terminal_states: HashMap<TerminalKey, LogicState>,
+}
+
 fn terminals(component: &Component) -> &'static [&'static str] {
     match component.kind.as_str() {
         "nmos" | "pmos" => &["gate", "drain", "source"],
@@ -436,6 +441,14 @@ fn analyze_fanout(
 }
 
 pub fn simulate(project: &Project, inputs: &HashMap<String, LogicState>) -> SimulationResult {
+    simulate_with_memory(project, inputs, None).0
+}
+
+pub(crate) fn simulate_with_memory(
+    project: &Project,
+    inputs: &HashMap<String, LogicState>,
+    previous: Option<&SimulationMemory>,
+) -> (SimulationResult, SimulationMemory) {
     let mut terminal_sets = DisjointSet::default();
     let mut terminal_indices = HashMap::new();
     for component in &project.components {
@@ -530,10 +543,24 @@ pub fn simulate(project: &Project, inputs: &HashMap<String, LogicState>) -> Simu
 
     let mut states = direct_drives
         .iter()
-        .map(|drives| {
+        .enumerate()
+        .map(|(net, drives)| {
             let mut combined = Drives::default();
             drives.iter().for_each(|state| combined.add(*state));
-            combined.state()
+            let direct = combined.state();
+            if direct != LogicState::Floating {
+                return direct;
+            }
+            previous
+                .and_then(|memory| {
+                    terminal_nets.iter().find_map(|(terminal, terminal_net)| {
+                        (*terminal_net == net)
+                            .then(|| memory.terminal_states.get(terminal).copied())
+                            .flatten()
+                    })
+                })
+                .filter(|state| matches!(state, LogicState::High | LogicState::Low))
+                .unwrap_or(LogicState::Floating)
         })
         .collect::<Vec<_>>();
     let mut switches = vec![SwitchState::Unknown; transistors.len()];
@@ -610,6 +637,23 @@ pub fn simulate(project: &Project, inputs: &HashMap<String, LogicState>) -> Simu
         switches = next_switches;
     }
 
+    // A floating node that is both channel-driven and controls another
+    // transistor is unresolved feedback, not a truly open circuit. Without
+    // prior state a bistable loop has multiple valid DC solutions.
+    let gate_nets = transistors
+        .iter()
+        .map(|transistor| transistor.gate)
+        .collect::<BTreeSet<_>>();
+    let channel_nets = transistors
+        .iter()
+        .flat_map(|transistor| [transistor.drain, transistor.source])
+        .collect::<BTreeSet<_>>();
+    for net in gate_nets.intersection(&channel_nets) {
+        if states[*net] == LogicState::Floating {
+            states[*net] = LogicState::Unknown;
+        }
+    }
+
     let high_resistance = shortest_drive_resistances(
         net_count,
         &transistors,
@@ -679,7 +723,13 @@ pub fn simulate(project: &Project, inputs: &HashMap<String, LogicState>) -> Simu
     outputs.sort_by(|left, right| left.name.cmp(&right.name));
 
     let fanout = analyze_fanout(project, &terminal_nets, &net_names);
-    SimulationResult {
+    let memory = SimulationMemory {
+        terminal_states: terminal_nets
+            .iter()
+            .map(|(terminal, net)| (terminal.clone(), states[*net]))
+            .collect(),
+    };
+    let result = SimulationResult {
         nets,
         outputs,
         transistors: transistors
@@ -709,7 +759,8 @@ pub fn simulate(project: &Project, inputs: &HashMap<String, LogicState>) -> Simu
         converged,
         supply_voltage: project.technology.supply_voltage,
         fanout,
-    }
+    };
+    (result, memory)
 }
 
 pub fn truth_table(project: &Project) -> Result<TruthTableResult, String> {
@@ -821,6 +872,7 @@ pub fn waveform(project: &Project, config: WaveformConfig) -> Result<WaveformRes
         .chain(&output_names)
         .map(|name| (name.clone(), Vec::new()))
         .collect::<HashMap<_, _>>();
+    let mut memory = None;
     for time in times {
         let step = time / config.input_change_ns;
         let inputs = input_names
@@ -854,7 +906,8 @@ pub fn waveform(project: &Project, config: WaveformConfig) -> Result<WaveformRes
                 (name.clone(), state)
             })
             .collect::<HashMap<_, _>>();
-        let result = simulate(project, &inputs);
+        let (result, next_memory) = simulate_with_memory(project, &inputs, memory.as_ref());
+        memory = Some(next_memory);
         for output in result.outputs {
             let samples = signal_samples
                 .get_mut(&output.name)
@@ -1818,6 +1871,124 @@ mod tests {
         let loaded: Project = serde_json::from_str(&serialized).unwrap();
         assert_eq!(loaded.block_definitions.len(), 1);
         assert_eq!(loaded.components[0].block_definition_id, Some(definition));
+    }
+
+    #[test]
+    fn cross_coupled_nand_latch_retains_state_and_starts_unknown() {
+        let mut source = Project::default();
+        let vdd = source.add_component("vdd", 0.0, -5.0).unwrap();
+        let gnd = source.add_component("gnd", 0.0, 5.0).unwrap();
+        let a = source.add_component("input", -5.0, -1.0).unwrap();
+        let b = source.add_component("input", -5.0, 1.0).unwrap();
+        let out = source.add_component("output", 5.0, 0.0).unwrap();
+        let pa = source.add_component("pmos", -1.0, -2.0).unwrap();
+        let pb = source.add_component("pmos", 1.0, -2.0).unwrap();
+        let na = source.add_component("nmos", 0.0, 1.0).unwrap();
+        let nb = source.add_component("nmos", 0.0, 3.0).unwrap();
+        connect(&mut source, (vdd, "out"), (pa, "source"));
+        connect(&mut source, (vdd, "out"), (pb, "source"));
+        connect(&mut source, (pa, "drain"), (out, "in"));
+        connect(&mut source, (pb, "drain"), (out, "in"));
+        connect(&mut source, (na, "drain"), (out, "in"));
+        connect(&mut source, (na, "source"), (nb, "drain"));
+        connect(&mut source, (nb, "source"), (gnd, "out"));
+        connect(&mut source, (a, "out"), (pa, "gate"));
+        connect(&mut source, (a, "out"), (na, "gate"));
+        connect(&mut source, (b, "out"), (pb, "gate"));
+        connect(&mut source, (b, "out"), (nb, "gate"));
+        let definition = source.capture_block("NAND2".into()).unwrap();
+
+        let mut nand_probe = Project::default();
+        nand_probe.block_definitions = source.block_definitions.clone();
+        let gate = nand_probe.place_block(definition, 0.0, 0.0).unwrap();
+        let probe_vdd = nand_probe.add_component("vdd", 0.0, -5.0).unwrap();
+        let probe_gnd = nand_probe.add_component("gnd", 0.0, 5.0).unwrap();
+        let probe_a = nand_probe.add_component("input", -5.0, -1.0).unwrap();
+        let probe_b = nand_probe.add_component("input", -5.0, 1.0).unwrap();
+        let probe_out = nand_probe.add_component("output", 5.0, 0.0).unwrap();
+        connect(&mut nand_probe, (probe_vdd, "out"), (gate, "VDD1"));
+        connect(&mut nand_probe, (probe_gnd, "out"), (gate, "GND1"));
+        connect(&mut nand_probe, (probe_a, "out"), (gate, "IN1"));
+        connect(&mut nand_probe, (probe_b, "out"), (gate, "IN2"));
+        connect(&mut nand_probe, (gate, "OUT1"), (probe_out, "in"));
+        let nand_result = simulate(
+            &nand_probe.flattened().unwrap(),
+            &HashMap::from([
+                ("IN1".into(), LogicState::High),
+                ("IN2".into(), LogicState::High),
+            ]),
+        );
+        assert_eq!(output(&nand_result), LogicState::Low);
+
+        let mut latch = Project::default();
+        latch.block_definitions = source.block_definitions;
+        let q_gate = latch.place_block(definition, -2.0, 0.0).unwrap();
+        let qn_gate = latch.place_block(definition, 2.0, 0.0).unwrap();
+        let top_vdd = latch.add_component("vdd", 0.0, -5.0).unwrap();
+        let top_gnd = latch.add_component("gnd", 0.0, 5.0).unwrap();
+        let set_bar = latch.add_component("input", -6.0, -1.0).unwrap();
+        let reset_bar = latch.add_component("input", -6.0, 1.0).unwrap();
+        latch.rename_component(set_bar, "S_B".into()).unwrap();
+        latch.rename_component(reset_bar, "R_B".into()).unwrap();
+        let q = latch.add_component("output", 6.0, -1.0).unwrap();
+        let qn = latch.add_component("output", 6.0, 1.0).unwrap();
+        latch.rename_component(q, "Q".into()).unwrap();
+        latch.rename_component(qn, "Q_N".into()).unwrap();
+        for gate in [q_gate, qn_gate] {
+            connect(&mut latch, (top_vdd, "out"), (gate, "VDD1"));
+            connect(&mut latch, (top_gnd, "out"), (gate, "GND1"));
+        }
+        connect(&mut latch, (set_bar, "out"), (q_gate, "IN1"));
+        connect(&mut latch, (reset_bar, "out"), (qn_gate, "IN1"));
+        connect(&mut latch, (q_gate, "OUT1"), (qn_gate, "IN2"));
+        connect(&mut latch, (qn_gate, "OUT1"), (q_gate, "IN2"));
+        connect(&mut latch, (q_gate, "OUT1"), (q, "in"));
+        connect(&mut latch, (qn_gate, "OUT1"), (qn, "in"));
+        let flattened = latch.flattened().unwrap();
+
+        let (uninitialized, _) = super::simulate_with_memory(
+            &flattened,
+            &HashMap::from([
+                ("S_B".into(), LogicState::High),
+                ("R_B".into(), LogicState::High),
+            ]),
+            None,
+        );
+        assert!(uninitialized
+            .outputs
+            .iter()
+            .all(|output| output.state == LogicState::Unknown));
+
+        let (set, memory) = super::simulate_with_memory(
+            &flattened,
+            &HashMap::from([
+                ("S_B".into(), LogicState::Low),
+                ("R_B".into(), LogicState::High),
+            ]),
+            None,
+        );
+        assert_eq!(
+            set.outputs
+                .iter()
+                .map(|output| output.state)
+                .collect::<Vec<_>>(),
+            [LogicState::High, LogicState::Low]
+        );
+        let (held, _) = super::simulate_with_memory(
+            &flattened,
+            &HashMap::from([
+                ("S_B".into(), LogicState::High),
+                ("R_B".into(), LogicState::High),
+            ]),
+            Some(&memory),
+        );
+        assert_eq!(
+            held.outputs
+                .iter()
+                .map(|output| output.state)
+                .collect::<Vec<_>>(),
+            [LogicState::High, LogicState::Low]
+        );
     }
 
     #[test]

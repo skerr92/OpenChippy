@@ -19,7 +19,7 @@ use uuid::Uuid;
 // Version 46 persists process density coverage measured globally and over
 // sliding windows. Version 45's terminal-preserving manufacturing baseline
 // remains otherwise unchanged.
-pub const CURRENT_PHYSICAL_IR_VERSION: u32 = 46;
+pub const CURRENT_PHYSICAL_IR_VERSION: u32 = 47;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +72,8 @@ pub struct PhysicalDensityLayerReport {
     pub achieved_maximum_window_density: f64,
     pub window_width_um: f64,
     pub window_height_um: f64,
+    pub window_step_x_um: f64,
+    pub window_step_y_um: f64,
     pub window_count: usize,
     pub underfilled_window_count: usize,
     pub overfilled_window_count: usize,
@@ -630,6 +632,18 @@ pub struct PhysicalPin {
     pub name: String,
     pub role: NetRole,
     pub net: usize,
+    #[serde(default)]
+    pub pad_id: Option<String>,
+    #[serde(default)]
+    pub x: Option<f64>,
+    #[serde(default)]
+    pub y: Option<f64>,
+    #[serde(default)]
+    pub width_um: Option<f64>,
+    #[serde(default)]
+    pub height_um: Option<f64>,
+    #[serde(default)]
+    pub layer: Option<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3170,15 +3184,17 @@ fn compact_preview(
     let pin_x_by_net = signal_pins
         .iter()
         .map(|pin| {
-            let x = if pin.role == NetRole::Input {
-                let x = bounds.min_x + 0.35 + input_index as f64 * 0.7;
-                input_index += 1;
-                x
-            } else {
-                let x = bounds.max_x - 0.35 - output_index as f64 * 0.7;
-                output_index += 1;
-                x
-            };
+            let x = pin.x.unwrap_or_else(|| {
+                if pin.role == NetRole::Input {
+                    let x = bounds.min_x + 0.35 + input_index as f64 * 0.7;
+                    input_index += 1;
+                    x
+                } else {
+                    let x = bounds.max_x - 0.35 - output_index as f64 * 0.7;
+                    output_index += 1;
+                    x
+                }
+            });
             (pin.net, x)
         })
         .collect::<HashMap<_, _>>();
@@ -3236,8 +3252,9 @@ fn compact_preview(
 
     for pin in signal_pins {
         let x = pin_x_by_net[&pin.net];
-        let y = signal_track[&pin.net];
-        let layer = PhysicalLayer::Metal(signal_layer[&pin.net]);
+        let y = pin.y.unwrap_or(signal_track[&pin.net]);
+        let pin_layer = pin.layer.unwrap_or(signal_layer[&pin.net]);
+        let layer = PhysicalLayer::Metal(pin_layer);
         anchors.entry(pin.net).or_default().push(RouteAnchor {
             point: (x, y),
             layer,
@@ -3248,16 +3265,12 @@ fn compact_preview(
             layer,
             x,
             y,
-            width: minimum_metal_landing(
-                rules,
-                signal_layer[&pin.net],
-                signal_layer[&pin.net].saturating_sub(1).max(1),
-            ),
-            height: minimum_metal_landing(
-                rules,
-                signal_layer[&pin.net],
-                signal_layer[&pin.net].saturating_sub(1).max(1),
-            ),
+            width: pin.width_um.unwrap_or_else(|| {
+                minimum_metal_landing(rules, pin_layer, pin_layer.saturating_sub(1).max(1))
+            }),
+            height: pin.height_um.unwrap_or_else(|| {
+                minimum_metal_landing(rules, pin_layer, pin_layer.saturating_sub(1).max(1))
+            }),
             component_id: Some(pin.component_id),
             net: Some(pin.net),
             purpose: PhysicalShapePurpose::Pin,
@@ -6177,6 +6190,7 @@ fn density_fill_layer(name: &str, technology: &Technology) -> Option<PhysicalLay
     }
 }
 
+#[cfg(test)]
 fn process_density_fill_counts(
     shapes: &[PhysicalShape],
     technology: &Technology,
@@ -6199,6 +6213,153 @@ fn process_density_fill_counts(
         .collect()
 }
 
+fn add_tapeout_perimeter_geometry(
+    shapes: &mut Vec<PhysicalShape>,
+    bounds: &mut PhysicalBounds,
+    pins: &[PhysicalPin],
+    technology: &Technology,
+) {
+    let tapeout = &technology.tapeout_window;
+    let width = tapeout.width_um - 2.0 * tapeout.edge_margin_um;
+    let height = tapeout.height_um - 2.0 * tapeout.edge_margin_um;
+    if tapeout.layout_mode == crate::technology::TapeoutLayoutMode::FullUsableArea {
+        *bounds = PhysicalBounds {
+            min_x: -width / 2.0,
+            min_y: -height / 2.0,
+            max_x: width / 2.0,
+            max_y: height / 2.0,
+        };
+    }
+    let role_net = |role: crate::technology::TapeoutPadRole| {
+        pins.iter().find_map(|pin| {
+            let matches = matches!(
+                (role, pin.role),
+                (crate::technology::TapeoutPadRole::Power, NetRole::Power)
+                    | (crate::technology::TapeoutPadRole::Ground, NetRole::Ground)
+            );
+            matches.then_some(pin.net)
+        })
+    };
+    let stitch_supplies = [
+        crate::technology::TapeoutPadRole::Power,
+        crate::technology::TapeoutPadRole::Ground,
+    ]
+    .into_iter()
+    .all(|role| tapeout.pads.iter().filter(|pad| pad.role == role).count() >= 2);
+    for ring in &tapeout.rings {
+        let ring_width = width - 2.0 * ring.inset_um;
+        let ring_height = height - 2.0 * ring.inset_um;
+        let net = stitch_supplies.then(|| role_net(ring.net)).flatten();
+        for (x, y, shape_width, shape_height) in [
+            (
+                0.0,
+                -height / 2.0 + ring.inset_um,
+                ring_width,
+                ring.width_um,
+            ),
+            (0.0, height / 2.0 - ring.inset_um, ring_width, ring.width_um),
+            (
+                -width / 2.0 + ring.inset_um,
+                0.0,
+                ring.width_um,
+                ring_height,
+            ),
+            (width / 2.0 - ring.inset_um, 0.0, ring.width_um, ring_height),
+        ] {
+            shapes.push(PhysicalShape {
+                layer: PhysicalLayer::Metal(ring.layer),
+                x,
+                y,
+                width: shape_width,
+                height: shape_height,
+                component_id: None,
+                net,
+                purpose: PhysicalShapePurpose::PowerRail,
+            });
+        }
+    }
+    let mut supply_columns = Vec::new();
+    for pad in &tapeout.pads {
+        let (x, y) = match pad.side {
+            crate::technology::TapeoutSide::Top => (
+                -width / 2.0 + pad.offset_um,
+                -height / 2.0 + pad.height_um / 2.0,
+            ),
+            crate::technology::TapeoutSide::Bottom => (
+                -width / 2.0 + pad.offset_um,
+                height / 2.0 - pad.height_um / 2.0,
+            ),
+            crate::technology::TapeoutSide::Left => (
+                -width / 2.0 + pad.width_um / 2.0,
+                -height / 2.0 + pad.offset_um,
+            ),
+            crate::technology::TapeoutSide::Right => (
+                width / 2.0 - pad.width_um / 2.0,
+                -height / 2.0 + pad.offset_um,
+            ),
+        };
+        let bound_pin = pins
+            .iter()
+            .find(|pin| pin.pad_id.as_deref() == Some(&pad.id));
+        let net = bound_pin
+            .map(|pin| pin.net)
+            .or_else(|| stitch_supplies.then(|| role_net(pad.role)).flatten());
+        shapes.push(PhysicalShape {
+            layer: PhysicalLayer::Metal(pad.layer),
+            x,
+            y,
+            width: pad.width_um,
+            height: pad.height_um,
+            component_id: bound_pin.map(|pin| pin.component_id),
+            net,
+            purpose: PhysicalShapePurpose::Pin,
+        });
+        if stitch_supplies
+            && matches!(
+                pad.role,
+                crate::technology::TapeoutPadRole::Power
+                    | crate::technology::TapeoutPadRole::Ground
+            )
+        {
+            supply_columns.push((pad.role, pad.layer, x, net));
+        }
+    }
+
+    supply_columns.sort_by(|left, right| {
+        (left.0, left.1)
+            .cmp(&(right.0, right.1))
+            .then_with(|| left.2.total_cmp(&right.2))
+    });
+    supply_columns.dedup_by(|left, right| {
+        left.0 == right.0 && left.1 == right.1 && (left.2 - right.2).abs() < 1e-9
+    });
+    for (role, layer, x, net) in &supply_columns {
+        let Some(net) = *net else { continue };
+        shapes.push(PhysicalShape {
+            layer: PhysicalLayer::Metal(*layer),
+            x: *x,
+            y: 0.0,
+            width: 20.0,
+            height,
+            component_id: None,
+            net: Some(net),
+            purpose: PhysicalShapePurpose::PowerRail,
+        });
+        for ring in tapeout.rings.iter().filter(|ring| ring.net == *role) {
+            for y in [-height / 2.0 + ring.inset_um, height / 2.0 - ring.inset_um] {
+                add_via_stack(
+                    shapes,
+                    (*x, y),
+                    ring.layer.min(*layer),
+                    ring.layer.max(*layer),
+                    net,
+                    &technology.physical_rules,
+                );
+            }
+        }
+    }
+}
+
 fn density_fill_obstacle(
     material: &str,
     candidate: &PhysicalShape,
@@ -6208,6 +6369,13 @@ fn density_fill_obstacle(
     if shape.purpose == PhysicalShapePurpose::DummyFill {
         return shape.layer == candidate.layer
             && rectangles_within(candidate, shape, rule.fill_spacing_um);
+    }
+    if shape.purpose == PhysicalShapePurpose::PowerRail
+        && shape.component_id.is_none()
+        && shape.width.max(shape.height) > 2_000.0
+        && rule.ring_keepout_um > 0.0
+    {
+        return rectangles_within(candidate, shape, rule.ring_keepout_um);
     }
     let relevant = match material {
         "active" => matches!(
@@ -6230,6 +6398,56 @@ fn density_fill_obstacle(
         _ => shape.layer == candidate.layer,
     };
     relevant && rectangles_within(candidate, shape, rule.circuit_spacing_um)
+}
+
+/// Coarse, layer-agnostic rectangle index for process fill. Density rules can
+/// create tens of thousands of candidates over a full reticle; scanning the
+/// complete IR for every candidate makes admission quadratic. Exact rule
+/// checks still run after this conservative spatial query.
+pub(crate) struct DensitySpatialIndex {
+    cell_size_um: f64,
+    cells: HashMap<(i64, i64), Vec<usize>>,
+}
+
+impl DensitySpatialIndex {
+    pub(crate) fn new(cell_size_um: f64) -> Self {
+        Self {
+            cell_size_um: cell_size_um.max(1.0),
+            cells: HashMap::new(),
+        }
+    }
+
+    fn cell_span(&self, shape: &PhysicalShape, halo: f64) -> (i64, i64, i64, i64) {
+        let left = ((shape.x - shape.width / 2.0 - halo) / self.cell_size_um).floor() as i64;
+        let right = ((shape.x + shape.width / 2.0 + halo) / self.cell_size_um).floor() as i64;
+        let top = ((shape.y - shape.height / 2.0 - halo) / self.cell_size_um).floor() as i64;
+        let bottom = ((shape.y + shape.height / 2.0 + halo) / self.cell_size_um).floor() as i64;
+        (left, right, top, bottom)
+    }
+
+    pub(crate) fn insert(&mut self, index: usize, shape: &PhysicalShape) {
+        let (left, right, top, bottom) = self.cell_span(shape, 0.0);
+        for cell_x in left..=right {
+            for cell_y in top..=bottom {
+                self.cells.entry((cell_x, cell_y)).or_default().push(index);
+            }
+        }
+    }
+
+    pub(crate) fn query(&self, shape: &PhysicalShape, halo: f64) -> Vec<usize> {
+        let (left, right, top, bottom) = self.cell_span(shape, halo);
+        let mut found = HashSet::new();
+        for cell_x in left..=right {
+            for cell_y in top..=bottom {
+                if let Some(indices) = self.cells.get(&(cell_x, cell_y)) {
+                    found.extend(indices.iter().copied());
+                }
+            }
+        }
+        let mut found = found.into_iter().collect::<Vec<_>>();
+        found.sort_unstable();
+        found
+    }
 }
 
 fn density_material_shape(material: &str, layer: PhysicalLayer, shape: &PhysicalShape) -> bool {
@@ -6300,15 +6518,17 @@ fn sliding_density_windows(
     bounds: &PhysicalBounds,
     requested_width: Option<f64>,
     requested_height: Option<f64>,
+    requested_step_x: Option<f64>,
+    requested_step_y: Option<f64>,
 ) -> Vec<PhysicalBounds> {
     let design_width = bounds.max_x - bounds.min_x;
     let design_height = bounds.max_y - bounds.min_y;
     let width = requested_width.unwrap_or(design_width).min(design_width);
     let height = requested_height.unwrap_or(design_height).min(design_height);
-    let axis_origins = |minimum: f64, maximum: f64, extent: f64| {
+    let axis_origins = |minimum: f64, maximum: f64, extent: f64, requested_step: Option<f64>| {
         let mut origins = vec![minimum];
         let last = maximum - extent;
-        let step = extent / 2.0;
+        let step = requested_step.unwrap_or(extent / 2.0).min(extent);
         let mut cursor = minimum + step;
         while cursor < last - 1e-9 {
             origins.push(cursor);
@@ -6319,8 +6539,8 @@ fn sliding_density_windows(
         }
         origins
     };
-    let xs = axis_origins(bounds.min_x, bounds.max_x, width);
-    let ys = axis_origins(bounds.min_y, bounds.max_y, height);
+    let xs = axis_origins(bounds.min_x, bounds.max_x, width, requested_step_x);
+    let ys = axis_origins(bounds.min_y, bounds.max_y, height, requested_step_y);
     ys.into_iter()
         .flat_map(|min_y| {
             xs.iter().copied().map(move |min_x| PhysicalBounds {
@@ -6360,6 +6580,8 @@ fn add_process_density_fill(
         bounds,
         rules.evaluation_window_width_um,
         rules.evaluation_window_height_um,
+        rules.evaluation_window_step_x_um,
+        rules.evaluation_window_step_y_um,
     );
     let window_area = windows.first().map_or(area, |window| {
         (window.max_x - window.min_x) * (window.max_y - window.min_y)
@@ -6391,6 +6613,16 @@ fn add_process_density_fill(
             .iter()
             .map(|window| rectangle_union_area(shapes, &name, layer, window))
             .collect::<Vec<_>>();
+        let query_halo = rule
+            .fill_spacing_um
+            .max(rule.circuit_spacing_um)
+            .max(rule.ring_keepout_um);
+        let mut spatial = DensitySpatialIndex::new(
+            (rule.tile_width_um.max(rule.tile_height_um) + query_halo).max(32.0),
+        );
+        for (index, shape) in shapes.iter().enumerate() {
+            spatial.insert(index, shape);
+        }
         let mut candidates = Vec::new();
         if rule.support_layer.as_deref() == Some("active") {
             for support in shapes.iter().filter(|shape| {
@@ -6466,9 +6698,10 @@ fn add_process_density_fill(
                 net: None,
                 purpose: PhysicalShapePurpose::DummyFill,
             };
-            if shapes
-                .iter()
-                .any(|shape| density_fill_obstacle(&name, &candidate, shape, rule))
+            if spatial
+                .query(&candidate, query_halo)
+                .into_iter()
+                .any(|index| density_fill_obstacle(&name, &candidate, &shapes[index], rule))
             {
                 continue;
             }
@@ -6504,7 +6737,9 @@ fn add_process_density_fill(
             for (covered, overlap) in covered_windows.iter_mut().zip(overlaps) {
                 *covered += overlap;
             }
+            let index = shapes.len();
             shapes.push(candidate);
+            spatial.insert(index, &shapes[index]);
         }
         let achieved_global_density = covered_global / area;
         let window_densities = covered_windows
@@ -6537,6 +6772,14 @@ fn add_process_density_fill(
             window_height_um: windows
                 .first()
                 .map_or(0.0, |window| window.max_y - window.min_y),
+            window_step_x_um: rules
+                .evaluation_window_step_x_um
+                .or(rules.evaluation_window_width_um.map(|width| width / 2.0))
+                .unwrap_or(0.0),
+            window_step_y_um: rules
+                .evaluation_window_step_y_um
+                .or(rules.evaluation_window_height_um.map(|height| height / 2.0))
+                .unwrap_or(0.0),
             window_count: windows.len(),
             underfilled_window_count: window_densities
                 .iter()
@@ -6660,25 +6903,11 @@ fn feol_density_targets_met(
         return true;
     }
     let mut trial = shapes.to_vec();
-    add_process_density_fill(&mut trial, bounds, &feol_technology);
-    let area = (bounds.max_x - bounds.min_x) * (bounds.max_y - bounds.min_y);
-    feol_technology
-        .physical_rules
-        .density_fill
-        .layers
-        .iter()
-        .all(|(name, rule)| {
-            let fill_area = trial
-                .iter()
-                .filter(|shape| {
-                    shape.purpose == PhysicalShapePurpose::DummyFill
-                        && density_fill_layer(name, &feol_technology)
-                            .is_some_and(|layer| shape.layer == layer)
-                })
-                .map(|shape| shape.width * shape.height)
-                .sum::<f64>();
-            fill_area + 1e-9 >= area * rule.target_density
-        })
+    let report = add_process_density_fill(&mut trial, bounds, &feol_technology);
+    report.layers.iter().all(|layer| {
+        layer.achieved_global_density + 1e-9 >= layer.preferred_density
+            && layer.achieved_minimum_window_density + 1e-9 >= layer.preferred_density
+    })
 }
 
 /// Reserve field bands outside topology-owned device wells before final fill.
@@ -7121,6 +7350,27 @@ fn normalize_with_progress(
     devices.sort_by(|left, right| (&left.kind, &left.name).cmp(&(&right.kind, &right.name)));
     let top_level_nets = top_level_routing_nets(&nets, &devices);
 
+    let tapeout = &project.technology.tapeout_window;
+    let usable_width = tapeout.width_um - 2.0 * tapeout.edge_margin_um;
+    let usable_height = tapeout.height_um - 2.0 * tapeout.edge_margin_um;
+    let pad_position = |pad: &crate::technology::TapeoutPad| match pad.side {
+        crate::technology::TapeoutSide::Top => (
+            -usable_width / 2.0 + pad.offset_um,
+            -usable_height / 2.0 + pad.height_um / 2.0,
+        ),
+        crate::technology::TapeoutSide::Bottom => (
+            -usable_width / 2.0 + pad.offset_um,
+            usable_height / 2.0 - pad.height_um / 2.0,
+        ),
+        crate::technology::TapeoutSide::Left => (
+            -usable_width / 2.0 + pad.width_um / 2.0,
+            -usable_height / 2.0 + pad.offset_um,
+        ),
+        crate::technology::TapeoutSide::Right => (
+            usable_width / 2.0 - pad.width_um / 2.0,
+            -usable_height / 2.0 + pad.offset_um,
+        ),
+    };
     let mut pins = physical_components
         .iter()
         .filter_map(|component| {
@@ -7131,11 +7381,22 @@ fn normalize_with_progress(
                 "output" => ("in", NetRole::Output),
                 _ => return None,
             };
+            let assigned_pad = project
+                .tapeout_pin_bindings
+                .get(&component.id)
+                .and_then(|id| tapeout.pads.iter().find(|pad| &pad.id == id));
+            let (x, y) = assigned_pad.map(&pad_position).unzip();
             Some(PhysicalPin {
                 component_id: component.id,
                 name: component.name.clone(),
                 role,
                 net: terminal_nets[&(component.id, terminal.into())],
+                pad_id: assigned_pad.map(|pad| pad.id.clone()),
+                x,
+                y,
+                width_um: assigned_pad.map(|pad| pad.width_um),
+                height_um: assigned_pad.map(|pad| pad.height_um),
+                layer: assigned_pad.map(|pad| pad.layer),
             })
         })
         .collect::<Vec<_>>();
@@ -7622,7 +7883,19 @@ fn normalize_with_progress(
     bounds.min_y = snap_to_grid(bounds.min_y, grid);
     bounds.max_x = snap_to_grid(bounds.max_x, grid);
     bounds.max_y = snap_to_grid(bounds.max_y, grid);
-    reserve_feol_density_field(&mut bounds, &shapes, project)?;
+    let explicit_full_area_template = project.technology.tapeout_window.layout_mode
+        == crate::technology::TapeoutLayoutMode::FullUsableArea
+        && (!project.technology.tapeout_window.rings.is_empty()
+            || !project.technology.tapeout_window.pads.is_empty());
+    if !explicit_full_area_template
+        || !project
+            .technology
+            .physical_rules
+            .density_fill
+            .cover_full_usable_area
+    {
+        reserve_feol_density_field(&mut bounds, &shapes, project)?;
+    }
     expand_well_fabric_to_floorplan(
         &mut shapes,
         &bounds,
@@ -7693,11 +7966,54 @@ fn normalize_with_progress(
         &project.technology.physical_rules,
     );
     fill_same_net_metal_notches(&mut shapes, &project.technology.physical_rules);
-    let density = add_process_density_fill(&mut shapes, &bounds, &project.technology);
-    let density_fill_counts = process_density_fill_counts(&shapes, &project.technology);
-    let missing_density_layers = density_fill_counts
+    // A process with an explicit perimeter template establishes the die
+    // envelope before density insertion so fill covers its manufactured
+    // field. Template-free legacy decks retain compact fill until scalable
+    // array geometry can represent their full default area efficiently.
+    let compact_density_bounds = bounds.clone();
+    let perimeter_before_density = explicit_full_area_template;
+    if perimeter_before_density {
+        add_tapeout_perimeter_geometry(&mut shapes, &mut bounds, &pins, &project.technology);
+        deduplicate_exact_vias(&mut shapes, grid);
+        repair_disconnected_routing(
+            &mut shapes,
+            &nets,
+            &project.technology.physical_rules,
+            false,
+        );
+        deduplicate_exact_vias(&mut shapes, grid);
+    }
+    let density_bounds = if perimeter_before_density
+        && !project
+            .technology
+            .physical_rules
+            .density_fill
+            .cover_full_usable_area
+    {
+        &compact_density_bounds
+    } else {
+        &bounds
+    };
+    let density = add_process_density_fill(&mut shapes, density_bounds, &project.technology);
+    if !perimeter_before_density {
+        add_tapeout_perimeter_geometry(&mut shapes, &mut bounds, &pins, &project.technology);
+        deduplicate_exact_vias(&mut shapes, grid);
+        repair_disconnected_routing(
+            &mut shapes,
+            &nets,
+            &project.technology.physical_rules,
+            false,
+        );
+        deduplicate_exact_vias(&mut shapes, grid);
+    }
+    let missing_density_layers = density
+        .layers
         .iter()
-        .filter_map(|(material, count)| (*count == 0).then_some(material.as_str()))
+        .filter_map(|layer| {
+            (layer.dummy_shape_count == 0
+                && layer.achieved_global_density + 1e-9 < layer.preferred_density)
+                .then_some(layer.material.as_str())
+        })
         .collect::<Vec<_>>();
     if !missing_density_layers.is_empty() {
         return Err(format!(
@@ -7789,14 +8105,14 @@ pub fn normalize_project_with_progress(
 #[cfg(test)]
 mod tests {
     use super::{
-        add_process_density_fill, commit_preview_routing, contains_shape, density_fill_layer,
-        device_footprint_with_gate_access, gate_contact_point, local_route_candidates,
-        local_route_marker, materialize_shared_terminal_accesses, multilayer_track_search,
-        normalize, normalize_with_progress, process_density_fill_counts, prune_orphan_routing,
-        route_quality, shared_signal_row_accesses, synthesize_row_topology, trim_metal_overhangs,
-        DeviceKind, NetRole, PhysicalBounds, PhysicalDevice, PhysicalLayer, PhysicalNet,
-        PhysicalShape, PhysicalShapePurpose, PhysicalTerminal, RouteAnchor, ROUTING_CLEARANCE,
-        ROUTING_LANDING_SIZE,
+        add_process_density_fill, commit_preview_routing, contains_shape,
+        device_footprint_with_gate_access, feol_density_targets_met, gate_contact_point,
+        local_route_candidates, local_route_marker, materialize_shared_terminal_accesses,
+        multilayer_track_search, normalize, normalize_with_progress, process_density_fill_counts,
+        prune_orphan_routing, rectangles_within, route_quality, shared_signal_row_accesses,
+        synthesize_row_topology, trim_metal_overhangs, DeviceKind, NetRole, PhysicalBounds,
+        PhysicalDevice, PhysicalLayer, PhysicalNet, PhysicalShape, PhysicalShapePurpose,
+        PhysicalTerminal, RouteAnchor, ROUTING_CLEARANCE, ROUTING_LANDING_SIZE,
     };
     use crate::model::{Project, TerminalRef};
     use crate::physical_canvas::{
@@ -7888,6 +8204,49 @@ mod tests {
                 .routed_shape_area_um2,
             0.23 * 8.0
         );
+    }
+
+    #[test]
+    fn feol_reservation_counts_existing_geometry_toward_density() {
+        let mut technology = Technology::from_yaml(include_str!(
+            "../../docs/examples/process_gf180mcu_3v3_5m_dr.yaml"
+        ))
+        .unwrap();
+        technology
+            .physical_rules
+            .density_fill
+            .layers
+            .retain(|name, _| name == "active");
+        let rule = technology
+            .physical_rules
+            .density_fill
+            .layers
+            .get_mut("active")
+            .unwrap();
+        rule.target_density = 0.25;
+        rule.minimum_global_density = Some(0.20);
+        let bounds = PhysicalBounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 10.0,
+            max_y: 10.0,
+        };
+        let existing_active = PhysicalShape {
+            layer: PhysicalLayer::Ndiff,
+            x: 5.0,
+            y: 5.0,
+            width: 5.0,
+            height: 5.0,
+            component_id: Some(Uuid::new_v4()),
+            net: None,
+            purpose: PhysicalShapePurpose::Active,
+        };
+
+        assert!(feol_density_targets_met(
+            &[existing_active],
+            &bounds,
+            &technology
+        ));
     }
 
     fn terminal(component_id: Uuid, terminal: &str) -> TerminalRef {
@@ -8061,7 +8420,10 @@ mod tests {
 
     #[test]
     fn well_fabric_alternates_and_topology_seeded_devices_match_polarity() {
-        let ir = normalize(&inverter()).unwrap();
+        let mut project = inverter();
+        project.technology.tapeout_window.layout_mode =
+            crate::technology::TapeoutLayoutMode::ContentFit;
+        let ir = normalize(&project).unwrap();
         let wells = ir
             .shapes
             .iter()
@@ -8102,7 +8464,9 @@ mod tests {
 
     #[test]
     fn floorplan_expands_to_routes_and_tapeout_escape_fails_generation() {
-        let project = inverter();
+        let mut project = inverter();
+        project.technology.tapeout_window.layout_mode =
+            crate::technology::TapeoutLayoutMode::ContentFit;
         let normal = normalize(&project).unwrap();
         assert!(normal.tapeout.fits);
         assert_eq!(normal.tapeout.shapes_outside_floorplan, 0);
@@ -8876,7 +9240,10 @@ mod tests {
 
     #[test]
     fn physical_plan_exposes_resources_priorities_and_bounded_candidates() {
-        let ir = normalize(&nand()).unwrap();
+        let mut project = nand();
+        project.technology.tapeout_window.layout_mode =
+            crate::technology::TapeoutLayoutMode::ContentFit;
+        let ir = normalize(&project).unwrap();
         assert_eq!(ir.planning.routing_layers.len(), 5);
         assert_eq!(ir.planning.candidates.len(), 3);
         assert!(ir
@@ -9737,6 +10104,117 @@ mod tests {
     }
 
     #[test]
+    fn assigned_gpio_site_reaches_physical_ir_and_full_tapeout_bounds() {
+        let technology =
+            Technology::from_yaml(include_str!("../../docs/examples/openchippy-edu-5m.yaml"))
+                .unwrap();
+        let mut project = nand();
+        project.technology = technology;
+        let input = project
+            .components
+            .iter()
+            .find(|component| component.kind == "input")
+            .unwrap()
+            .id;
+        project
+            .set_tapeout_pin_binding(input, Some("gpio_left_0".into()))
+            .unwrap();
+
+        let ir = normalize(&project).unwrap();
+        let pin = ir
+            .pins
+            .iter()
+            .find(|pin| pin.component_id == input)
+            .unwrap();
+        assert_eq!(pin.pad_id.as_deref(), Some("gpio_left_0"));
+        assert_eq!(pin.layer, Some(5));
+        assert_eq!(pin.x, Some(-1_430.0));
+        assert_eq!(pin.y, Some(-1_320.0));
+        assert_eq!(ir.bounds.min_x, -1_460.0);
+        assert_eq!(ir.bounds.max_x, 1_460.0);
+        assert_eq!(ir.bounds.min_y, -1_760.0);
+        assert_eq!(ir.bounds.max_y, 1_760.0);
+        assert!(ir.shapes.iter().any(|shape| {
+            shape.component_id == Some(input)
+                && shape.purpose == PhysicalShapePurpose::Pin
+                && shape.layer == PhysicalLayer::Metal(5)
+                && (shape.x + 1_430.0).abs() < 1e-9
+                && (shape.y + 1_320.0).abs() < 1e-9
+        }));
+        let fill = ir
+            .shapes
+            .iter()
+            .filter(|shape| shape.purpose == PhysicalShapePurpose::DummyFill)
+            .collect::<Vec<_>>();
+        let rings = ir
+            .shapes
+            .iter()
+            .filter(|shape| shape.purpose == PhysicalShapePurpose::PowerRail && shape.net.is_none())
+            .collect::<Vec<_>>();
+        assert!(!fill.is_empty());
+        assert!(fill.iter().all(|dummy| {
+            rings
+                .iter()
+                .all(|ring| !rectangles_within(dummy, ring, 60.0))
+        }));
+    }
+
+    #[test]
+    fn gf180_caravel_template_emits_two_rings_and_42_perimeter_pads() {
+        let mut technology = Technology::from_yaml(include_str!(
+            "../../docs/examples/process_gf180mcu_3v3_5m_dr.yaml"
+        ))
+        .unwrap();
+        // This regression isolates perimeter materialization from the much
+        // larger full-reticle density qualification problem.
+        technology.physical_rules.density_fill.layers.clear();
+        let mut project = nand();
+        project.technology = technology;
+        let ir = normalize(&project).unwrap();
+        assert_eq!(ir.bounds.min_x, -1_460.0);
+        assert_eq!(ir.bounds.max_x, 1_460.0);
+        assert_eq!(ir.bounds.min_y, -1_760.0);
+        assert_eq!(ir.bounds.max_y, 1_760.0);
+        assert_eq!(
+            ir.shapes
+                .iter()
+                .filter(|shape| {
+                    shape.purpose == PhysicalShapePurpose::Pin
+                        && shape.component_id.is_none()
+                        && matches!(shape.width, 60.0 | 80.0)
+                        && matches!(shape.height, 60.0 | 80.0)
+                })
+                .count(),
+            42
+        );
+        assert_eq!(
+            ir.shapes
+                .iter()
+                .filter(|shape| {
+                    shape.purpose == PhysicalShapePurpose::PowerRail
+                        && shape.component_id.is_none()
+                        && ((shape.width == 10.0 && shape.height > 1_000.0)
+                            || (shape.height == 10.0 && shape.width > 1_000.0))
+                })
+                .count(),
+            8
+        );
+        assert_eq!(
+            ir.shapes
+                .iter()
+                .filter(|shape| {
+                    shape.purpose == PhysicalShapePurpose::PowerRail
+                        && shape.layer == PhysicalLayer::Metal(5)
+                        && shape.width == 20.0
+                        && shape.height == 3_520.0
+                        && shape.net.is_some()
+                })
+                .count(),
+            4
+        );
+    }
+
+    #[test]
     fn gf180_reserves_legal_field_bands_for_feol_density_fill() {
         let technology = Technology::from_yaml(include_str!(
             "../../docs/examples/process_gf180mcu_3v3_5m_dr.yaml"
@@ -9762,21 +10240,24 @@ mod tests {
             well_top > ir.bounds.min_y || well_bottom < ir.bounds.max_y,
             "FEOL density planning should leave field outside topology-owned wells"
         );
-        let area = (ir.bounds.max_x - ir.bounds.min_x) * (ir.bounds.max_y - ir.bounds.min_y);
         for material in ["active", "poly"] {
             let rule = &technology.physical_rules.density_fill.layers[material];
-            let layer = density_fill_layer(material, &technology).unwrap();
-            let fill_area = ir
-                .shapes
+            let density = ir
+                .density
+                .layers
                 .iter()
-                .filter(|shape| {
-                    shape.purpose == PhysicalShapePurpose::DummyFill && shape.layer == layer
-                })
-                .map(|shape| shape.width * shape.height)
-                .sum::<f64>();
+                .find(|density| density.material == material)
+                .unwrap();
             assert!(
-                fill_area + 1e-9 >= area * rule.target_density,
-                "{material} fill area {fill_area} did not reach target {} over {area}",
+                density.achieved_global_density + 1e-9 >= rule.target_density,
+                "{material} total density {} did not reach target {}",
+                density.achieved_global_density,
+                rule.target_density
+            );
+            assert!(
+                density.achieved_minimum_window_density + 1e-9 >= rule.target_density,
+                "{material} minimum window density {} did not reach target {}",
+                density.achieved_minimum_window_density,
                 rule.target_density
             );
         }

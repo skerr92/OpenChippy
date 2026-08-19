@@ -68,6 +68,8 @@ export type Wire = {
 
 export type Project = {
   formatVersion: number;
+  projectId: string;
+  forkedFromProjectId: string | null;
   name: string;
   components: Component[];
   wires: Wire[];
@@ -77,6 +79,7 @@ export type Project = {
   timingTargetNs: number | null;
   highFanoutWarningThreshold: number;
   rtlDesign: RtlDesign | null;
+  tapeoutPinBindings: Record<string, string>;
 };
 
 export type RtlModule = {
@@ -138,6 +141,9 @@ export type BlockDefinition = {
   components: Component[];
   wires: Wire[];
   pins: BlockPin[];
+  sourceProjectId?: string;
+  sourceDigest?: string;
+  revision: number;
 };
 
 export type MosTechnology = {
@@ -178,6 +184,22 @@ export type TapeoutWindow = {
   width_um: number;
   height_um: number;
   edge_margin_um: number;
+  layout_mode: "full_usable_area" | "content_fit";
+  rings: Array<{
+    net: "power" | "ground" | "gpio";
+    layer: number;
+    width_um: number;
+    inset_um: number;
+  }>;
+  pads: Array<{
+    id: string;
+    role: "power" | "ground" | "gpio";
+    side: "top" | "right" | "bottom" | "left";
+    offset_um: number;
+    width_um: number;
+    height_um: number;
+    layer: number;
+  }>;
 };
 
 export type PhysicalParasiticRules = {
@@ -278,6 +300,12 @@ export type PhysicalLayoutIr = {
     name: string;
     role: "power" | "ground" | "input" | "output" | "internal";
     net: number;
+    padId: string | null;
+    x: number | null;
+    y: number | null;
+    widthUm: number | null;
+    heightUm: number | null;
+    layer: number | null;
   }>;
   planning: {
     placementSiteWidthUm: number;
@@ -516,6 +544,8 @@ export type PhysicalLayoutIr = {
       achievedMaximumWindowDensity: number;
       windowWidthUm: number;
       windowHeightUm: number;
+      windowStepXUm: number;
+      windowStepYUm: number;
       windowCount: number;
       underfilledWindowCount: number;
       overfilledWindowCount: number;

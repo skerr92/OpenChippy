@@ -1,7 +1,8 @@
 use crate::{
     physical_canvas::{ObstructionType, PhysicalCanvas},
     physical_layout::{
-        PhysicalLayer, PhysicalLayoutIr, PhysicalRowTopology, PhysicalShape, PhysicalShapePurpose,
+        DensitySpatialIndex, PhysicalLayer, PhysicalLayoutIr, PhysicalRowTopology, PhysicalShape,
+        PhysicalShapePurpose,
     },
     technology::{CutRule, LayerRule, Technology},
 };
@@ -1178,6 +1179,12 @@ fn validate_shape_set(
     let mut spatial = PhysicalCanvas::new(&technology.physical_rules);
     let mut shape_by_occupied_id = HashMap::with_capacity(shapes.len());
     for (shape_index, shape) in shapes.iter().enumerate() {
+        // Density fill has its own process-aware spacing/coverage validation
+        // and is skipped by the pairwise checks below. Avoid rasterizing
+        // large, electrically inert preview tiles into the fine routing grid.
+        if shape.purpose == PhysicalShapePurpose::DummyFill {
+            continue;
+        }
         let occupied_id = spatial.index_unchecked(
             shape,
             format!("drc-shape-{shape_index}"),
@@ -1213,6 +1220,25 @@ fn validate_shape_set(
             if same_active_island(left, right, row_topology) {
                 continue;
             }
+            // Process-owned perimeter rings and their fixed, unassigned pads
+            // are decomposed into touching rectangles without pretending they
+            // belong to a routed schematic net. Their touching edges form the
+            // intended manufactured perimeter conductor.
+            if left.net.is_none()
+                && right.net.is_none()
+                && left.component_id.is_none()
+                && right.component_id.is_none()
+                && matches!(
+                    left.purpose,
+                    PhysicalShapePurpose::PowerRail | PhysicalShapePurpose::Pin
+                )
+                && matches!(
+                    right.purpose,
+                    PhysicalShapePurpose::PowerRail | PhysicalShapePurpose::Pin
+                )
+            {
+                continue;
+            }
             // Continuous same-net layers may merge into one conductor. Cuts
             // remain discrete manufactured features, so contact/via spacing
             // applies even when both cuts belong to the same electrical net.
@@ -1245,6 +1271,17 @@ fn validate_shape_set(
         }
     }
 
+    let maximum_density_clearance = technology
+        .physical_rules
+        .density_fill
+        .layers
+        .values()
+        .map(|rule| rule.fill_spacing_um.max(rule.circuit_spacing_um))
+        .fold(0.0, f64::max);
+    let mut density_spatial = DensitySpatialIndex::new(maximum_density_clearance.max(32.0));
+    for (index, shape) in shapes.iter().enumerate() {
+        density_spatial.insert(index, shape);
+    }
     for (fill_index, fill) in shapes
         .iter()
         .enumerate()
@@ -1261,7 +1298,9 @@ fn validate_shape_set(
             );
             continue;
         };
-        for (other_index, other) in shapes.iter().enumerate() {
+        let query_clearance = rule.fill_spacing_um.max(rule.circuit_spacing_um);
+        for other_index in density_spatial.query(fill, query_clearance) {
+            let other = &shapes[other_index];
             if other_index == fill_index {
                 continue;
             }

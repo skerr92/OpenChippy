@@ -1475,3 +1475,7 @@ Replace global minimum-only fill closure with process-configurable sliding-windo
   critical-net, clock/power, antenna, and coupling-aware keepout classes remain
   a follow-up because those require process parasitic limits rather than an
   invented universal distance.
+- FEOL field reservation consumes the same total-density report as final fill.
+  Existing active/poly geometry therefore contributes to preferred global and
+  worst-window density; reservation must not compare dummy area alone against
+  the total target or falsely expand a legal design to the tapeout boundary.

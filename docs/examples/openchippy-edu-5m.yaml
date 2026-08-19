@@ -18,6 +18,28 @@ tapeout_window:
   width_um: 2920.0
   height_um: 3520.0
   edge_margin_um: 0.0
+  layout_mode: full_usable_area
+  # Metal 5 is the process top metal used for external pad landings. The PDN
+  # rings sit below it so signal pads do not intersect a perimeter power ring.
+  rings:
+    - { net: power, layer: 4, width_um: 10.0, inset_um: 20.0 }
+    - { net: ground, layer: 3, width_um: 10.0, inset_um: 35.0 }
+  # Fixed Caravel-style perimeter sites. GPIO assignment is stored in the
+  # project; power and ground sites bind automatically to their rails.
+  pads:
+    - { id: gpio_left_0, role: gpio, side: left, offset_um: 440.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_1, role: gpio, side: left, offset_um: 1100.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_2, role: gpio, side: left, offset_um: 1760.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_3, role: gpio, side: left, offset_um: 2420.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_4, role: gpio, side: left, offset_um: 3080.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_0, role: gpio, side: right, offset_um: 440.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_1, role: gpio, side: right, offset_um: 1100.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_2, role: gpio, side: right, offset_um: 1760.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_3, role: gpio, side: right, offset_um: 2420.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_4, role: gpio, side: right, offset_um: 3080.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: vdd_top, role: power, side: top, offset_um: 730.0, width_um: 80.0, height_um: 80.0, layer: 5 }
+    - { id: vdd_bottom, role: power, side: bottom, offset_um: 730.0, width_um: 80.0, height_um: 80.0, layer: 5 }
+    - { id: gnd_bottom, role: ground, side: bottom, offset_um: 2190.0, width_um: 80.0, height_um: 80.0, layer: 4 }
 
 nmos:
   threshold_voltage: 0.45
@@ -71,6 +93,10 @@ gds_layers:
     metal4: [{ purpose: metal4, layer: 40, datatype: 0 }]
     via45: [{ purpose: via45, layer: 41, datatype: 0 }]
     metal5: [{ purpose: metal5, layer: 42, datatype: 0 }]
+  # Educational dummy-purpose mappings. Datatype 4 keeps fill distinct from
+  # electrically routed shapes in exported GDS and on later import.
+  dummy_layers:
+    metal5: [{ purpose: metal5_dummy, layer: 42, datatype: 4 }]
 
 physical_rules:
   format_version: 1
@@ -84,6 +110,30 @@ physical_rules:
   via: { size_um: 0.24, min_spacing_um: 0.08, enclosure_um: 0.02 }
   gate_extension_um: 0.20
   well_enclosure_um: 0.30
+  # Coarse, deterministic preview fill intended to communicate how an
+  # otherwise sparse die may look after density insertion. These are not
+  # SKY130 foundry rules. Large tiles keep the interactive 3D scene tractable;
+  # a qualified process deck should replace them with its actual window,
+  # density, exclusion, slotting, and pattern constraints.
+  density_fill:
+    format_version: 1
+    # Educational local-density evaluation: 400 um square windows at a
+    # half-window (200 um) step, mirroring common published deck structure.
+    evaluation_window_width_um: 400.0
+    evaluation_window_height_um: 400.0
+    evaluation_window_step_x_um: 200.0
+    evaluation_window_step_y_um: 200.0
+    layers:
+      # Bounded top-metal dummy islands make the otherwise empty field and
+      # pad layer legible without overwhelming an interactive preview.
+      metal5:
+        target_density: 0.005
+        maximum_density: 0.70
+        tile_width_um: 10.0
+        tile_height_um: 10.0
+        fill_spacing_um: 40.0
+        circuit_spacing_um: 12.0
+        ring_keepout_um: 60.0
   layer_overrides: {}
   via_overrides: {}
 

@@ -126,6 +126,21 @@ export default function PhysicalViewport({
   const [showBlockRegions, setShowBlockRegions] = useState(true);
   const [showDummyFill, setShowDummyFill] = useState(true);
   const [soloDummyFill, setSoloDummyFill] = useState(false);
+  const perimeterGeometry = useMemo(() => {
+    if (!layout) return { rings: 0, pads: 0 };
+    return layout.shapes.reduce(
+      (counts, shape) => {
+        if (shape.componentId === null && shape.net === null && shape.purpose === "power_rail") {
+          counts.rings += 1;
+        }
+        if (shape.componentId === null && shape.net === null && shape.purpose === "pin") {
+          counts.pads += 1;
+        }
+        return counts;
+      },
+      { rings: 0, pads: 0 },
+    );
+  }, [layout]);
   const dummyFillByLayer = useMemo(() => {
     const counts: Record<string, number> = {};
     layout?.shapes.forEach((shape) => {
@@ -439,6 +454,9 @@ export default function PhysicalViewport({
           <span>{layout ? `${layout.devices.length} MOS` : "Generating…"}</span>
           <span>{layout ? `${layout.nets.length} nets · ${layout.pins.length} pins` : ""}</span>
           <span>{layout ? `${layout.maxMetalLayers} routing metals` : ""}</span>
+          {layout && perimeterGeometry.rings > 0 && (
+            <span>{perimeterGeometry.rings} ring segments · {perimeterGeometry.pads} free process pads</span>
+          )}
           {layout && <span>{dummyFillCount} dummy-fill shapes</span>}
           {layout && Object.entries(dummyFillByLayer).map(([layer, count]) => (
             <span key={`fill-${layer}`}>{layer} fill · {count}</span>
@@ -450,6 +468,9 @@ export default function PhysicalViewport({
               {` · windows ${(density.achievedMinimumWindowDensity * 100).toFixed(1)}–${(density.achievedMaximumWindowDensity * 100).toFixed(1)}%`}
               {density.underfilledWindowCount > 0 ? ` · ${density.underfilledWindowCount} under` : ""}
               {density.overfilledWindowCount > 0 ? ` · ${density.overfilledWindowCount} over` : ""}
+              {density.windowWidthUm > 0
+                ? ` · ${density.windowWidthUm}×${density.windowHeightUm} µm @ ${density.windowStepXUm}×${density.windowStepYUm} µm step`
+                : ""}
             </span>
           ))}
           <span>{layout ? `deck ${layout.technologyFingerprint}` : ""}</span>

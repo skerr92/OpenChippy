@@ -762,7 +762,9 @@ mod tests {
 
     #[test]
     fn exports_structurally_valid_gds_with_matching_geometry_counts() {
-        let project = inverter();
+        let mut project = inverter();
+        project.technology.tapeout_window.layout_mode =
+            crate::technology::TapeoutLayoutMode::ContentFit;
         let ir = physical_layout::normalize_project(&project).unwrap();
         let technology = Technology::default();
         let dbu = technology.physical_rules.database_units_per_micron;
@@ -781,7 +783,9 @@ mod tests {
 
     #[test]
     fn shape_envelope_not_planning_bounds_is_the_export_contract() {
-        let project = inverter();
+        let mut project = inverter();
+        project.technology.tapeout_window.layout_mode =
+            crate::technology::TapeoutLayoutMode::ContentFit;
         let mut ir = physical_layout::normalize_project(&project).unwrap();
         ir.bounds.min_x += 10.0;
         ir.bounds.max_x -= 10.0;

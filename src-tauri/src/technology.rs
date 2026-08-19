@@ -66,6 +66,58 @@ pub struct TapeoutWindow {
     pub width_um: f64,
     pub height_um: f64,
     pub edge_margin_um: f64,
+    #[serde(default)]
+    pub layout_mode: TapeoutLayoutMode,
+    #[serde(default)]
+    pub rings: Vec<TapeoutRing>,
+    #[serde(default)]
+    pub pads: Vec<TapeoutPad>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TapeoutLayoutMode {
+    FullUsableArea,
+    #[default]
+    ContentFit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TapeoutPadRole {
+    Power,
+    Ground,
+    Gpio,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TapeoutSide {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct TapeoutRing {
+    pub net: TapeoutPadRole,
+    pub layer: u16,
+    pub width_um: f64,
+    pub inset_um: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct TapeoutPad {
+    pub id: String,
+    pub role: TapeoutPadRole,
+    pub side: TapeoutSide,
+    pub offset_um: f64,
+    pub width_um: f64,
+    pub height_um: f64,
+    pub layer: u16,
 }
 
 impl Default for TapeoutWindow {
@@ -76,6 +128,9 @@ impl Default for TapeoutWindow {
             width_um: 2_920.0,
             height_um: 3_520.0,
             edge_margin_um: 0.0,
+            layout_mode: TapeoutLayoutMode::FullUsableArea,
+            rings: Vec::new(),
+            pads: Vec::new(),
         }
     }
 }
@@ -143,7 +198,7 @@ pub struct PhysicalRuleDeck {
     pub density_fill: DensityFillRuleDeck,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct DensityFillRuleDeck {
     pub format_version: u32,
@@ -152,7 +207,34 @@ pub struct DensityFillRuleDeck {
     #[serde(default)]
     pub evaluation_window_height_um: Option<f64>,
     #[serde(default)]
+    pub evaluation_window_step_x_um: Option<f64>,
+    #[serde(default)]
+    pub evaluation_window_step_y_um: Option<f64>,
+    /// Whether an explicit full-area tapeout template receives fill across its
+    /// complete field. Fine foundry fill may opt out until the IR can encode
+    /// repeated arrays without materializing millions of rectangles.
+    #[serde(default = "default_true")]
+    pub cover_full_usable_area: bool,
+    #[serde(default)]
     pub layers: BTreeMap<String, DensityFillLayerRule>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for DensityFillRuleDeck {
+    fn default() -> Self {
+        Self {
+            format_version: 0,
+            evaluation_window_width_um: None,
+            evaluation_window_height_um: None,
+            evaluation_window_step_x_um: None,
+            evaluation_window_step_y_um: None,
+            cover_full_usable_area: true,
+            layers: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -179,6 +261,9 @@ pub struct DensityFillLayerRule {
     pub fallback_tile_sizes_um: Vec<f64>,
     pub fill_spacing_um: f64,
     pub circuit_spacing_um: f64,
+    /// Cross-layer exclusion around process-owned perimeter power rings.
+    #[serde(default)]
+    pub ring_keepout_um: f64,
     /// A dummy layer may require another dummy material under it. GF180 dummy
     /// poly, for example, must be generated over dummy COMP.
     #[serde(default)]
@@ -469,6 +554,8 @@ impl Technology {
         // packaged deck while preserving any explicit user overrides.
         if self.physical_rules.density_fill.layers.is_empty()
             || self.gds_layers.dummy_layers.is_empty()
+            || self.tapeout_window.rings.is_empty()
+            || self.tapeout_window.pads.is_empty()
         {
             let canonical = Technology::from_yaml(include_str!(
                 "../../docs/examples/process_gf180mcu_3v3_5m_dr.yaml"
@@ -480,6 +567,14 @@ impl Technology {
             }
             if self.gds_layers.dummy_layers.is_empty() {
                 self.gds_layers.dummy_layers = canonical.gds_layers.dummy_layers;
+                changed = true;
+            }
+            // Early full-area snapshots carried the Caravel-sized envelope but
+            // predated the process-owned ring and pad schema. Treat either
+            // missing collection as an incomplete packaged GF180 perimeter;
+            // custom processes never enter this narrowly identified migration.
+            if self.tapeout_window.rings.is_empty() || self.tapeout_window.pads.is_empty() {
+                self.tapeout_window = canonical.tapeout_window;
                 changed = true;
             }
         }
@@ -608,7 +703,12 @@ impl Technology {
             self.max_metal_layers,
             &mut diagnostics,
         );
-        validate_tapeout_window(&self.tapeout_window, &mut diagnostics);
+        validate_tapeout_window(
+            &self.tapeout_window,
+            self.max_metal_layers,
+            self.physical_rules.manufacturing_grid_um,
+            &mut diagnostics,
+        );
         validate_physical_planning(
             &self.physical_planning,
             self.max_metal_layers,
@@ -995,6 +1095,57 @@ fn validate_density_fill(
             message: "Density evaluation windows require both width and height.".into(),
         }),
     }
+    match (
+        fill.evaluation_window_step_x_um,
+        fill.evaluation_window_step_y_um,
+    ) {
+        (Some(step_x), Some(step_y)) => {
+            for (field, value) in [
+                ("evaluation_window_step_x_um", step_x),
+                ("evaluation_window_step_y_um", step_y),
+            ] {
+                validate_positive(
+                    &format!("physical_rules.density_fill.{field}"),
+                    value,
+                    diagnostics,
+                );
+                validate_on_grid(
+                    &format!("physical_rules.density_fill.{field}"),
+                    value,
+                    grid,
+                    diagnostics,
+                );
+            }
+            if fill
+                .evaluation_window_width_um
+                .is_some_and(|width| step_x > width)
+                || fill
+                    .evaluation_window_height_um
+                    .is_some_and(|height| step_y > height)
+            {
+                diagnostics.push(TechnologyDiagnostic {
+                    code: "density_window_step_exceeds_window",
+                    field: "physical_rules.density_fill".into(),
+                    message: "Density window steps must not exceed their window dimensions.".into(),
+                });
+            }
+        }
+        (None, None) => {}
+        _ => diagnostics.push(TechnologyDiagnostic {
+            code: "incomplete_density_window_step",
+            field: "physical_rules.density_fill".into(),
+            message: "Density evaluation-window stepping requires both X and Y values.".into(),
+        }),
+    }
+    if fill.evaluation_window_step_x_um.is_some()
+        && (fill.evaluation_window_width_um.is_none() || fill.evaluation_window_height_um.is_none())
+    {
+        diagnostics.push(TechnologyDiagnostic {
+            code: "density_step_without_window",
+            field: "physical_rules.density_fill".into(),
+            message: "Density evaluation-window stepping requires a configured window.".into(),
+        });
+    }
     let valid_name = |name: &str| {
         matches!(name, "active" | "poly" | "top_metal")
             || name
@@ -1082,6 +1233,17 @@ fn validate_density_fill(
             validate_positive(&format!("{prefix}.{field}"), value, diagnostics);
             validate_on_grid(&format!("{prefix}.{field}"), value, grid, diagnostics);
         }
+        validate_non_negative(
+            &format!("{prefix}.ring_keepout_um"),
+            rule.ring_keepout_um,
+            diagnostics,
+        );
+        validate_on_grid(
+            &format!("{prefix}.ring_keepout_um"),
+            rule.ring_keepout_um,
+            grid,
+            diagnostics,
+        );
         validate_centered_extent_on_grid(
             &format!("{prefix}.tile_width_um"),
             rule.tile_width_um,
@@ -1349,7 +1511,12 @@ fn validate_gds_layers(
     }
 }
 
-fn validate_tapeout_window(window: &TapeoutWindow, diagnostics: &mut Vec<TechnologyDiagnostic>) {
+fn validate_tapeout_window(
+    window: &TapeoutWindow,
+    max_metal_layers: u16,
+    grid: f64,
+    diagnostics: &mut Vec<TechnologyDiagnostic>,
+) {
     if window.format_version != 1 {
         diagnostics.push(TechnologyDiagnostic {
             code: "unsupported_tapeout_window_version",
@@ -1389,6 +1556,79 @@ fn validate_tapeout_window(window: &TapeoutWindow, diagnostics: &mut Vec<Technol
             field: "tapeout_window.edge_margin_um".into(),
             message: "Tapeout edge margin must leave a positive usable width and height.".into(),
         });
+    }
+    let usable_width = window.width_um - 2.0 * window.edge_margin_um;
+    let usable_height = window.height_um - 2.0 * window.edge_margin_um;
+    for (index, ring) in window.rings.iter().enumerate() {
+        let prefix = format!("tapeout_window.rings[{index}]");
+        if ring.net == TapeoutPadRole::Gpio {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "invalid_tapeout_ring_role",
+                field: format!("{prefix}.net"),
+                message: "A perimeter ring must be power or ground.".into(),
+            });
+        }
+        if ring.layer == 0 || ring.layer > max_metal_layers {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "invalid_tapeout_layer",
+                field: format!("{prefix}.layer"),
+                message: format!("Ring layer must be between 1 and {max_metal_layers}."),
+            });
+        }
+        for (field, value) in [("width_um", ring.width_um), ("inset_um", ring.inset_um)] {
+            if field == "width_um" {
+                validate_positive(&format!("{prefix}.{field}"), value, diagnostics);
+            } else {
+                validate_non_negative(&format!("{prefix}.{field}"), value, diagnostics);
+            }
+            validate_on_grid(&format!("{prefix}.{field}"), value, grid, diagnostics);
+        }
+        if ring.inset_um * 2.0 >= usable_width || ring.inset_um * 2.0 >= usable_height {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "tapeout_ring_out_of_bounds",
+                field: format!("{prefix}.inset_um"),
+                message: "Ring inset must leave positive horizontal and vertical spans.".into(),
+            });
+        }
+    }
+    let mut pad_ids = std::collections::HashSet::new();
+    for (index, pad) in window.pads.iter().enumerate() {
+        let prefix = format!("tapeout_window.pads[{index}]");
+        if pad.id.trim().is_empty() || !pad_ids.insert(pad.id.as_str()) {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "invalid_tapeout_pad_id",
+                field: format!("{prefix}.id"),
+                message: "Tapeout pad IDs must be non-blank and unique.".into(),
+            });
+        }
+        if pad.layer == 0 || pad.layer > max_metal_layers {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "invalid_tapeout_layer",
+                field: format!("{prefix}.layer"),
+                message: format!("Pad layer must be between 1 and {max_metal_layers}."),
+            });
+        }
+        for (field, value) in [
+            ("offset_um", pad.offset_um),
+            ("width_um", pad.width_um),
+            ("height_um", pad.height_um),
+        ] {
+            validate_positive(&format!("{prefix}.{field}"), value, diagnostics);
+            validate_on_grid(&format!("{prefix}.{field}"), value, grid, diagnostics);
+        }
+        let (side_extent, parallel_size) = match pad.side {
+            TapeoutSide::Top | TapeoutSide::Bottom => (usable_width, pad.width_um),
+            TapeoutSide::Left | TapeoutSide::Right => (usable_height, pad.height_um),
+        };
+        if pad.offset_um - parallel_size / 2.0 < 0.0
+            || pad.offset_um + parallel_size / 2.0 > side_extent
+        {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "tapeout_pad_out_of_bounds",
+                field: format!("{prefix}.offset_um"),
+                message: format!("The complete pad must fit on its {side_extent} µm side."),
+            });
+        }
     }
 }
 
@@ -1585,8 +1825,8 @@ fn validate_centered_extent_on_grid(
 #[cfg(test)]
 mod tests {
     use super::{
-        CutRule, GdsLayerPurpose, LayerRule, Technology, CURRENT_TECHNOLOGY_FORMAT_VERSION,
-        DEFAULT_MAX_METAL_LAYERS,
+        CutRule, GdsLayerPurpose, LayerRule, TapeoutPadRole, Technology,
+        CURRENT_TECHNOLOGY_FORMAT_VERSION, DEFAULT_MAX_METAL_LAYERS,
     };
 
     #[test]
@@ -1641,6 +1881,17 @@ mod tests {
             Some(technology.fingerprint().unwrap().as_str())
         );
         assert_eq!(process["foundry_signoff_deck"].as_bool(), Some(false));
+        assert_eq!(technology.tapeout_window.pads.len(), 42);
+        assert_eq!(
+            technology
+                .tapeout_window
+                .pads
+                .iter()
+                .filter(|pad| pad.role == TapeoutPadRole::Gpio)
+                .count(),
+            38
+        );
+        assert_eq!(technology.tapeout_window.rings.len(), 2);
         assert_eq!(record["overall_status"].as_str(), Some("IMPLEMENTED"));
         assert_eq!(
             validation["process_validation"]["signature"]["status"].as_str(),
@@ -1650,6 +1901,33 @@ mod tests {
         assert_eq!(technology.gds_layers.layers["ndiff"].len(), 2);
         assert_eq!(technology.gds_layers.layers["pdiff"].len(), 2);
         assert!(technology.gds_layers.layers["substrate"].is_empty());
+    }
+
+    #[test]
+    fn ihp_process_examples_are_linked_by_identity_and_fingerprint() {
+        let technology = Technology::from_yaml(include_str!(
+            "../../docs/examples/process_ihp_sg13g2_1v2_5m_dr.yaml"
+        ))
+        .expect("IHP compatibility rule deck should load");
+        let validation: serde_yaml::Value = serde_yaml::from_str(include_str!(
+            "../../docs/examples/process_ihp_sg13g2_1v2_5m_validation.yaml"
+        ))
+        .expect("IHP validation record should be valid YAML");
+        let process = &validation["process_validation"]["process"];
+
+        assert_eq!(
+            process["process_id"].as_str(),
+            Some(technology.process_id.as_str())
+        );
+        assert_eq!(
+            process["deck_revision"].as_str(),
+            Some(technology.deck_revision.as_str())
+        );
+        assert_eq!(
+            process["deck_fingerprint"].as_str(),
+            Some(technology.fingerprint().unwrap().as_str())
+        );
+        assert_eq!(process["foundry_signoff_deck"].as_bool(), Some(false));
     }
 
     #[test]
@@ -1701,6 +1979,9 @@ mod tests {
         technology.physical_rules.layer_overrides.remove("metal5");
         technology.physical_rules.density_fill.layers.clear();
         technology.gds_layers.dummy_layers.clear();
+        technology.tapeout_window.name = "Caravel SKY130 user area".into();
+        technology.tapeout_window.rings.clear();
+        technology.tapeout_window.pads.clear();
 
         assert!(technology.migrate_legacy_gds_layers());
         assert_eq!(
@@ -1717,6 +1998,14 @@ mod tests {
         assert_eq!(technology.physical_rules.contact.size_um, 0.22);
         assert!(!technology.physical_rules.density_fill.layers.is_empty());
         assert!(!technology.gds_layers.dummy_layers.is_empty());
+        assert_eq!(technology.tapeout_window.width_um, 2_920.0);
+        assert_eq!(technology.tapeout_window.height_um, 3_520.0);
+        assert_eq!(technology.tapeout_window.rings.len(), 2);
+        assert_eq!(technology.tapeout_window.pads.len(), 42);
+        assert_eq!(
+            technology.tapeout_window.name,
+            "Caravel-sized GF180 user area"
+        );
         assert_eq!(
             technology.physical_rules.layer_overrides["metal5"],
             LayerRule {
@@ -1934,6 +2223,23 @@ pmos:
         assert_eq!(technology.tapeout_window.width_um, 2_920.0);
         assert_eq!(technology.tapeout_window.height_um, 3_520.0);
         assert_eq!(
+            technology
+                .physical_rules
+                .density_fill
+                .layers
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["metal5"]
+        );
+        assert_eq!(
+            technology
+                .gds_layers
+                .dummy_layers
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["metal5"]
+        );
+        assert_eq!(
             technology.physical_parasitics.layer_capacitance_ff_per_um["metal1"],
             0.20
         );
@@ -1975,6 +2281,14 @@ pmos:
             .physical_rules
             .density_fill
             .evaluation_window_height_um = Some(80.0);
+        technology
+            .physical_rules
+            .density_fill
+            .evaluation_window_step_x_um = Some(40.0);
+        technology
+            .physical_rules
+            .density_fill
+            .evaluation_window_step_y_um = Some(40.0);
         let metal1 = technology
             .physical_rules
             .density_fill
@@ -1989,6 +2303,8 @@ pmos:
         let fill = &technology.physical_rules.density_fill;
         assert_eq!(fill.evaluation_window_width_um, Some(80.0));
         assert_eq!(fill.evaluation_window_height_um, Some(80.0));
+        assert_eq!(fill.evaluation_window_step_x_um, Some(40.0));
+        assert_eq!(fill.evaluation_window_step_y_um, Some(40.0));
         assert_eq!(fill.layers["metal1"].minimum_window_density, Some(0.25));
         assert_eq!(fill.layers["metal1"].maximum_window_density, Some(0.75));
 

@@ -72,6 +72,7 @@ struct PhysicalBuildProgress {
 }
 
 const BLOCK_LIBRARY_DIRECTORY: &str = "chippyblocks";
+const CURRENT_CHIPPYBLOCK_FORMAT_VERSION: u32 = 1;
 const OCHIPPY_FORMAT_VERSION: u32 = 1;
 const PHYSICAL_ARTIFACT_FORMAT_VERSION: u32 = 1;
 
@@ -344,6 +345,13 @@ struct PhysicalArtifact {
     physical_ir: PhysicalLayoutIr,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChippyBlockFile {
+    format_version: u32,
+    definition: BlockDefinition,
+}
+
 fn project_digest(project: &Project) -> Result<String, ProjectError> {
     let mut effective_project = project.clone();
     effective_project.technology.migrate_legacy_gds_layers();
@@ -448,15 +456,66 @@ fn write_block(project_path: &Path, definition: &BlockDefinition) -> Result<Path
     let directory = block_library_directory(project_path);
     fs::create_dir_all(&directory)?;
     let destination = directory.join(block_file_name(&definition.name));
-    fs::write(&destination, serde_json::to_string_pretty(definition)?)?;
+    let file = ChippyBlockFile {
+        format_version: CURRENT_CHIPPYBLOCK_FORMAT_VERSION,
+        definition: definition.clone(),
+    };
+    fs::write(&destination, serde_json::to_string_pretty(&file)?)?;
     Ok(destination)
+}
+
+fn parse_chippyblock(source: &str, path: &Path) -> Result<(BlockDefinition, bool), ProjectError> {
+    let value: serde_json::Value = serde_json::from_str(source).map_err(|error| {
+        ProjectError::InvalidAction(format!(
+            "block library file {} is invalid: {error}",
+            path.display()
+        ))
+    })?;
+    let (mut definition, legacy) = if value.get("formatVersion").is_some() {
+        let file: ChippyBlockFile = serde_json::from_value(value).map_err(|error| {
+            ProjectError::InvalidAction(format!(
+                "block library file {} is invalid: {error}",
+                path.display()
+            ))
+        })?;
+        if file.format_version > CURRENT_CHIPPYBLOCK_FORMAT_VERSION {
+            return Err(ProjectError::InvalidAction(format!(
+                "block library file {} uses unsupported format version {}; this build supports through version {}",
+                path.display(),
+                file.format_version,
+                CURRENT_CHIPPYBLOCK_FORMAT_VERSION
+            )));
+        }
+        (
+            file.definition,
+            file.format_version < CURRENT_CHIPPYBLOCK_FORMAT_VERSION,
+        )
+    } else {
+        // Files written before the envelope existed are the implicit v0 form:
+        // a bare BlockDefinition. Its newer provenance fields already have
+        // serde defaults, so it can be upgraded without guessing identities.
+        let definition: BlockDefinition = serde_json::from_value(value).map_err(|error| {
+            ProjectError::InvalidAction(format!(
+                "block library file {} is invalid: {error}",
+                path.display()
+            ))
+        })?;
+        (definition, true)
+    };
+    if definition.revision == 0 {
+        definition.revision = 1;
+    }
+    Ok((definition, legacy))
 }
 
 fn save_block_library(
     project_path: &Path,
+    project_id: uuid::Uuid,
     definitions: &[BlockDefinition],
 ) -> Result<(), ProjectError> {
-    for definition in definitions {
+    for definition in definitions.iter().filter(|definition| {
+        definition.source_project_id.is_none() || definition.source_project_id == Some(project_id)
+    }) {
         write_block(project_path, definition)?;
     }
     Ok(())
@@ -469,30 +528,85 @@ fn load_block_library(project_path: &Path, project: &mut Project) -> Result<(), 
     }
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
+    let mut loaded_files = Vec::new();
     for entry in entries {
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("chippyblock") {
             continue;
         }
-        let definition: BlockDefinition = serde_json::from_str(&fs::read_to_string(&path)?)
-            .map_err(|error| {
-                ProjectError::InvalidAction(format!(
-                    "block library file {} is invalid: {error}",
-                    path.display()
-                ))
-            })?;
-        if project
-            .block_definitions
-            .iter()
-            .any(|existing| existing.id == definition.id || existing.name == definition.name)
-        {
-            continue;
-        }
-        project.block_definitions.push(definition);
+        let (definition, legacy) = parse_chippyblock(&fs::read_to_string(&path)?, &path)?;
+        loaded_files.push((path, definition, legacy));
     }
-    project
+
+    // A block file may reference another block whose filename sorts later.
+    // Resolve every compatible revision on a staging project before checking
+    // the graph, so directory order cannot manufacture a transient missing
+    // definition error. Nothing reaches the live project on failure.
+    let mut candidate = project.clone();
+    for (_, definition, _) in &loaded_files {
+        candidate
+            .merge_block_definition_unvalidated(definition.clone())
+            .map_err(ProjectError::InvalidAction)?;
+    }
+    candidate
         .validate_block_graph()
         .map_err(ProjectError::InvalidAction)?;
+
+    let mut rejected_files = std::collections::HashSet::new();
+    for (path, incoming, _) in &loaded_files {
+        let Err(reason) = candidate.validate_block_definition_integrity(incoming) else {
+            continue;
+        };
+        let incoming_won = candidate.block_definition(incoming.id) == Some(incoming);
+        if !incoming_won {
+            continue;
+        }
+        let Some(fallback) = project
+            .block_definition(incoming.id)
+            .filter(|definition| {
+                project
+                    .validate_block_definition_integrity(definition)
+                    .is_ok()
+            })
+            .cloned()
+        else {
+            return Err(ProjectError::InvalidAction(format!(
+                "block library file {} cannot replace the current definition: {reason}",
+                path.display()
+            )));
+        };
+        let index = candidate
+            .block_definitions
+            .iter()
+            .position(|definition| definition.id == incoming.id)
+            .expect("selected incoming definition must exist");
+        candidate.block_definitions[index] = fallback;
+        rejected_files.insert(path.clone());
+    }
+    candidate
+        .validate_block_graph()
+        .map_err(ProjectError::InvalidAction)?;
+
+    for (path, definition, legacy) in loaded_files {
+        if rejected_files.contains(&path) {
+            continue;
+        }
+        // Staging chose the newest interface-compatible revision between the
+        // project snapshot and its complete adjacent library. Rewrite legacy
+        // input, or an older library copy, to that resolved representation.
+        let resolved = candidate
+            .block_definition(definition.id)
+            .expect("merged or pre-existing block definition must resolve");
+        let current_file = ChippyBlockFile {
+            format_version: CURRENT_CHIPPYBLOCK_FORMAT_VERSION,
+            definition: resolved.clone(),
+        };
+        let current_source = serde_json::to_string_pretty(&current_file)?;
+        if legacy || fs::read_to_string(&path)? != current_source {
+            fs::write(&path, current_source)?;
+        }
+    }
+    *project = candidate;
     Ok(())
 }
 
@@ -506,8 +620,10 @@ struct Workspace {
 impl Default for Workspace {
     fn default() -> Self {
         let project = Project::default();
+        let mut history = ProjectHistory::default();
+        history.reset(project.clone());
         Self {
-            history: ProjectHistory::default(),
+            history,
             path: None,
             saved: project,
             physical_cache: None,
@@ -548,6 +664,7 @@ impl Workspace {
 
 struct AppState {
     workspace: Mutex<Workspace>,
+    simulation_memory: Mutex<Option<(String, simulation::SimulationMemory)>>,
 }
 
 #[derive(Serialize)]
@@ -827,6 +944,22 @@ fn delete_components(
 }
 
 #[tauri::command]
+fn duplicate_components(
+    ids: Vec<uuid::Uuid>,
+    state: tauri::State<AppState>,
+) -> Result<WorkspaceState, ProjectError> {
+    let mut workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| ProjectError::StateUnavailable)?;
+    workspace
+        .history
+        .try_update(|project| project.duplicate_components(&ids))
+        .map_err(ProjectError::InvalidAction)?;
+    Ok(workspace.state())
+}
+
+#[tauri::command]
 fn rename_component(
     id: uuid::Uuid,
     name: String,
@@ -839,6 +972,23 @@ fn rename_component(
     workspace
         .history
         .try_update(|project| project.rename_component(id, name))
+        .map_err(ProjectError::InvalidAction)?;
+    Ok(workspace.state())
+}
+
+#[tauri::command]
+fn set_tapeout_pin_binding(
+    id: uuid::Uuid,
+    pad_id: Option<String>,
+    state: tauri::State<AppState>,
+) -> Result<WorkspaceState, ProjectError> {
+    let mut workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| ProjectError::StateUnavailable)?;
+    workspace
+        .history
+        .try_update(|project| project.set_tapeout_pin_binding(id, pad_id))
         .map_err(ProjectError::InvalidAction)?;
     Ok(workspace.state())
 }
@@ -958,8 +1108,10 @@ fn parse_verilog(source: String) -> Result<rtl::RtlModule, ProjectError> {
 }
 
 #[tauri::command]
-fn read_verilog_source(path: String) -> Result<String, ProjectError> {
-    Ok(fs::read_to_string(Path::new(&path))?)
+async fn read_verilog_source(path: String) -> Result<String, ProjectError> {
+    tauri::async_runtime::spawn_blocking(move || Ok(fs::read_to_string(Path::new(&path))?))
+        .await
+        .map_err(|error| ProjectError::InvalidAction(format!("file task failed: {error}")))?
 }
 
 #[tauri::command]
@@ -995,9 +1147,13 @@ fn export_verilog(state: tauri::State<AppState>) -> Result<String, ProjectError>
 }
 
 #[tauri::command]
-fn save_text_file(path: String, data: String) -> Result<String, ProjectError> {
-    fs::write(Path::new(&path), data)?;
-    Ok(path)
+async fn save_text_file(path: String, data: String) -> Result<String, ProjectError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        fs::write(Path::new(&path), data)?;
+        Ok(path)
+    })
+    .await
+    .map_err(|error| ProjectError::InvalidAction(format!("file task failed: {error}")))?
 }
 
 #[tauri::command]
@@ -1139,88 +1295,104 @@ async fn inspect_physical_layout(
 }
 
 #[tauri::command]
-fn save_physical_layout(
+async fn save_physical_layout(
     path: String,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
 ) -> Result<String, ProjectError> {
+    let (project, cached_layout) = {
+        let workspace = state
+            .workspace
+            .lock()
+            .map_err(|_| ProjectError::StateUnavailable)?;
+        let project = workspace.history.current();
+        let cached = matching_cached_layout(&workspace.physical_cache, &project);
+        (project, cached)
+    };
+    let task_path = path.clone();
+    let artifact =
+        tauri::async_runtime::spawn_blocking(move || -> Result<PhysicalArtifact, ProjectError> {
+            let artifact = match cached_layout {
+                Some(physical_ir) => PhysicalArtifact {
+                    format_version: PHYSICAL_ARTIFACT_FORMAT_VERSION,
+                    source_project_digest: project_digest(&project)?,
+                    physical_ir,
+                },
+                None => build_physical_artifact(&project)?,
+            };
+            fs::write(&task_path, serde_json::to_string_pretty(&artifact)?)?;
+            Ok(artifact)
+        })
+        .await
+        .map_err(|error| ProjectError::InvalidAction(format!("file task failed: {error}")))??;
     let mut workspace = state
         .workspace
         .lock()
         .map_err(|_| ProjectError::StateUnavailable)?;
-    let project = workspace.history.current();
-    let artifact = match matching_cached_layout(&workspace.physical_cache, &project) {
-        Some(physical_ir) => PhysicalArtifact {
-            format_version: PHYSICAL_ARTIFACT_FORMAT_VERSION,
-            source_project_digest: project_digest(&project)?,
-            physical_ir,
-        },
-        None => build_physical_artifact(&project)?,
-    };
-    fs::write(&path, serde_json::to_string_pretty(&artifact)?)?;
-    workspace.physical_cache = Some(artifact);
+    if project_digest(&workspace.history.current())? == artifact.source_project_digest {
+        workspace.physical_cache = Some(artifact);
+    }
     Ok(path)
 }
 
 #[tauri::command]
-fn export_gdsii(
+async fn export_gdsii(
     path: String,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
 ) -> Result<GdsExportReport, ProjectError> {
-    let workspace = state
-        .workspace
-        .lock()
-        .map_err(|_| ProjectError::StateUnavailable)?;
-    let project = workspace.history.current();
-    let layout = matching_cached_layout(&workspace.physical_cache, &project)
-        .map(Ok)
-        .unwrap_or_else(|| {
-            physical_layout::normalize_project(&project).map_err(ProjectError::InvalidAction)
-        })?;
-    let connectivity_errors = physical_drc::validate(&layout, &project.technology)
-        .diagnostics
-        .into_iter()
-        .filter(|diagnostic| diagnostic.rule_id.starts_with("CONNECTIVITY."))
-        .count();
-    if connectivity_errors > 0 {
-        return Err(ProjectError::InvalidAction(format!(
-            "GDSII export blocked: physical layout has {connectivity_errors} unconnected transistor-net diagnostics. Regenerate or repair the physical layout before manufacturing export."
-        )));
-    }
-    let (bytes, report) = gdsii::export(
-        &layout,
-        project.technology.physical_rules.database_units_per_micron,
-        &project.technology.gds_layers,
-    )
-    .map_err(ProjectError::InvalidAction)?;
-    if !report.structurally_valid {
-        return Err(ProjectError::InvalidAction(format!(
-            "GDSII structural validation failed: {}",
-            report.diagnostics.join("; ")
-        )));
-    }
-    fs::write(path, bytes)?;
-    Ok(report)
+    let (project, cached) = {
+        let workspace = state
+            .workspace
+            .lock()
+            .map_err(|_| ProjectError::StateUnavailable)?;
+        let project = workspace.history.current();
+        let cached = matching_cached_layout(&workspace.physical_cache, &project);
+        (project, cached)
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let layout = cached.map(Ok).unwrap_or_else(|| physical_layout::normalize_project(&project).map_err(ProjectError::InvalidAction))?;
+        let connectivity_errors = physical_drc::validate(&layout, &project.technology).diagnostics.into_iter().filter(|diagnostic| diagnostic.rule_id.starts_with("CONNECTIVITY.")).count();
+        if connectivity_errors > 0 { return Err(ProjectError::InvalidAction(format!("GDSII export blocked: physical layout has {connectivity_errors} unconnected transistor-net diagnostics. Regenerate or repair the physical layout before manufacturing export."))); }
+        let (bytes, report) = gdsii::export(&layout, project.technology.physical_rules.database_units_per_micron, &project.technology.gds_layers).map_err(ProjectError::InvalidAction)?;
+        if !report.structurally_valid { return Err(ProjectError::InvalidAction(format!("GDSII structural validation failed: {}", report.diagnostics.join("; ")))); }
+        fs::write(path, bytes)?;
+        Ok(report)
+    }).await.map_err(|error| ProjectError::InvalidAction(format!("file task failed: {error}")))?
 }
 
 #[tauri::command]
-fn export_lef(path: String, state: tauri::State<AppState>) -> Result<String, ProjectError> {
-    let workspace = state
-        .workspace
-        .lock()
-        .map_err(|_| ProjectError::StateUnavailable)?;
-    let project = workspace.history.current();
-    let layout = matching_cached_layout(&workspace.physical_cache, &project)
-        .map(Ok)
-        .unwrap_or_else(|| {
+async fn export_lef(
+    path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, ProjectError> {
+    let (project, cached) = {
+        let workspace = state
+            .workspace
+            .lock()
+            .map_err(|_| ProjectError::StateUnavailable)?;
+        let project = workspace.history.current();
+        let cached = matching_cached_layout(&workspace.physical_cache, &project);
+        (project, cached)
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let layout = cached.map(Ok).unwrap_or_else(|| {
             physical_layout::normalize_project(&project).map_err(ProjectError::InvalidAction)
         })?;
-    let source = lef::export(&layout).map_err(ProjectError::InvalidAction)?;
-    fs::write(&path, source)?;
-    Ok(path)
+        let source = lef::export(&layout).map_err(ProjectError::InvalidAction)?;
+        fs::write(&path, source)?;
+        Ok(path)
+    })
+    .await
+    .map_err(|error| ProjectError::InvalidAction(format!("file task failed: {error}")))?
 }
 
 #[tauri::command]
-fn save_physical_drc_report(path: String, data: String) -> Result<String, ProjectError> {
+async fn save_physical_drc_report(path: String, data: String) -> Result<String, ProjectError> {
+    tauri::async_runtime::spawn_blocking(move || save_physical_drc_report_sync(path, data))
+        .await
+        .map_err(|error| ProjectError::InvalidAction(format!("file task failed: {error}")))?
+}
+
+fn save_physical_drc_report_sync(path: String, data: String) -> Result<String, ProjectError> {
     fs::write(Path::new(&path), data)?;
     Ok(path)
 }
@@ -1276,34 +1448,45 @@ fn update_block_from_current(
 }
 
 #[tauri::command]
-fn export_block(
+async fn export_block(
     definition_id: uuid::Uuid,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
 ) -> Result<String, ProjectError> {
-    let workspace = state
-        .workspace
-        .lock()
-        .map_err(|_| ProjectError::StateUnavailable)?;
-    let project_path = workspace.path.as_deref().ok_or(ProjectError::MissingPath)?;
-    let project = workspace.history.current();
-    let definition: &BlockDefinition = project
+    let (project_path, project) = {
+        let workspace = state
+            .workspace
+            .lock()
+            .map_err(|_| ProjectError::StateUnavailable)?;
+        (
+            workspace.path.clone().ok_or(ProjectError::MissingPath)?,
+            workspace.history.current(),
+        )
+    };
+    let definition = project
         .block_definition(definition_id)
+        .cloned()
         .ok_or_else(|| ProjectError::InvalidAction("block definition not found".into()))?;
-    save_block_library(Path::new(project_path), &project.block_definitions)?;
-    let destination =
-        block_library_directory(Path::new(project_path)).join(block_file_name(&definition.name));
-    Ok(destination.to_string_lossy().into_owned())
+    tauri::async_runtime::spawn_blocking(move || {
+        let destination = write_block(Path::new(&project_path), &definition)?;
+        Ok(destination.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|error| ProjectError::InvalidAction(format!("file task failed: {error}")))?
 }
 
 #[tauri::command]
-fn load_technology(
+async fn load_technology(
     path: String,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
 ) -> Result<WorkspaceState, ProjectError> {
-    let source = fs::read_to_string(Path::new(&path)).map_err(|error| {
-        ProjectError::InvalidAction(format!("could not read technology: {error}"))
-    })?;
-    let technology = Technology::from_yaml(&source).map_err(ProjectError::InvalidAction)?;
+    let technology = tauri::async_runtime::spawn_blocking(move || {
+        let source = fs::read_to_string(Path::new(&path)).map_err(|error| {
+            ProjectError::InvalidAction(format!("could not read technology: {error}"))
+        })?;
+        Technology::from_yaml(&source).map_err(ProjectError::InvalidAction)
+    })
+    .await
+    .map_err(|error| ProjectError::InvalidAction(format!("file task failed: {error}")))??;
     let mut workspace = state
         .workspace
         .lock()
@@ -1331,16 +1514,29 @@ fn simulate_project(
     inputs: HashMap<String, LogicState>,
     state: tauri::State<AppState>,
 ) -> Result<SimulationResult, ProjectError> {
-    let workspace = state
-        .workspace
+    let flattened = {
+        let workspace = state
+            .workspace
+            .lock()
+            .map_err(|_| ProjectError::StateUnavailable)?;
+        workspace
+            .history
+            .current()
+            .flattened()
+            .map_err(ProjectError::InvalidAction)?
+    };
+    let digest = project_digest(&flattened)?;
+    let mut session = state
+        .simulation_memory
         .lock()
         .map_err(|_| ProjectError::StateUnavailable)?;
-    let flattened = workspace
-        .history
-        .current()
-        .flattened()
-        .map_err(ProjectError::InvalidAction)?;
-    Ok(simulation::simulate(&flattened, &inputs))
+    let previous = session
+        .as_ref()
+        .filter(|(session_digest, _)| session_digest == &digest)
+        .map(|(_, memory)| memory);
+    let (result, memory) = simulation::simulate_with_memory(&flattened, &inputs, previous);
+    *session = Some((digest, memory));
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1412,6 +1608,14 @@ fn load_circuit_file(path: &Path) -> Result<Project, ProjectError> {
         });
     }
     project.technology.migrate_legacy_gds_layers();
+    // Repair locally-authored snapshots before consulting the adjacent
+    // library. In particular, this recovers projects whose source ownership
+    // was misattributed by the older Save-As behavior. Keep loading possible
+    // when an edit is intentionally incomplete; Save will report that update.
+    let mut refreshed = project.clone();
+    if refreshed.refresh_linked_blocks().is_ok() {
+        project = refreshed;
+    }
     load_block_library(path, &mut project)?;
     Ok(project)
 }
@@ -1463,76 +1667,135 @@ fn load_project_files(path: &Path) -> Result<(Project, Option<PhysicalArtifact>)
 }
 
 #[tauri::command]
-fn save_project(
+async fn save_project(
     path: Option<String>,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
 ) -> Result<WorkspaceState, ProjectError> {
+    let (destination, source_project, project, cached_layout) = {
+        let workspace = state
+            .workspace
+            .lock()
+            .map_err(|_| ProjectError::StateUnavailable)?;
+        let destination = path
+            .or_else(|| workspace.path.clone())
+            .ok_or(ProjectError::MissingPath)?;
+        let source_project = workspace.history.current();
+        let mut project = source_project.clone();
+        let forks_existing_project = workspace
+            .path
+            .as_deref()
+            .is_some_and(|current| Path::new(current) != Path::new(&destination));
+        if forks_existing_project {
+            project.fork_for_save_as();
+        }
+        project
+            .refresh_linked_blocks()
+            .map_err(ProjectError::InvalidAction)?;
+        let cached_layout = matching_cached_layout(&workspace.physical_cache, &project);
+        (destination, source_project, project, cached_layout)
+    };
+    let destination_for_task = destination.clone();
+    let project_for_task = project.clone();
+    let artifact = tauri::async_runtime::spawn_blocking(
+        move || -> Result<Option<PhysicalArtifact>, ProjectError> {
+            let destination_path = Path::new(&destination_for_task);
+            if destination_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("ochippy")
+            {
+                let root = destination_path.parent().unwrap_or_else(|| Path::new("."));
+                let stem = destination_path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("project");
+                let circuit_name = format!("{stem}.chippy");
+                let physical_name = format!("{stem}.chippy_gds");
+                let circuit_path = root.join(&circuit_name);
+                let physical_path = root.join(&physical_name);
+                let artifact = cached_layout
+                    .map(|physical_ir| -> Result<PhysicalArtifact, ProjectError> {
+                        Ok(PhysicalArtifact {
+                            format_version: PHYSICAL_ARTIFACT_FORMAT_VERSION,
+                            source_project_digest: project_digest(&project_for_task)?,
+                            physical_ir,
+                        })
+                    })
+                    .transpose()?;
+                fs::write(
+                    &circuit_path,
+                    serde_json::to_string_pretty(&project_for_task)?,
+                )?;
+                if let Some(artifact) = &artifact {
+                    fs::write(&physical_path, serde_json::to_string_pretty(artifact)?)?;
+                }
+                let mut included_files = vec![OchippyIncludedFile {
+                    role: "circuit".into(),
+                    path: circuit_name,
+                }];
+                if artifact.is_some() {
+                    included_files.push(OchippyIncludedFile {
+                        role: "physical".into(),
+                        path: physical_name,
+                    });
+                }
+                let manifest = OchippyManifest {
+                    format_version: OCHIPPY_FORMAT_VERSION,
+                    project_name: project_for_task.name.clone(),
+                    included_files,
+                };
+                fs::write(destination_path, serde_json::to_string_pretty(&manifest)?)?;
+                save_block_library(
+                    &circuit_path,
+                    project_for_task.project_id,
+                    &project_for_task.block_definitions,
+                )?;
+                Ok(artifact)
+            } else {
+                fs::write(
+                    destination_path,
+                    serde_json::to_string_pretty(&project_for_task)?,
+                )?;
+                save_block_library(
+                    destination_path,
+                    project_for_task.project_id,
+                    &project_for_task.block_definitions,
+                )?;
+                Ok(None)
+            }
+        },
+    )
+    .await
+    .map_err(|error| ProjectError::InvalidAction(format!("file task failed: {error}")))??;
     let mut workspace = state
         .workspace
         .lock()
         .map_err(|_| ProjectError::StateUnavailable)?;
-    let destination = path
-        .or_else(|| workspace.path.clone())
-        .ok_or(ProjectError::MissingPath)?;
-    let project = workspace.history.current();
-    let destination_path = Path::new(&destination);
-    if destination_path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        == Some("ochippy")
-    {
-        let root = destination_path.parent().unwrap_or_else(|| Path::new("."));
-        let stem = destination_path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
-            .unwrap_or("project");
-        let circuit_name = format!("{stem}.chippy");
-        let physical_name = format!("{stem}.chippy_gds");
-        let circuit_path = root.join(&circuit_name);
-        let physical_path = root.join(&physical_name);
-        let artifact = match matching_cached_layout(&workspace.physical_cache, &project) {
-            Some(physical_ir) => PhysicalArtifact {
-                format_version: PHYSICAL_ARTIFACT_FORMAT_VERSION,
-                source_project_digest: project_digest(&project)?,
-                physical_ir,
-            },
-            None => build_physical_artifact(&project)?,
-        };
-        fs::write(&circuit_path, serde_json::to_string_pretty(&project)?)?;
-        fs::write(&physical_path, serde_json::to_string_pretty(&artifact)?)?;
-        let manifest = OchippyManifest {
-            format_version: OCHIPPY_FORMAT_VERSION,
-            project_name: project.name.clone(),
-            included_files: vec![
-                OchippyIncludedFile {
-                    role: "circuit".into(),
-                    path: circuit_name,
-                },
-                OchippyIncludedFile {
-                    role: "physical".into(),
-                    path: physical_name,
-                },
-            ],
-        };
-        fs::write(destination_path, serde_json::to_string_pretty(&manifest)?)?;
-        save_block_library(&circuit_path, &project.block_definitions)?;
-        workspace.physical_cache = Some(artifact);
-    } else {
-        fs::write(destination_path, serde_json::to_string_pretty(&project)?)?;
-        save_block_library(destination_path, &project.block_definitions)?;
+    if workspace.history.current() == source_project {
+        if source_project != project {
+            let refreshed = project.clone();
+            workspace.history.update(|current| *current = refreshed);
+        }
+        workspace.saved = project;
     }
-    workspace.saved = project;
     workspace.path = Some(destination);
+    if artifact.is_some() {
+        workspace.physical_cache = artifact;
+    }
     Ok(workspace.state())
 }
 
 #[tauri::command]
-fn load_project(
+async fn load_project(
     path: String,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
 ) -> Result<WorkspaceState, ProjectError> {
-    let (project, physical_cache) = load_project_files(Path::new(&path))?;
+    let task_path = path.clone();
+    let (project, physical_cache) =
+        tauri::async_runtime::spawn_blocking(move || load_project_files(Path::new(&task_path)))
+            .await
+            .map_err(|error| ProjectError::InvalidAction(format!("file task failed: {error}")))??;
     let mut workspace = state
         .workspace
         .lock()
@@ -1552,6 +1815,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             workspace: Mutex::new(Workspace::default()),
+            simulation_memory: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             new_project,
@@ -1567,7 +1831,9 @@ pub fn run() {
             finish_wire,
             rotate_components,
             delete_components,
+            duplicate_components,
             rename_component,
+            set_tapeout_pin_binding,
             set_device_geometry,
             device_characteristics,
             rename_project,
@@ -1610,9 +1876,9 @@ pub fn run() {
 mod tests {
     use super::{
         build_physical_artifact, load_block_library, load_project_files, matching_cached_layout,
-        save_block_library, save_physical_drc_report, validate_physical_artifact,
-        OchippyIncludedFile, OchippyManifest, Workspace, BLOCK_LIBRARY_DIRECTORY,
-        CURRENT_PHYSICAL_IR_VERSION, OCHIPPY_FORMAT_VERSION,
+        save_block_library, save_physical_drc_report_sync, validate_physical_artifact,
+        ChippyBlockFile, OchippyIncludedFile, OchippyManifest, Workspace, BLOCK_LIBRARY_DIRECTORY,
+        CURRENT_CHIPPYBLOCK_FORMAT_VERSION, CURRENT_PHYSICAL_IR_VERSION, OCHIPPY_FORMAT_VERSION,
     };
     use crate::model::{Project, TerminalRef};
     use std::fs;
@@ -1624,7 +1890,8 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("report.json");
         let data = r#"{"formatVersion":1,"report":{"errorCount":0}}"#;
-        let saved = save_physical_drc_report(path.to_string_lossy().into(), data.into()).unwrap();
+        let saved =
+            save_physical_drc_report_sync(path.to_string_lossy().into(), data.into()).unwrap();
         assert_eq!(saved, path.to_string_lossy());
         assert_eq!(fs::read_to_string(&path).unwrap(), data);
         fs::remove_dir_all(directory).unwrap();
@@ -1666,11 +1933,23 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let project_path = root.join("logic.chippy");
         let mut source = Project::default();
-        source.add_component("input", -2.0, 0.0).unwrap();
-        source.add_component("output", 2.0, 0.0).unwrap();
+        let input = source.add_component("input", -2.0, 0.0).unwrap();
+        let output = source.add_component("output", 2.0, 0.0).unwrap();
+        source
+            .connect(
+                TerminalRef {
+                    component_id: input,
+                    terminal: "out".into(),
+                },
+                TerminalRef {
+                    component_id: output,
+                    terminal: "in".into(),
+                },
+            )
+            .unwrap();
         source.capture_block("Reusable Gate".into()).unwrap();
 
-        save_block_library(&project_path, &source.block_definitions).unwrap();
+        save_block_library(&project_path, source.project_id, &source.block_definitions).unwrap();
         let library = root.join(BLOCK_LIBRARY_DIRECTORY);
         assert!(library.join("Reusable_Gate.chippyblock").is_file());
 
@@ -1679,11 +1958,290 @@ mod tests {
         load_block_library(&project_path, &mut loaded).unwrap();
         assert_eq!(loaded.block_definitions.len(), 1);
         assert_eq!(loaded.block_definitions[0].name, "Reusable Gate");
+        assert_eq!(loaded.block_definitions[0].revision, 1);
+
+        let resistor = source.add_component("resistor", 0.0, 2.0).unwrap();
+        source
+            .connect(
+                TerminalRef {
+                    component_id: input,
+                    terminal: "out".into(),
+                },
+                TerminalRef {
+                    component_id: resistor,
+                    terminal: "a".into(),
+                },
+            )
+            .unwrap();
+        source
+            .connect(
+                TerminalRef {
+                    component_id: resistor,
+                    terminal: "b".into(),
+                },
+                TerminalRef {
+                    component_id: output,
+                    terminal: "in".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(source.refresh_linked_blocks().unwrap(), 1);
+        save_block_library(&project_path, source.project_id, &source.block_definitions).unwrap();
+        load_block_library(&project_path, &mut loaded).unwrap();
+        assert_eq!(loaded.block_definitions[0].revision, 2);
+        assert_eq!(loaded.block_definitions[0].components.len(), 3);
+
+        // Saving a dependent project must not overwrite a newer definition
+        // authored by the source project.
+        save_block_library(&project_path, loaded.project_id, &loaded.block_definitions).unwrap();
+        let disk: ChippyBlockFile = serde_json::from_str(
+            &fs::read_to_string(library.join("Reusable_Gate.chippyblock")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(disk.format_version, CURRENT_CHIPPYBLOCK_FORMAT_VERSION);
+        assert_eq!(disk.definition.revision, 2);
+
+        // A pre-envelope v0 block with an older revision is accepted, merged
+        // against the newer compatible project copy, and rewritten in the
+        // latest file format without downgrading the definition.
+        let block_path = library.join("Reusable_Gate.chippyblock");
+        let mut legacy = source.block_definitions[0].clone();
+        legacy.revision = 0;
+        fs::write(&block_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+        load_block_library(&project_path, &mut loaded).unwrap();
+        let upgraded: ChippyBlockFile =
+            serde_json::from_str(&fs::read_to_string(&block_path).unwrap()).unwrap();
+        assert_eq!(upgraded.format_version, CURRENT_CHIPPYBLOCK_FORMAT_VERSION);
+        assert_eq!(upgraded.definition.revision, 2);
+        assert_eq!(loaded.block_definitions[0].revision, 2);
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn loading_a_legacy_gf180_project_restores_pwell_export_mapping() {
+    fn block_library_load_is_independent_of_dependency_filename_order() {
+        let root =
+            std::env::temp_dir().join(format!("openchippy-block-order-{}", uuid::Uuid::new_v4()));
+        let project_path = root.join("logic.chippy");
+        let library = root.join(BLOCK_LIBRARY_DIRECTORY);
+        fs::create_dir_all(&library).unwrap();
+
+        let mut leaf_source = Project::default();
+        let leaf_input = leaf_source.add_component("input", -2.0, 0.0).unwrap();
+        let leaf_output = leaf_source.add_component("output", 2.0, 0.0).unwrap();
+        leaf_source
+            .connect(
+                TerminalRef {
+                    component_id: leaf_input,
+                    terminal: "out".into(),
+                },
+                TerminalRef {
+                    component_id: leaf_output,
+                    terminal: "in".into(),
+                },
+            )
+            .unwrap();
+        let leaf_id = leaf_source.capture_block("Z_Leaf".into()).unwrap();
+        let leaf = leaf_source.block_definition(leaf_id).unwrap().clone();
+
+        let mut parent_source = Project::default();
+        parent_source.block_definitions.push(leaf.clone());
+        let leaf_instance = parent_source.place_block(leaf_id, 0.0, 0.0).unwrap();
+        let parent_input = parent_source.add_component("input", -4.0, 0.0).unwrap();
+        let parent_output = parent_source.add_component("output", 4.0, 0.0).unwrap();
+        parent_source
+            .connect(
+                TerminalRef {
+                    component_id: parent_input,
+                    terminal: "out".into(),
+                },
+                TerminalRef {
+                    component_id: leaf_instance,
+                    terminal: "IN1".into(),
+                },
+            )
+            .unwrap();
+        parent_source
+            .connect(
+                TerminalRef {
+                    component_id: leaf_instance,
+                    terminal: "OUT1".into(),
+                },
+                TerminalRef {
+                    component_id: parent_output,
+                    terminal: "in".into(),
+                },
+            )
+            .unwrap();
+        let parent_id = parent_source.capture_block("A_Parent".into()).unwrap();
+        let parent = parent_source.block_definition(parent_id).unwrap().clone();
+
+        // Both are legacy bare files. Alphabetical loading encounters the
+        // dependent parent before its leaf dependency.
+        fs::write(
+            library.join("A_Parent.chippyblock"),
+            serde_json::to_string_pretty(&parent).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            library.join("Z_Leaf.chippyblock"),
+            serde_json::to_string_pretty(&leaf).unwrap(),
+        )
+        .unwrap();
+
+        let mut loaded = Project::default();
+        load_block_library(&project_path, &mut loaded).unwrap();
+        assert!(loaded.block_definition(parent_id).is_some());
+        assert!(loaded.block_definition(leaf_id).is_some());
+        assert!(loaded.validate_block_graph().is_ok());
+        for name in ["A_Parent.chippyblock", "Z_Leaf.chippyblock"] {
+            let file: ChippyBlockFile =
+                serde_json::from_str(&fs::read_to_string(library.join(name)).unwrap()).unwrap();
+            assert_eq!(file.format_version, CURRENT_CHIPPYBLOCK_FORMAT_VERSION);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_newer_block_revision_cannot_replace_valid_embedded_definition() {
+        let root = std::env::temp_dir().join(format!(
+            "openchippy-block-integrity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let project_path = root.join("logic.chippy");
+        let library = root.join(BLOCK_LIBRARY_DIRECTORY);
+        fs::create_dir_all(&library).unwrap();
+
+        let mut source = Project::default();
+        let input = source.add_component("input", -2.0, 0.0).unwrap();
+        let output = source.add_component("output", 2.0, 0.0).unwrap();
+        source
+            .connect(
+                TerminalRef {
+                    component_id: input,
+                    terminal: "out".into(),
+                },
+                TerminalRef {
+                    component_id: output,
+                    terminal: "in".into(),
+                },
+            )
+            .unwrap();
+        let definition_id = source.capture_block("BUFFER".into()).unwrap();
+        let valid = source.block_definition(definition_id).unwrap().clone();
+        let mut incomplete = valid.clone();
+        incomplete.revision = 2;
+        incomplete.source_project_id = Some(uuid::Uuid::new_v4());
+        incomplete.components.push(crate::model::Component {
+            id: uuid::Uuid::new_v4(),
+            kind: "nmos".into(),
+            name: "UNDRIVEN".into(),
+            position: crate::model::Position {
+                x: 0.0,
+                y: 2.0,
+                z: 0.0,
+            },
+            rotation: 0.0,
+            device_geometry: None,
+            block_definition_id: None,
+        });
+        let block_path = library.join("BUFFER.chippyblock");
+        fs::write(
+            &block_path,
+            serde_json::to_string_pretty(&ChippyBlockFile {
+                format_version: CURRENT_CHIPPYBLOCK_FORMAT_VERSION,
+                definition: incomplete,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut parent = Project::default();
+        parent.block_definitions.push(valid);
+        load_block_library(&project_path, &mut parent).unwrap();
+        assert_eq!(parent.block_definition(definition_id).unwrap().revision, 1);
+        let disk: ChippyBlockFile =
+            serde_json::from_str(&fs::read_to_string(block_path).unwrap()).unwrap();
+        assert_eq!(disk.definition.revision, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loading_block_source_repairs_stale_save_as_authorship_from_top_level() {
+        let root = std::env::temp_dir().join(format!(
+            "openchippy-block-source-repair-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let project_path = root.join("SOURCE.chippy");
+        let library = root.join(BLOCK_LIBRARY_DIRECTORY);
+        fs::create_dir_all(&library).unwrap();
+        let mut source = Project::default();
+        let input = source.add_component("input", -2.0, 0.0).unwrap();
+        let output = source.add_component("output", 2.0, 0.0).unwrap();
+        source
+            .connect(
+                TerminalRef {
+                    component_id: input,
+                    terminal: "out".into(),
+                },
+                TerminalRef {
+                    component_id: output,
+                    terminal: "in".into(),
+                },
+            )
+            .unwrap();
+        let definition_id = source.capture_block("SOURCE".into()).unwrap();
+        let definition = source
+            .block_definitions
+            .iter_mut()
+            .find(|definition| definition.id == definition_id)
+            .unwrap();
+        definition.revision = 2;
+        definition.source_project_id = Some(uuid::Uuid::new_v4());
+        definition.source_digest = None;
+        definition.components.push(crate::model::Component {
+            id: uuid::Uuid::new_v4(),
+            kind: "nmos".into(),
+            name: "STALE_EXTRA".into(),
+            position: crate::model::Position {
+                x: 0.0,
+                y: 2.0,
+                z: 0.0,
+            },
+            rotation: 0.0,
+            device_geometry: None,
+            block_definition_id: None,
+        });
+        let stale_definition = definition.clone();
+        fs::write(
+            &project_path,
+            serde_json::to_string_pretty(&source).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            library.join("SOURCE.chippyblock"),
+            serde_json::to_string_pretty(&ChippyBlockFile {
+                format_version: CURRENT_CHIPPYBLOCK_FORMAT_VERSION,
+                definition: stale_definition,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (loaded, _) = load_project_files(&project_path).unwrap();
+        let repaired = loaded.block_definition(definition_id).unwrap();
+        assert_eq!(repaired.revision, 3);
+        assert_eq!(repaired.source_project_id, Some(loaded.project_id));
+        assert_eq!(repaired.components.len(), 2);
+        assert!(loaded.validate_block_definition_integrity(repaired).is_ok());
+        let disk: ChippyBlockFile =
+            serde_json::from_str(&fs::read_to_string(library.join("SOURCE.chippyblock")).unwrap())
+                .unwrap();
+        assert_eq!(disk.definition, *repaired);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loading_a_legacy_gf180_project_restores_manufacturing_and_perimeter_contracts() {
         let root = std::env::temp_dir().join(format!("openchippy-gf180-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("legacy.chippy");
@@ -1693,11 +2251,20 @@ mod tests {
         ))
         .unwrap();
         project.technology.gds_layers.layers.remove("pwell");
+        project.technology.tapeout_window.name = "Caravel SKY130 user area".into();
+        project.technology.tapeout_window.rings.clear();
+        project.technology.tapeout_window.pads.clear();
         fs::write(&path, serde_json::to_string_pretty(&project).unwrap()).unwrap();
 
         let (loaded, cache) = load_project_files(&path).unwrap();
         assert!(cache.is_none());
         assert_eq!(loaded.technology.gds_layers.layers["pwell"][0].layer, 204);
+        assert_eq!(loaded.technology.tapeout_window.rings.len(), 2);
+        assert_eq!(loaded.technology.tapeout_window.pads.len(), 42);
+        assert_eq!(
+            loaded.technology.tapeout_window.name,
+            "Caravel-sized GF180 user area"
+        );
         assert!(loaded.technology.validate().is_ok());
         fs::remove_dir_all(root).unwrap();
     }

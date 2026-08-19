@@ -25,6 +25,64 @@ technology:
   supply_voltage: 3.3
   max_metal_layers: 5
 
+# Caravel-sized user-project allocation. This compatibility template uses the
+# complete 2.92 mm x 3.52 mm area and exposes 38 GPIO plus two VDD and two GND
+# landing sites (42 total). Pad placement is an OpenChippy integration
+# contract, not a claim that GF180 is intrinsically tied to Caravel.
+tapeout_window:
+  format_version: 1
+  name: Caravel-sized GF180 user area
+  width_um: 2920.0
+  height_um: 3520.0
+  edge_margin_um: 0.0
+  layout_mode: full_usable_area
+  rings:
+    - { net: power, layer: 4, width_um: 10.0, inset_um: 20.0 }
+    - { net: ground, layer: 3, width_um: 10.0, inset_um: 35.0 }
+  pads:
+    - { id: gpio_left_0, role: gpio, side: left, offset_um: 176.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_1, role: gpio, side: left, offset_um: 352.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_2, role: gpio, side: left, offset_um: 528.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_3, role: gpio, side: left, offset_um: 704.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_4, role: gpio, side: left, offset_um: 880.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_5, role: gpio, side: left, offset_um: 1056.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_6, role: gpio, side: left, offset_um: 1232.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_7, role: gpio, side: left, offset_um: 1408.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_8, role: gpio, side: left, offset_um: 1584.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_9, role: gpio, side: left, offset_um: 1760.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_10, role: gpio, side: left, offset_um: 1936.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_11, role: gpio, side: left, offset_um: 2112.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_12, role: gpio, side: left, offset_um: 2288.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_13, role: gpio, side: left, offset_um: 2464.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_14, role: gpio, side: left, offset_um: 2640.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_15, role: gpio, side: left, offset_um: 2816.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_16, role: gpio, side: left, offset_um: 2992.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_17, role: gpio, side: left, offset_um: 3168.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_left_18, role: gpio, side: left, offset_um: 3344.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_0, role: gpio, side: right, offset_um: 176.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_1, role: gpio, side: right, offset_um: 352.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_2, role: gpio, side: right, offset_um: 528.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_3, role: gpio, side: right, offset_um: 704.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_4, role: gpio, side: right, offset_um: 880.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_5, role: gpio, side: right, offset_um: 1056.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_6, role: gpio, side: right, offset_um: 1232.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_7, role: gpio, side: right, offset_um: 1408.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_8, role: gpio, side: right, offset_um: 1584.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_9, role: gpio, side: right, offset_um: 1760.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_10, role: gpio, side: right, offset_um: 1936.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_11, role: gpio, side: right, offset_um: 2112.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_12, role: gpio, side: right, offset_um: 2288.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_13, role: gpio, side: right, offset_um: 2464.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_14, role: gpio, side: right, offset_um: 2640.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_15, role: gpio, side: right, offset_um: 2816.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_16, role: gpio, side: right, offset_um: 2992.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_17, role: gpio, side: right, offset_um: 3168.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: gpio_right_18, role: gpio, side: right, offset_um: 3344.0, width_um: 60.0, height_um: 60.0, layer: 5 }
+    - { id: vdd_top_0, role: power, side: top, offset_um: 730.0, width_um: 80.0, height_um: 80.0, layer: 5 }
+    - { id: vdd_top_1, role: power, side: top, offset_um: 2190.0, width_um: 80.0, height_um: 80.0, layer: 5 }
+    - { id: gnd_bottom_0, role: ground, side: bottom, offset_um: 365.0, width_um: 80.0, height_um: 80.0, layer: 5 }
+    - { id: gnd_bottom_1, role: ground, side: bottom, offset_um: 2555.0, width_um: 80.0, height_um: 80.0, layer: 5 }
+
 nmos:
   # Preliminary nominal values for OpenChippy's educational timing model.
   # Do not use these as SPICE or signoff characterization.
@@ -180,6 +238,15 @@ physical_rules:
   # dummy-to-dummy and dummy-to-circuit clearances.
   density_fill:
     format_version: 1
+    # Exact 2 um GF180 fill across this 10.3 mm^2 preview would require several
+    # million independent rectangles. Keep current generation scoped to the
+    # routed core until Physical IR supports repeated manufacturing arrays;
+    # the perimeter template itself is still emitted at full Caravel size.
+    cover_full_usable_area: false
+    evaluation_window_width_um: 200.0
+    evaluation_window_height_um: 200.0
+    evaluation_window_step_x_um: 100.0
+    evaluation_window_step_y_um: 100.0
     layers:
       active:
         target_density: 0.25
@@ -190,6 +257,7 @@ physical_rules:
         # Dummy COMP is paired with covering dummy Poly2, so reserve the
         # stricter Poly2-to-circuit clearance while placing the support tile.
         circuit_spacing_um: 5.0
+        ring_keepout_um: 60.0
       poly:
         target_density: 0.14
         # DPF.1 requires the dummy Poly2 tile to cover its dummy COMP support.
@@ -197,46 +265,51 @@ physical_rules:
         tile_height_um: 6.0
         fill_spacing_um: 1.1
         circuit_spacing_um: 5.0
+        ring_keepout_um: 60.0
         support_layer: active
       metal1:
         target_density: 0.31
-        tile_width_um: 3.0
-        tile_height_um: 3.0
-        fallback_tile_sizes_um: [1.0, 0.5, 0.25, 0.13]
-        fill_spacing_um: 0.98
+        tile_width_um: 2.0
+        tile_height_um: 2.0
+        fill_spacing_um: 1.2
         circuit_spacing_um: 2.0
+        ring_keepout_um: 60.0
       metal2:
         target_density: 0.31
-        tile_width_um: 3.0
-        tile_height_um: 3.0
-        fallback_tile_sizes_um: [1.0]
-        fill_spacing_um: 0.98
+        tile_width_um: 2.0
+        tile_height_um: 2.0
+        fill_spacing_um: 1.2
         circuit_spacing_um: 2.0
+        ring_keepout_um: 60.0
       metal3:
         target_density: 0.31
-        tile_width_um: 3.0
-        tile_height_um: 3.0
-        fallback_tile_sizes_um: [1.0]
-        fill_spacing_um: 0.98
+        tile_width_um: 2.0
+        tile_height_um: 2.0
+        fill_spacing_um: 1.2
         circuit_spacing_um: 2.0
+        ring_keepout_um: 60.0
       metal4:
         target_density: 0.31
-        tile_width_um: 3.0
-        tile_height_um: 3.0
-        fill_spacing_um: 0.98
+        tile_width_um: 2.0
+        tile_height_um: 2.0
+        fill_spacing_um: 1.2
         circuit_spacing_um: 2.0
+        ring_keepout_um: 60.0
       metal5:
         target_density: 0.31
-        tile_width_um: 3.0
-        tile_height_um: 3.0
-        fill_spacing_um: 0.98
+        tile_width_um: 2.0
+        tile_height_um: 2.0
+        fill_spacing_um: 1.2
         circuit_spacing_um: 2.0
+        ring_keepout_um: 60.0
       top_metal:
         target_density: 0.31
-        tile_width_um: 6.0
-        tile_height_um: 6.0
-        fill_spacing_um: 0.98
+        tile_width_um: 2.0
+        tile_height_um: 2.0
+        # DM.2c uses 2.0 um spacing for the 3 um thick MetalTop option.
+        fill_spacing_um: 2.0
         circuit_spacing_um: 2.0
+        ring_keepout_um: 60.0
 
   layer_overrides:
     metal1:

@@ -13,6 +13,7 @@ type ViewMode = "schematic" | "3d" | "waveform" | "rtl";
 
 export default function App() {
   const editableFocusRef = useRef(false);
+  const copiedComponentIdsRef = useRef<string[]>([]);
   const [workspace, setWorkspace] = useState<WorkspaceState | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [selectedWireId, setSelectedWireId] = useState<string | null>(null);
@@ -473,6 +474,18 @@ export default function App() {
     }
   };
 
+  const assignTapeoutPad = async (padId: string) => {
+    if (!selected) return;
+    try {
+      replaceWorkspace(
+        await backend.setTapeoutPinBinding(selected.id, padId || null),
+        padId ? `Assigned ${selected.name} to ${padId}` : `Cleared ${selected.name} tapeout pad`,
+      );
+    } catch (reason) {
+      showError(reason);
+    }
+  };
+
   const updateTimingTarget = async (value: string) => {
     if (!project) return;
     const trimmed = value.trim();
@@ -668,6 +681,39 @@ export default function App() {
       showError(reason);
     }
   };
+
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+      if (editableFocusRef.current || isEditingText(event)) return;
+      const key = event.key.toLowerCase();
+      if (key === "s") {
+        event.preventDefault();
+        void saveCurrent(event.shiftKey);
+      } else if (key === "o") {
+        event.preventDefault();
+        void loadExisting();
+      } else if (key === "c" && viewMode === "schematic" && selectedIds.length) {
+        event.preventDefault();
+        copiedComponentIdsRef.current = [...selectedIds];
+        setStatus(`Copied ${selectedIds.length} component${selectedIds.length === 1 ? "" : "s"}`);
+      } else if (key === "v" && viewMode === "schematic" && copiedComponentIdsRef.current.length && project) {
+        event.preventDefault();
+        const existing = new Set(project.components.map(({ id }) => id));
+        void backend.duplicateComponents(copiedComponentIdsRef.current)
+          .then((next) => {
+            const pasted = next.project.components
+              .filter(({ id }) => !existing.has(id))
+              .map(({ id }) => id);
+            replaceWorkspace(next, `Pasted ${pasted.length} component${pasted.length === 1 ? "" : "s"}`);
+            setSelectedIds(pasted);
+          })
+          .catch(showError);
+      }
+    };
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, [project, selectedIds, viewMode, workspace?.path, workspace?.dirty]);
 
   const loadTechnology = async () => {
     try {
@@ -1159,6 +1205,28 @@ export default function App() {
               <dt>ID</dt><dd>{selected.id.slice(0, 8)}</dd>
               <dt>Position</dt><dd>{selected.position.x}, {selected.position.y}</dd>
             </dl>
+            {project && (selected.kind === "input" || selected.kind === "output") && (
+              <>
+                <p className="inspector-section">Tapeout perimeter</p>
+                <label className="field-label">
+                  GPIO pad
+                  <select
+                    className="property-input"
+                    value={project.tapeoutPinBindings[selected.id] ?? ""}
+                    onChange={(event) => assignTapeoutPad(event.currentTarget.value)}
+                  >
+                    <option value="">Unassigned</option>
+                    {project.technology.tapeout_window.pads
+                      .filter((pad) => pad.role === "gpio")
+                      .map((pad) => {
+                        const owner = Object.entries(project.tapeoutPinBindings)
+                          .find(([componentId, padId]) => componentId !== selected.id && padId === pad.id);
+                        return <option key={pad.id} value={pad.id} disabled={Boolean(owner)}>{pad.id} · {pad.side}</option>;
+                      })}
+                  </select>
+                </label>
+              </>
+            )}
             {deviceCharacteristics && (
               <>
                 <p className="inspector-section">Device geometry</p>
@@ -1213,6 +1281,7 @@ export default function App() {
                   <p className="inspector-section">Shared definition</p>
                   <strong>{definition.name}</strong>
                   <small>{definition.components.length} source components · {definition.wires.length} wires</small>
+                  <small>{definition.sourceProjectId ? `Linked source · revision ${definition.revision}` : "Legacy snapshot"}</small>
                   <div className="block-pin-list">
                     {definition.pins.map((pin) => <span key={pin.name}><b>{pin.name}</b>{pin.role}</span>)}
                   </div>

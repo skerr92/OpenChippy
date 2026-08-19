@@ -188,7 +188,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 npm run tauri -- build
 ```
 
-The current baseline is 185 passing Rust tests plus successful frontend and Tauri release
+The current baseline is 193 passing Rust tests plus successful frontend and Tauri release
 builds. Some physical-layout regressions are intentionally heavyweight and may take more
 than a minute on a development machine.
 

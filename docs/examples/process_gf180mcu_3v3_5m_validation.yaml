@@ -18,7 +18,7 @@ process_validation:
     process_id: gf180mcu-3v3-5m-compat
     deck_revision: openchippy-compat-v1
     deck_file: process_gf180mcu_3v3_5m_dr.yaml
-    deck_fingerprint: "fnv1a64:c739268436df11f1"
+    deck_fingerprint: "fnv1a64:954348f563ca895d"
     compatibility_profile: true
     foundry_signoff_deck: false
 
@@ -31,6 +31,7 @@ process_validation:
     notes:
       - The deck loads through the current strict OpenChippy technology parser.
       - EDU and GF180 compatibility NAND regressions pass native DRC.
+      - The compatibility template emits a full 2920 x 3520 um Caravel-sized perimeter with two rings and 42 pads (38 GPIO, two VDD, two GND), plus four full-height 20 um Metal5 supply trunks stitched to the rings and core nets; exact fine fill remains core-scoped pending repeated-array Physical IR.
       - QD-0001 passes native DRC/connectivity/LVS and its deterministic GDS has been checked with the official variant-C 5LM/9K deck.
       - KLayout opens and canonically round-trips the supported GDS record set.
       - Official GF180 geometry/process DRC is clean; the remaining DBU marker comes from an exact floating-point comparison in the deck/tool combination and is retained as correlation evidence.

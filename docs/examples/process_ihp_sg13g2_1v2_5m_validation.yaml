@@ -15,7 +15,7 @@ process_validation:
     process_id: ihp-sg13g2-1v2-5m-compat
     deck_revision: openchippy-compat-v1
     deck_file: process_ihp_sg13g2_1v2_5m_dr.yaml
-    deck_fingerprint: "fnv1a64:9e6046013a546854"
+    deck_fingerprint: "fnv1a64:d5926a20ab8e2b81"
     compatibility_profile: true
     foundry_signoff_deck: false
 
@@ -28,7 +28,7 @@ process_validation:
     notes:
       - The rule deck is derived from the public SG13G2 layer table and minimal precheck/rejection rules.
       - Filler layer mappings use the published filler datatype 22.
-      - Density limits record the public global and 800 x 800 um window requirements.
+      - Metal fill is temporarily configured with the packaged GF180 compatibility values (2 x 2 um tiles, 1.2 um spacing, 200 x 200 um windows stepped 100 um); this is implementation scaffolding, not IHP qualification evidence.
       - OpenChippy parser tests, native DRC tests, GDS round-trip tests, official IHP DRC, and LVS have not yet been run for this deck.
       - Tiny Tapeout top-level fill and finishing may satisfy requirements that cannot be evaluated inside an individual small macro.
       - Device timing, resistance, capacitance, and routing parasitic entries remain non-signoff estimates.
