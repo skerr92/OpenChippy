@@ -4,6 +4,7 @@ technology:
   format_version: 1
   name: OpenChippy Example EDU 5M
   process_id: openchippy-edu-5m
+  standard_cell_library: openchippy-edu
   deck_revision: example-v1
   source: OpenChippy educational example
   supply_voltage: 1.8

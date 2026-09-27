@@ -3,17 +3,20 @@
 ## Context Freshness
 
 - Context ID: FRESH-001
-- Last Verified Commit: `34d386a9396635b6569f0e372bbd23e17027d521`
-- Current HEAD: context-only successor of `34d386a9396635b6569f0e372bbd23e17027d521`
-- Generated: 2026-08-11
-- Status: partial; the committed v46 baseline is verified, while the FEOL correction and first v47 full-die/perimeter-I/O slice are validated but uncommitted.
-- Files requiring verification: all currently modified working-tree files; see `git status --short`.
+- Last Verified Commit: `968e661`
+- Current HEAD: `968e661` plus uncommitted packaged-standard-cell selection work.
+- Generated: 2026-08-19
+- Status: partial; repository was reset to the known commit before this new direction.
+- Files requiring verification: current standard-cell/technology changes; see `git status --short`.
 - Full semantic memory: `CondensedContext.CCF1`
 
 ## Current Focus
 
 - Context ID: ACTIVE-001
 - Confidence: High for the current working tree and recorded qualification results; source remains authoritative.
+- Standard-cell direction restarted from commit `968e661`: process YAML selects a packaged library by stable identifier; flattened lowest-level reusable blocks are matched by exact CMOS connectivity rather than names, flags, authored fixtures, or runtime GDS imports. Initial recognition covers INV, NAND2, and NOR2 and records selected instance/device IDs in Physical IR; unmatched topology retains transistor-level generation.
+- Legacy adjacent block libraries may contain a same-named definition with a different UUID than the embedded project snapshot. Staging keeps the embedded definition and now preserves the non-selected disk file verbatim instead of panicking during migration rewrite.
+- Invalid standalone entries in a shared adjacent `chippyblocks` directory no longer block unrelated projects from opening. They are excluded from the staged library and preserved verbatim for repair; invalid definitions referenced by the project or another selected block remain fatal.
 - Physical IR v47 extends the v46 density baseline with full-usable-area die bounds, process-defined perimeter rings/pads, physical-pin site metadata, and routed schematic GPIO anchors.
 - FEOL field reservation now consumes that same report, so existing active/poly geometry counts toward total preferred density instead of being mistaken for missing dummy fill and forcing false tapeout-height failures.
 - New tapeout direction: unless a process explicitly requests content-fit behavior, the top-level die uses the complete usable tapeout area. Keep compact core-placement bounds separate from die bounds; represent large repetitive fill as scalable tiled/array regions rather than millions of independent IR rectangles.
@@ -35,14 +38,18 @@
 ## Handoff
 
 - Context ID: HANDOFF-001
-- Last known state: v46 density closure is committed at `34d386a`; its FEOL fix, v47 tapeout perimeter slice, and GF180 vertical top-metal PDN stitching are validated and uncommitted.
-- Next useful step: add scalable full-area density arrays and explicit core bounds, then add binding-specific DRC before generic fallback template tiers/perimeter editor.
-- Validation: complete Rust suite passes 193/193 on 2026-08-11; focused tests prove all example process decks pass physical DRC and GF180 emits 42 pads, two rings, and four full-height connected M5 supply trunks.
+- Last known state: packaged identifiers `openchippy-edu` and `gf180mcu-3v3-5m` resolve explicitly; GF180/EDU example YAMLs select them; flattened INV/NAND2/NOR2 topology is inferred before planning. Designs with complete library coverage use canonical relative placement and skip alternate placement-routing evaluations; unmatched designs retain the transistor fallback.
+- Next useful step: cache one completed process-owned geometry template per recognized cell type and stamp translated instances, then route only the exposed cell interfaces. Current cutover canonicalizes placement and reduces candidate work but still materializes device geometry per instance.
+- Validation: 200/201 full Rust tests passed; the one assertion encoded the former report-only placement behavior and was updated for intentional production canonical placement. Both hierarchy-focused regressions pass after the update. Direct rustfmt succeeds; `cargo fmt` still cannot discover the installed component.
 
 ## Recent Changes
 
 | Date | Tags | Change | Commit | Remote |
 | --- | --- | --- | --- | --- |
+| 2026-08-19 | gf180, standard-cells, placement, performance | Moved library inference ahead of planning; fully recognized flattened designs now use canonical cell placement and skip redundant placement-routing challengers, while partial/unmatched designs keep the existing fallback. | Uncommitted | Not confirmed |
+| 2026-08-19 | legacy-load, invalid-block, isolation | Made invalid unreferenced adjacent library entries non-fatal while retaining strict errors for required dependencies; stale files remain untouched. | Uncommitted | Not confirmed |
+| 2026-08-19 | legacy-load, chippyblock, compatibility | Removed the same-name/different-UUID block migration panic; embedded definition wins and the unrelated adjacent legacy file is not overwritten. | Uncommitted | Not confirmed |
+| 2026-08-19 | standard-cells, technology-yaml, topology-inference | Reset abandoned import/editor direction; added packaged library identifiers and exact flattened CMOS recognition for INV/NAND2/NOR2 with Physical IR/viewer reporting and transistor fallback. | Uncommitted | Not confirmed |
 | 2026-08-11 | simulation, flattening, nand, block-integrity | Prevented incomplete newer block revisions from overriding valid embedded logic, added stale-source recovery, and locked hierarchical NAND `HIGH,HIGH → LOW` into the latch regression. | Uncommitted | Not confirmed |
 | 2026-08-11 | chippyblock, interface, revision, hierarchy | Allowed additive block-pin revisions so existing parent designs automatically gain new terminals without losing established wiring. | Uncommitted | Not confirmed |
 | 2026-08-11 | save-as, project-identity, blocks, ownership | Made Save As create an independent project identity while preserving original block authorship as imports, so altered copies save without mutating the source library. | Uncommitted | Not confirmed |

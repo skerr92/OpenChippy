@@ -1728,10 +1728,13 @@ pub fn place(
             },
         });
     }
+    // Keep the canonical placement available to production. The layout driver
+    // selects it only when process-library inference covers every device;
+    // otherwise it remains a report-only candidate for compatibility.
     let standard_cell_candidate = candidates
         .last()
-        .is_some_and(|candidate| candidate.strategy == PlacementStrategy::HierarchyTopology)
-        .then(|| candidates.pop().expect("checked standard-cell candidate"));
+        .filter(|candidate| candidate.strategy == PlacementStrategy::HierarchyTopology)
+        .cloned();
     let selected_candidate = candidates
         .iter()
         .filter(|candidate| candidate.legal)

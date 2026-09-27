@@ -15,6 +15,8 @@ pub struct Technology {
     pub deck_revision: String,
     #[serde(default = "default_deck_source")]
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standard_cell_library: Option<String>,
     pub supply_voltage: f64,
     #[serde(default = "default_max_metal_layers")]
     pub max_metal_layers: u16,
@@ -337,6 +339,7 @@ impl Default for Technology {
             process_id: "openchippy-edu-cmos".into(),
             deck_revision: "builtin-v1".into(),
             source: "OpenChippy built-in educational technology".into(),
+            standard_cell_library: Some("openchippy-edu".into()),
             supply_voltage: 1.8,
             max_metal_layers: DEFAULT_MAX_METAL_LAYERS,
             nmos: MosTechnology {
@@ -672,6 +675,17 @@ impl Technology {
                 });
             }
         }
+        if self
+            .standard_cell_library
+            .as_deref()
+            .is_some_and(|library| library.trim().is_empty())
+        {
+            diagnostics.push(TechnologyDiagnostic {
+                code: "invalid_standard_cell_library",
+                field: "standard_cell_library".into(),
+                message: "Standard-cell library identifier cannot be blank.".into(),
+            });
+        }
         if !self.supply_voltage.is_finite() || self.supply_voltage <= 0.0 {
             diagnostics.push(TechnologyDiagnostic {
                 code: "invalid_supply_voltage",
@@ -739,6 +753,7 @@ impl Technology {
             process_id: file.technology.process_id,
             deck_revision: file.technology.deck_revision,
             source: file.technology.source,
+            standard_cell_library: file.technology.standard_cell_library,
             supply_voltage: file.technology.supply_voltage,
             max_metal_layers: file.technology.max_metal_layers,
             nmos: file.nmos,
@@ -776,6 +791,7 @@ impl Technology {
                 process_id: self.process_id.clone(),
                 deck_revision: self.deck_revision.clone(),
                 source: self.source.clone(),
+                standard_cell_library: self.standard_cell_library.clone(),
                 supply_voltage: self.supply_voltage,
                 max_metal_layers: self.max_metal_layers,
             },
@@ -820,6 +836,8 @@ struct TechnologyHeader {
     deck_revision: String,
     #[serde(default = "default_deck_source")]
     source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    standard_cell_library: Option<String>,
     supply_voltage: f64,
     max_metal_layers: u16,
 }
@@ -2220,6 +2238,10 @@ pmos:
             Technology::from_yaml(include_str!("../../docs/examples/openchippy-edu-5m.yaml"))
                 .unwrap();
         assert_eq!(technology.name, "OpenChippy Example EDU 5M");
+        assert_eq!(
+            technology.standard_cell_library.as_deref(),
+            Some("openchippy-edu")
+        );
         assert_eq!(technology.tapeout_window.width_um, 2_920.0);
         assert_eq!(technology.tapeout_window.height_um, 3_520.0);
         assert_eq!(

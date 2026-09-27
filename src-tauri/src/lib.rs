@@ -561,20 +561,44 @@ fn load_block_library(project_path: &Path, project: &mut Project) -> Result<(), 
         if !incoming_won {
             continue;
         }
-        let Some(fallback) = project
+        let fallback = project
             .block_definition(incoming.id)
             .filter(|definition| {
                 project
                     .validate_block_definition_integrity(definition)
                     .is_ok()
             })
-            .cloned()
-        else {
+            .cloned();
+        if fallback.is_none() {
+            let required = candidate
+                .components
+                .iter()
+                .any(|component| component.block_definition_id == Some(incoming.id))
+                || candidate.block_definitions.iter().any(|definition| {
+                    definition.id != incoming.id
+                        && definition
+                            .components
+                            .iter()
+                            .any(|component| component.block_definition_id == Some(incoming.id))
+                });
+            if !required {
+                candidate
+                    .block_definitions
+                    .retain(|definition| definition.id != incoming.id);
+                rejected_files.insert(path.clone());
+                continue;
+            }
             return Err(ProjectError::InvalidAction(format!(
                 "block library file {} cannot replace the current definition: {reason}",
                 path.display()
             )));
-        };
+        }
+        let fallback = fallback.ok_or_else(|| {
+            ProjectError::InvalidAction(format!(
+                "block library file {} has no valid fallback: {reason}",
+                path.display()
+            ))
+        })?;
         let index = candidate
             .block_definitions
             .iter()
@@ -594,9 +618,14 @@ fn load_block_library(project_path: &Path, project: &mut Project) -> Result<(), 
         // Staging chose the newest interface-compatible revision between the
         // project snapshot and its complete adjacent library. Rewrite legacy
         // input, or an older library copy, to that resolved representation.
-        let resolved = candidate
-            .block_definition(definition.id)
-            .expect("merged or pre-existing block definition must resolve");
+        let Some(resolved) = candidate.block_definition(definition.id) else {
+            // Legacy libraries can contain a same-named definition with a
+            // different UUID. The merge deliberately keeps the embedded
+            // project definition in that case. Preserve the unselected file
+            // verbatim; it neither belongs to the resolved graph nor may be
+            // rewritten to an unrelated identity.
+            continue;
+        };
         let current_file = ChippyBlockFile {
             format_version: CURRENT_CHIPPYBLOCK_FORMAT_VERSION,
             definition: resolved.clone(),
@@ -2102,6 +2131,45 @@ mod tests {
     }
 
     #[test]
+    fn legacy_same_name_different_uuid_block_does_not_panic_or_overwrite() {
+        let root = std::env::temp_dir().join(format!(
+            "openchippy-block-name-collision-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let project_path = root.join("legacy.chippy");
+        let library = root.join(BLOCK_LIBRARY_DIRECTORY);
+        fs::create_dir_all(&library).unwrap();
+
+        let mut project = Project::default();
+        let input = project.add_component("input", -2.0, 0.0).unwrap();
+        let output = project.add_component("output", 2.0, 0.0).unwrap();
+        project
+            .connect(
+                TerminalRef {
+                    component_id: input,
+                    terminal: "out".into(),
+                },
+                TerminalRef {
+                    component_id: output,
+                    terminal: "in".into(),
+                },
+            )
+            .unwrap();
+        let embedded_id = project.capture_block("LEGACY_GATE".into()).unwrap();
+        let mut disk_definition = project.block_definition(embedded_id).unwrap().clone();
+        disk_definition.id = uuid::Uuid::new_v4();
+        let path = library.join("LEGACY_GATE.chippyblock");
+        let original = serde_json::to_string_pretty(&disk_definition).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        load_block_library(&project_path, &mut project).unwrap();
+        assert!(project.block_definition(embedded_id).is_some());
+        assert!(project.block_definition(disk_definition.id).is_none());
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn incomplete_newer_block_revision_cannot_replace_valid_embedded_definition() {
         let root = std::env::temp_dir().join(format!(
             "openchippy-block-integrity-{}",
@@ -2162,6 +2230,61 @@ mod tests {
         let disk: ChippyBlockFile =
             serde_json::from_str(&fs::read_to_string(block_path).unwrap()).unwrap();
         assert_eq!(disk.definition.revision, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unrelated_invalid_library_file_does_not_block_project_load() {
+        let root = std::env::temp_dir().join(format!(
+            "openchippy-unrelated-invalid-block-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let project_path = root.join("logic.chippy");
+        let library = root.join(BLOCK_LIBRARY_DIRECTORY);
+        fs::create_dir_all(&library).unwrap();
+
+        let mut source = Project::default();
+        let input = source.add_component("input", -2.0, 0.0).unwrap();
+        let output = source.add_component("output", 2.0, 0.0).unwrap();
+        source
+            .connect(
+                TerminalRef {
+                    component_id: input,
+                    terminal: "out".into(),
+                },
+                TerminalRef {
+                    component_id: output,
+                    terminal: "in".into(),
+                },
+            )
+            .unwrap();
+        let id = source.capture_block("UNRELATED".into()).unwrap();
+        let mut invalid = source.block_definition(id).unwrap().clone();
+        invalid.components.push(crate::model::Component {
+            id: uuid::Uuid::new_v4(),
+            kind: "nmos".into(),
+            name: "FLOATING".into(),
+            position: crate::model::Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            rotation: 0.0,
+            device_geometry: None,
+            block_definition_id: None,
+        });
+        let path = library.join("UNRELATED.chippyblock");
+        let original = serde_json::to_string_pretty(&ChippyBlockFile {
+            format_version: CURRENT_CHIPPYBLOCK_FORMAT_VERSION,
+            definition: invalid,
+        })
+        .unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let mut project = Project::default();
+        load_block_library(&project_path, &mut project).unwrap();
+        assert!(project.block_definitions.is_empty());
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
         fs::remove_dir_all(root).unwrap();
     }
 

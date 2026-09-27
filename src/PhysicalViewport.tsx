@@ -513,7 +513,7 @@ export default function PhysicalViewport({
                   <span>{layout.physicalBlocks.filter((block) => block.verified).length}/{layout.physicalBlocks.length} frozen blocks locally DRC-clean · {layout.physicalBlocks.reduce((count, block) => count + block.interfacePins.length, 0)} interface pins</span>
                 )}
                 {layout.standardCellLibrary.generated && (
-                  <span>{layout.standardCellLibrary.cells.length} packaged cells · {layout.standardCellLibrary.libraryName}</span>
+                  <span>{layout.standardCellLibrary.inferredInstances.length} inferred instances · {layout.standardCellLibrary.cells.length} packaged cells · {layout.standardCellLibrary.libraryName}</span>
                 )}
                 <span>{layout.timing.estimatedWorstDelayNs.toFixed(4)} ns worst path · {layout.timing.paths.length} input/output paths</span>
                 <span>{layout.timing.candidates.length} routed candidates timing-scored</span>

@@ -75,6 +75,14 @@ Nested blocks are resolved from the bottom up: a full adder built from reusable
 NANDs identifies each NAND as the physical cell, while the full-adder boundary
 remains available for higher-level floorplanning.
 
+Process YAML may select a packaged physical library with
+`standard_cell_library`. The identifiers currently packaged are `openchippy-edu`
+and `gf180mcu-3v3-5m`. After hierarchy is flattened, OpenChippy recognizes exact
+CMOS `INV`, `NAND2`, and `NOR2` connectivity inside the lowest reusable block and
+records the selected library cell in Physical IR. Unrecognized topology continues
+through transistor-level physical generation; recognition never relies on block or
+device names.
+
 The 3D workspace can also export an early LEF macro view containing the
 Physical IR dimensions, input/output/power pin rectangles, symmetry, and metal
 obstructions. Process-derived placement-site dimensions are included, and the

@@ -7348,6 +7348,24 @@ fn normalize_with_progress(
         .collect::<Result<Vec<_>, String>>()?;
     progress("planning", 8);
     devices.sort_by(|left, right| (&left.kind, &left.name).cmp(&(&right.kind, &right.name)));
+    // Resolve process-owned standard cells before placement. Only electrically
+    // recognized groups retain their cell identity; everything else follows
+    // the established transistor-level fallback.
+    let mut standard_cell_library = match project.technology.standard_cell_library.as_deref() {
+        Some(library_id) => {
+            standard_cells::generate_for_library(library_id, &project.technology.process_id)?
+        }
+        None => standard_cells::empty_summary(&project.technology.process_id),
+    };
+    standard_cells::infer_flattened_instances(&devices, &nets, &mut standard_cell_library);
+    let recognized_cell_devices = standard_cell_library
+        .inferred_instances
+        .iter()
+        .flat_map(|instance| instance.device_ids.iter().copied())
+        .collect::<HashSet<_>>();
+    let complete_standard_cell_coverage = !devices.is_empty()
+        && recognized_cell_devices.len() == devices.len()
+        && !standard_cell_library.inferred_instances.is_empty();
     let top_level_nets = top_level_routing_nets(&nets, &devices);
 
     let tapeout = &project.technology.tapeout_window;
@@ -7444,30 +7462,44 @@ fn normalize_with_progress(
         // the normal score winner and the geometry-topology challenger
         // through the real global/detail routers, then retain the electrically
         // and geometrically stronger result.
-        let mut placement_indices = vec![candidate_placement.selected_candidate];
-        if let Some(index) = candidate_placement.candidates.iter().position(|candidate| {
-            candidate.strategy == physical_placement::PlacementStrategy::LeafTopology
-                && candidate.legal
-        }) {
-            if !placement_indices.contains(&index) {
-                placement_indices.push(index);
+        let canonical_cell_placement = complete_standard_cell_coverage
+            .then(|| {
+                candidate_placement.candidates.iter().position(|candidate| {
+                    candidate.strategy == physical_placement::PlacementStrategy::HierarchyTopology
+                        && candidate.legal
+                        && candidate.standard_cell_instances
+                            == standard_cell_library.inferred_instances.len()
+                })
+            })
+            .flatten();
+        let mut placement_indices = canonical_cell_placement
+            .map(|index| vec![index])
+            .unwrap_or_else(|| vec![candidate_placement.selected_candidate]);
+        if canonical_cell_placement.is_none() {
+            if let Some(index) = candidate_placement.candidates.iter().position(|candidate| {
+                candidate.strategy == physical_placement::PlacementStrategy::LeafTopology
+                    && candidate.legal
+            }) {
+                if !placement_indices.contains(&index) {
+                    placement_indices.push(index);
+                }
             }
-        }
-        let challenger = if candidate_placement.candidates.iter().any(|candidate| {
-            candidate.strategy == physical_placement::PlacementStrategy::LeafGeometryTopology
-                && candidate.legal
-        }) {
-            physical_placement::PlacementStrategy::LeafGeometryTopology
-        } else {
-            physical_placement::PlacementStrategy::GeometryTopology
-        };
-        if let Some(index) = candidate_placement
-            .candidates
-            .iter()
-            .position(|candidate| candidate.strategy == challenger && candidate.legal)
-        {
-            if !placement_indices.contains(&index) {
-                placement_indices.push(index);
+            let challenger = if candidate_placement.candidates.iter().any(|candidate| {
+                candidate.strategy == physical_placement::PlacementStrategy::LeafGeometryTopology
+                    && candidate.legal
+            }) {
+                physical_placement::PlacementStrategy::LeafGeometryTopology
+            } else {
+                physical_placement::PlacementStrategy::GeometryTopology
+            };
+            if let Some(index) = candidate_placement
+                .candidates
+                .iter()
+                .position(|candidate| candidate.strategy == challenger && candidate.legal)
+            {
+                if !placement_indices.contains(&index) {
+                    placement_indices.push(index);
+                }
             }
         }
         let mut evaluation: Option<CandidateEvaluation> = None;
@@ -7646,11 +7678,9 @@ fn normalize_with_progress(
     let mut high_fanout_first = nets.clone();
     high_fanout_first.sort_by_key(|net| (std::cmp::Reverse(net.terminals.len()), net.id));
     route_orders.push(high_fanout_first);
-    // Flattened device geometry is the production default. A repeated logical
-    // block is not automatically a physically characterized macro: preserving
-    // it can lock in a poor template and deny the placer useful routing space.
-    // The staged standard-cell candidate remains in the report for explicitly
-    // characterized memories/register arrays and future measured cutover.
+    // Unmatched flattened devices retain the established geometry fallback.
+    // Fully library-recognized designs arrive here with canonical relative
+    // placement, so repeated instances produce the same physical cell shape.
     let mut preview_variants = vec![(placement.clone(), true)];
     let selected_is_compacted = placement
         .candidates
@@ -8047,8 +8077,7 @@ fn normalize_with_progress(
         route_quality,
         orphan_routing_shapes_removed,
         physical_blocks: Vec::new(),
-        standard_cell_library: standard_cells::generate_for_process(&project.technology.process_id)
-            .unwrap_or_else(|_| standard_cells::empty_summary(&project.technology.process_id)),
+        standard_cell_library,
     };
     progress("physicalIr", 94);
     let block_drc = physical_drc::validate(&ir, &project.technology);
@@ -10695,7 +10724,7 @@ mod tests {
     }
 
     #[test]
-    fn hierarchy_candidate_is_retained_without_forcing_macro_geometry() {
+    fn recognized_library_cells_use_canonical_hierarchy_placement() {
         let project = hierarchical_inverter_pair();
         let flattened = project.flattened().unwrap();
         let ir = normalize(&flattened).unwrap();
@@ -10706,10 +10735,7 @@ mod tests {
         let selected = &ir.placement.candidates[ir.placement.selected_candidate];
         assert!(matches!(
             selected.strategy,
-            crate::physical_placement::PlacementStrategy::Hierarchy
-                | crate::physical_placement::PlacementStrategy::LeafTopology
-                | crate::physical_placement::PlacementStrategy::GeometryTopology
-                | crate::physical_placement::PlacementStrategy::LeafGeometryTopology
+            crate::physical_placement::PlacementStrategy::HierarchyTopology
         ));
         let standard_cells = ir
             .placement
@@ -10717,6 +10743,12 @@ mod tests {
             .as_ref()
             .expect("repeated leaf blocks should produce a staged standard-cell candidate");
         assert_eq!(standard_cells.standard_cell_instances, 2);
+        assert_eq!(ir.standard_cell_library.inferred_instances.len(), 2);
+        assert!(ir
+            .standard_cell_library
+            .inferred_instances
+            .iter()
+            .all(|instance| instance.cell == "INV" && instance.device_ids.len() == 2));
         assert!(standard_cells.legal);
         assert_eq!(selected.block_regions.len(), 2);
         assert!(selected.block_regions.iter().all(|region| region.immutable));

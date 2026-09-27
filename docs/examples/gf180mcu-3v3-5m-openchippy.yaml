@@ -22,6 +22,7 @@ technology:
   process_id: gf180mcu-3v3-5m-compat
   deck_revision: openchippy-compat-v1
   source: https://gf180mcu-pdk.readthedocs.io/en/latest/physical_verification/design_manual/Design_Manual.html
+  standard_cell_library: gf180mcu-3v3-5m
   supply_voltage: 3.3
   max_metal_layers: 5
 

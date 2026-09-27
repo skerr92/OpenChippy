@@ -21,6 +21,7 @@ const browserFallback = (): WorkspaceState => ({
       process_id: "openchippy-edu-cmos",
       deck_revision: "builtin-v1",
       source: "OpenChippy built-in educational technology",
+      standard_cell_library: "openchippy-edu",
       supply_voltage: 1.8,
       max_metal_layers: 5,
       nmos: {

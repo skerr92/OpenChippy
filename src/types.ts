@@ -161,6 +161,7 @@ export type Technology = {
   process_id: string;
   deck_revision: string;
   source: string;
+  standard_cell_library: string | null;
   supply_voltage: number;
   max_metal_layers: number;
   nmos: MosTechnology;
@@ -671,6 +672,11 @@ export type PhysicalLayoutIr = {
     deckRevision: string;
     source: string;
     generated: boolean;
+    inferredInstances: Array<{
+      instance: string;
+      cell: string;
+      deviceIds: string[];
+    }>;
     cells: Array<{
       definition: {
         name: string;
