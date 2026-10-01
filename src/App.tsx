@@ -45,6 +45,9 @@ export default function App() {
   const [physicalBuildRevision, setPhysicalBuildRevision] = useState(0);
   const [rtlDialogOpen, setRtlDialogOpen] = useState(false);
   const [rtlSource, setRtlSource] = useState("");
+  const [rtlTop, setRtlTop] = useState("");
+  const [rtlFrontend, setRtlFrontend] = useState("auto");
+  const [rtlCompilerPath, setRtlCompilerPath] = useState(() => localStorage.getItem("openchippy.yosysPath") ?? "");
   const [rtlPath, setRtlPath] = useState<string | null>(null);
   const [rtlPreview, setRtlPreview] = useState<RtlModule | null>(null);
   const [rtlDiagnostic, setRtlDiagnostic] = useState<string | null>(null);
@@ -744,7 +747,7 @@ export default function App() {
     setRtlPreview(null);
     setRtlDiagnostic(null);
     try {
-      setRtlPreview(await backend.parseVerilog(source));
+      setRtlPreview(await backend.parseVerilog(source, rtlTop, rtlFrontend, rtlCompilerPath));
     } catch (reason) {
       setRtlDiagnostic(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -756,7 +759,7 @@ export default function App() {
     try {
       const path = await open({
         multiple: false,
-        filters: [{ name: "Structural Verilog", extensions: ["v", "sv"] }],
+        filters: [{ name: "Verilog / SystemVerilog", extensions: ["v", "sv"] }],
       });
       if (typeof path !== "string") return;
       const source = await backend.readVerilogSource(path);
@@ -774,7 +777,7 @@ export default function App() {
     setRtlDiagnostic(null);
     try {
       const moduleName = rtlPreview.name;
-      const next = await backend.importVerilog(rtlSource);
+      const next = await backend.importVerilog(rtlSource, rtlTop, rtlFrontend, rtlCompilerPath);
       if (!next.project.rtlDesign) {
         throw new Error("The desktop backend did not return the imported logical design.");
       }
@@ -797,7 +800,7 @@ export default function App() {
     try {
       const destination = await save({
         defaultPath: `${project.rtlDesign.module.name}.v`,
-        filters: [{ name: "Structural Verilog", extensions: ["v"] }],
+        filters: [{ name: "Verilog / SystemVerilog", extensions: ["v"] }],
       });
       if (!destination) return;
       await backend.saveTextFile(destination, await backend.exportVerilog());
@@ -1415,15 +1418,30 @@ export default function App() {
         <div className="modal-backdrop" role="presentation" onPointerDown={() => setRtlDialogOpen(false)}>
           <section className="rtl-dialog" role="dialog" aria-modal="true" aria-labelledby="rtl-dialog-title"
             onPointerDown={(event) => event.stopPropagation()}>
-            <p className="eyebrow">RTL Import · Structural Verilog</p>
+            <p className="eyebrow">RTL Import · Verilog / SystemVerilog</p>
             <div className="rtl-dialog-heading">
               <div>
                 <h2 id="rtl-dialog-title">Preview RTL import</h2>
                 <small>{rtlPath?.split(/[/\\]/).pop() ?? "No source file selected"}</small>
               </div>
-              <button type="button" onClick={() => void chooseVerilogFile()}>Choose file…</button>
+              <button type="button" disabled={rtlParsing} onClick={() => void chooseVerilogFile()}>Choose file…</button>
             </div>
-            <textarea aria-label="Verilog source preview" spellCheck={false} value={rtlSource}
+            <div className="rtl-dialog-heading">
+              <label>Compiler <select value={rtlFrontend} disabled={rtlParsing} onChange={(event) => { setRtlFrontend(event.target.value); setRtlPreview(null); }}>
+                <option value="auto">Automatic (Yosys when installed)</option>
+                <option value="native">Built-in structural subset</option>
+                <option value="yosys">Yosys · synthesizable Verilog</option>
+                <option value="slang">Yosys + slang · SystemVerilog</option>
+              </select></label>
+              <label>Top module <input value={rtlTop} disabled={rtlParsing} placeholder="Auto-detect" onChange={(event) => { setRtlTop(event.target.value); setRtlPreview(null); }} /></label>
+            </div>
+            <label>Yosys executable <input value={rtlCompilerPath} disabled={rtlParsing} placeholder="Use PATH or OPENCHIPPY_YOSYS" onChange={(event) => {
+              setRtlCompilerPath(event.target.value);
+              localStorage.setItem("openchippy.yosysPath", event.target.value);
+              setRtlPreview(null);
+            }} /></label>
+            <small>Compiler imports elaborate hierarchy and behavioral logic. Original source is preserved for export. Yosys must be installed; slang requires its Yosys plugin.</small>
+            <textarea disabled={rtlParsing} aria-label="Verilog source preview" spellCheck={false} value={rtlSource}
               placeholder="module example(input A, output Y);\n  not u0(Y, A);\nendmodule"
               onChange={(event) => {
                 setRtlSource(event.currentTarget.value);
@@ -1432,8 +1450,8 @@ export default function App() {
               }} />
             {rtlDiagnostic && <div className="rtl-diagnostic"><strong>Cannot import this source</strong><span>{rtlDiagnostic}</span></div>}
             {rtlPreview && <div className="rtl-preview-summary">
-              <strong>{rtlPreview.name}</strong>
-              <span>{rtlPreview.ports.length} ports · {rtlPreview.nets.length} internal nets · {rtlPreview.instances.length} instances · {rtlPreview.assignments.length} continuous assignments · {rtlPreview.parameters.length} parameters</span>
+              <strong>{rtlPreview.name} · {rtlPreview.compiler ?? "Built-in parser"}</strong>
+              <span>{rtlPreview.ports.length} ports · {rtlPreview.nets.length} internal nets · {rtlPreview.instances.length} instances · {rtlPreview.assignments.length} continuous assignments · {rtlPreview.parameters.length} parameters · {rtlPreview.sequentialProcesses.length} register bits/processes</span>
               {rtlPreview.parameters.length > 0 && <small>{rtlPreview.parameters.map((parameter) => `${parameter.name}=${parameter.defaultExpression} → ${parameter.defaultValue}`).join(" · ")}</small>}
               <small>{rtlPreview.ports.map((port) => `${port.direction} ${port.range ? `[${port.range.msb}:${port.range.lsb}] ` : ""}${port.name}`).join(" · ")}</small>
             </div>}

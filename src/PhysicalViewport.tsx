@@ -99,10 +99,10 @@ export default function PhysicalViewport({
   const selectRef = useRef(onSelect);
   const renderedMetalLayers = useMemo(() => {
     const routable = layout?.maxMetalLayers ?? 5;
-    return layout?.shapes.reduce((maximum, shape) => {
+    return [...(layout?.shapes ?? []), ...(layout?.densityArrays ?? [])].reduce((maximum, shape) => {
       const match = /^metal(\d+)$/.exec(shape.layer);
       return match ? Math.max(maximum, Number(match[1])) : maximum;
-    }, routable) ?? routable;
+    }, routable);
   }, [layout]);
   const layers = useMemo(
     () => createLayers(layout?.maxMetalLayers ?? 5, renderedMetalLayers),
@@ -133,7 +133,7 @@ export default function PhysicalViewport({
         if (shape.componentId === null && shape.net === null && shape.purpose === "power_rail") {
           counts.rings += 1;
         }
-        if (shape.componentId === null && shape.net === null && shape.purpose === "pin") {
+        if (shape.purpose === "pad") {
           counts.pads += 1;
         }
         return counts;
@@ -145,6 +145,9 @@ export default function PhysicalViewport({
     const counts: Record<string, number> = {};
     layout?.shapes.forEach((shape) => {
       if (shape.purpose === "dummy_fill") counts[shape.layer] = (counts[shape.layer] ?? 0) + 1;
+    });
+    layout?.densityArrays?.forEach((array) => {
+      counts[array.layer] = (counts[array.layer] ?? 0) + array.columns * array.rows;
     });
     return counts;
   }, [layout]);
@@ -233,6 +236,37 @@ export default function PhysicalViewport({
         scene.add(mesh);
       });
 
+    // Render exact repeated tiles with one patterned plane per array. The
+    // lattice remains inspectable when zoomed in without millions of meshes.
+    if (showDummyFill) layout.densityArrays?.forEach((array) => {
+      if (!visibleLayers.has(array.layer)) return;
+      const layer = layers[array.layer];
+      if (!layer) return;
+      const width = array.tileWidth + (array.columns - 1) * array.stepX;
+      const height = array.tileHeight + (array.rows - 1) * array.stepY;
+      const geometry = new THREE.PlaneGeometry(width, height);
+      const material = new THREE.ShaderMaterial({
+        uniforms: {
+          extent: { value: new THREE.Vector2(width, height) },
+          tile: { value: new THREE.Vector2(array.tileWidth, array.tileHeight) },
+          pitch: { value: new THREE.Vector2(array.stepX, array.stepY) },
+          fillColor: { value: new THREE.Color(layer.color).lerp(new THREE.Color("#fff2a8"), .3) },
+        },
+        vertexShader: "varying vec2 tileUv; void main(){ tileUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }",
+        fragmentShader: `varying vec2 tileUv; uniform vec2 extent, tile, pitch; uniform vec3 fillColor;
+          void main(){ vec2 at=vec2(tileUv.x,1.0-tileUv.y)*extent;
+            vec2 local=mod(at,pitch);
+            if(local.x>tile.x || local.y>tile.y) discard;
+            gl_FragColor=vec4(fillColor,1.0); }`,
+        side: THREE.DoubleSide,
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.rotation.x = -Math.PI / 2;
+      mesh.position.set(array.x + (width - array.tileWidth) / 2, layer.elevation, array.y + (height - array.tileHeight) / 2);
+      scene.add(mesh);
+      geometries.push(geometry);
+      materials.push(material);
+    });
     const boundary = new THREE.Box3(
       new THREE.Vector3(layout.bounds.minX, -.24, layout.bounds.minY),
       new THREE.Vector3(

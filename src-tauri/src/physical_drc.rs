@@ -326,6 +326,11 @@ pub fn validate(ir: &PhysicalLayoutIr, technology: &Technology) -> PhysicalDrcRe
     validate_terminal_connectivity(&ir.shapes, &mut report);
     validate_logical_terminal_obligations(ir, &mut report);
     validate_route_endpoints(ir, &mut report);
+    if !ir.density_arrays.is_empty() || technology.physical_rules.density_fill.use_arrays {
+        for (layer, message) in crate::density_arrays::validate(&ir.density_arrays, &ir.shapes, &ir.bounds, technology) {
+            report.push("DENSITY.ARRAY", message, layer, Vec::new(), 0.0, 1.0);
+        }
+    }
     report
 }
 
@@ -699,7 +704,7 @@ fn validate_logical_terminal_obligations(ir: &PhysicalLayoutIr, report: &mut Phy
         .shapes
         .iter()
         .enumerate()
-        .filter(|(_, shape)| shape.net.is_some() && shape.purpose == PhysicalShapePurpose::Pin)
+        .filter(|(_, shape)| shape.net.is_some() && shape.purpose.is_pin())
     {
         obligations
             .entry(pin.net.expect("filtered physical pin"))
@@ -761,7 +766,7 @@ fn validate_logical_terminal_obligations(ir: &PhysicalLayoutIr, report: &mut Phy
         let expected_pins = ir
             .shapes
             .iter()
-            .filter(|shape| shape.net == Some(net.id) && shape.purpose == PhysicalShapePurpose::Pin)
+            .filter(|shape| shape.net == Some(net.id) && shape.purpose.is_pin())
             .count();
         let expected_power_fabric = usize::from(matches!(
             net.role,
@@ -981,9 +986,10 @@ fn topology_internal_access(
 ) -> bool {
     if access.device_ids.len() < 2
         || access.shared_contact
-        || ir.shapes.iter().any(|shape| {
-            shape.net == Some(access.net) && shape.purpose == PhysicalShapePurpose::Pin
-        })
+        || ir
+            .shapes
+            .iter()
+            .any(|shape| shape.net == Some(access.net) && shape.purpose.is_pin())
     {
         return false;
     }
@@ -1028,6 +1034,71 @@ fn validate_device_terminal_attachments(ir: &PhysicalLayoutIr, report: &mut Phys
     }
 }
 
+// Minimum metal area applies to each physically connected polygon, not to
+// its arbitrary rectangle decomposition. Vias and same-net disconnected
+// islands cannot contribute area to this component.
+fn connected_metal_area(
+    start: usize,
+    shapes: &[PhysicalShape],
+    spatial: &PhysicalCanvas,
+    indices: &HashMap<u64, usize>,
+    cache: &mut HashMap<usize, f64>,
+    required: f64,
+) -> f64 {
+    if let Some(area) = cache.get(&start) {
+        return *area;
+    }
+    let seed = &shapes[start];
+    let mut pending = vec![start];
+    let mut visited = HashSet::new();
+    let mut proven_area: f64 = 0.0;
+    while let Some(index) = pending.pop() {
+        if !visited.insert(index) {
+            continue;
+        }
+        let shape = &shapes[index];
+        proven_area = proven_area.max(
+            cache
+                .get(&index)
+                .copied()
+                .unwrap_or(shape.width * shape.height),
+        );
+        if proven_area + EPSILON >= required {
+            break;
+        }
+        for neighbor in spatial.query_neighbors(shape) {
+            let next = indices[&neighbor.id];
+            let other = &shapes[next];
+            if other.layer == seed.layer
+                && other.net == seed.net
+                && other.purpose != PhysicalShapePurpose::DummyFill
+                && shapes_touch(shape, other)
+                && !visited.contains(&next)
+            {
+                pending.push(next);
+            }
+        }
+    }
+    if proven_area + EPSILON < required {
+        let component = visited
+            .iter()
+            .map(|index| shapes[*index].clone())
+            .collect::<Vec<_>>();
+        let bounds = crate::physical_layout::PhysicalBounds {
+            min_x: f64::NEG_INFINITY,
+            min_y: f64::NEG_INFINITY,
+            max_x: f64::INFINITY,
+            max_y: f64::INFINITY,
+        };
+        proven_area =
+            crate::physical_layout::rectangle_union_area(&component, "metal", seed.layer, &bounds);
+    }
+    for index in visited {
+        cache.insert(index, proven_area);
+    }
+    proven_area
+}
+
 fn validate_shape_set(
     shapes: &[PhysicalShape],
     max_metal_layers: u16,
@@ -1038,6 +1109,24 @@ fn validate_shape_set(
     let mut report = PhysicalDrcReport::default();
     let grid = technology.physical_rules.manufacturing_grid_um;
 
+    let mut spatial = PhysicalCanvas::new(&technology.physical_rules);
+    let mut shape_by_occupied_id = HashMap::with_capacity(shapes.len());
+    for (shape_index, shape) in shapes.iter().enumerate() {
+        // Density fill has its own process-aware spacing/coverage validation
+        // and is skipped by the pairwise checks below. Avoid rasterizing
+        // large, electrically inert preview tiles into the fine routing grid.
+        if shape.purpose == PhysicalShapePurpose::DummyFill {
+            continue;
+        }
+        let occupied_id = spatial.index_unchecked(
+            shape,
+            format!("drc-shape-{shape_index}"),
+            obstruction_type(shape.layer),
+        );
+        shape_by_occupied_id.insert(occupied_id, shape_index);
+    }
+
+    let mut metal_areas = HashMap::new();
     for (index, shape) in shapes.iter().enumerate() {
         let (left, top, right, bottom) = edges(shape);
         if ![left, top, right, bottom]
@@ -1149,7 +1238,20 @@ fn validate_shape_set(
                     rule.min_width_um,
                 );
             }
-            let area = shape.width * shape.height;
+            let mut area = shape.width * shape.height;
+            if area + EPSILON < rule.min_area_um2
+                && matches!(shape.layer, PhysicalLayer::Metal(_))
+                && shape.net.is_some()
+            {
+                area = connected_metal_area(
+                    index,
+                    shapes,
+                    &spatial,
+                    &shape_by_occupied_id,
+                    &mut metal_areas,
+                    rule.min_area_um2,
+                );
+            }
             if area + EPSILON < rule.min_area_um2 {
                 report.push(
                     "GEOMETRY.MIN_AREA",
@@ -1174,23 +1276,6 @@ fn validate_shape_set(
                 );
             }
         }
-    }
-
-    let mut spatial = PhysicalCanvas::new(&technology.physical_rules);
-    let mut shape_by_occupied_id = HashMap::with_capacity(shapes.len());
-    for (shape_index, shape) in shapes.iter().enumerate() {
-        // Density fill has its own process-aware spacing/coverage validation
-        // and is skipped by the pairwise checks below. Avoid rasterizing
-        // large, electrically inert preview tiles into the fine routing grid.
-        if shape.purpose == PhysicalShapePurpose::DummyFill {
-            continue;
-        }
-        let occupied_id = spatial.index_unchecked(
-            shape,
-            format!("drc-shape-{shape_index}"),
-            obstruction_type(shape.layer),
-        );
-        shape_by_occupied_id.insert(occupied_id, shape_index);
     }
 
     for left_index in 0..shapes.len() {
@@ -1230,11 +1315,15 @@ fn validate_shape_set(
                 && right.component_id.is_none()
                 && matches!(
                     left.purpose,
-                    PhysicalShapePurpose::PowerRail | PhysicalShapePurpose::Pin
+                    PhysicalShapePurpose::PowerRail
+                        | PhysicalShapePurpose::Pin
+                        | PhysicalShapePurpose::Pad
                 )
                 && matches!(
                     right.purpose,
-                    PhysicalShapePurpose::PowerRail | PhysicalShapePurpose::Pin
+                    PhysicalShapePurpose::PowerRail
+                        | PhysicalShapePurpose::Pin
+                        | PhysicalShapePurpose::Pad
                 )
             {
                 continue;
@@ -1620,7 +1709,7 @@ fn validate_terminal_connectivity(shapes: &[PhysicalShape], report: &mut Physica
     for (pin_index, pin) in shapes
         .iter()
         .enumerate()
-        .filter(|(_, shape)| shape.net.is_some() && shape.purpose == PhysicalShapePurpose::Pin)
+        .filter(|(_, shape)| shape.net.is_some() && shape.purpose.is_pin())
     {
         by_net
             .entry(pin.net.expect("filtered pin net"))
@@ -1795,6 +1884,7 @@ mod tests {
                 shapes_outside_tapeout: 0,
             },
             density: Default::default(),
+            density_arrays: Vec::new(),
             bounds: PhysicalBounds {
                 min_x: -2.0,
                 min_y: -2.0,
@@ -1821,6 +1911,43 @@ mod tests {
             net,
             purpose: Default::default(),
         }
+    }
+
+    #[test]
+    fn metal_minimum_area_uses_connected_union_without_double_counting() {
+        let mut technology = Technology::default();
+        technology.physical_rules.layer_overrides.clear();
+        technology.physical_rules.metal.min_area_um2 = 0.14;
+        technology.physical_rules.metal.min_width_um = 0.23;
+        let piece = |x, net| {
+            let mut p = shape(PhysicalLayer::Metal(1), x, 0.3, Some(net));
+            p.height = 0.23;
+            p
+        };
+        let area_errors = |pieces| {
+            validate(&layout(pieces), &technology)
+                .diagnostics
+                .into_iter()
+                .filter(|d| d.rule_id == "GEOMETRY.MIN_AREA")
+                .count()
+        };
+        assert_eq!(
+            area_errors(vec![piece(0.0, 1), piece(0.2, 1), piece(0.4, 1)]),
+            0
+        );
+        assert_eq!(area_errors(vec![piece(0.0, 1), piece(0.2, 1)]), 2);
+        assert_eq!(
+            area_errors(vec![piece(0.0, 1), piece(0.0, 1), piece(0.0, 1)]),
+            3
+        );
+        assert_eq!(
+            area_errors(vec![piece(0.0, 1), piece(1.0, 1), piece(2.0, 1)]),
+            3
+        );
+        assert_eq!(
+            area_errors(vec![piece(0.0, 1), piece(0.2, 2), piece(0.4, 3)]),
+            3
+        );
     }
 
     #[test]

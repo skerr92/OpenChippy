@@ -1,7 +1,7 @@
 # CondensedContext
 <!-- CCF/1 -->
 @legend c=confidence; lvl=compression-level; fid=fidelity; imp=importance; vol=volatility; cost=expansion-cost; lv=last-verified; st=freshness; aliases from @path.
-@fresh id=FRESH-001 lv=34d386a9396635b6569f0e372bbd23e17027d521 head=context-only-successor gen=2026-08-11 st=partial verify=README,MROAD,PHY,CC,CCF
+@fresh id=FRESH-001 lv=4edc0a8 head=4edc0a8 gen=2026-09-27 st=partial verify=RTL,SIM,PHY,LIB,APP,TYPES,BRIDGE
 @path CC=CondensedContext.md
 @path CCF=CondensedContext.CCF1
 @path ROAD=docs/roadmap.md
@@ -498,3 +498,7 @@
 @validation id=VAL-NAND-FLATTENING-001 c=H date=2026-08-11 :: diagnosed Documents/NAND_Gate library rev2 as6MOS/17wire with undriven added gates versus valid embedded4MOS/13wire;fallback+source-repair regressions pass;hierarchical NAND HIGH/HIGH=>LOW asserted inside cross-coupled latch test;complete Rust198/198 passes in142.71s;frontend production build,cargo fmt,and git diff checks pass.
 @change id=GF180-CELL-CANONICAL-PLACEMENT-001 c=H date=2026-08-19 status=uncommitted :: packaged-library INV/NAND2/NOR2 inference now runs before planning; complete device coverage selects canonical hierarchy placement and omits alternate placement-routing challengers; partial/unmatched designs retain transistor fallback; canonical candidate remains report-visible.
 @validation id=VAL-GF180-CELL-CANONICAL-PLACEMENT-001 c=H date=2026-08-19 :: standard-cell3/3 and placement10/10 pass;full Rust reached200/201 with sole obsolete report-only strategy assertion,updated intentionally;both hierarchy-focused regressions then pass;direct rustfmt succeeds while cargo-fmt remains undiscoverable.
+
+@chg date=2026-09-27 tags=rtl,layout,drc commit=Uncommitted :: active work: compiler-backed Yosys/slang lowering and geometry/routing qualification;see root handoff;baseline201/201;current adder192MOS/9nativeDRC.
+
+@handoff id=HANDOFF-20260929 c=H :: IR48 raw-edge A* closes current192MOS adder core; perimeter repair expensive, per-net duplicate-index/score-before-legality optimization pending release validation. Compiler+clock-alias+negative-index focused207pass; fullsuite pending. logs=/private/tmp/openchippy-all-final.log,/private/tmp/openchippy-qualification-v48.log; official previous79markers; pad-opening37/0+implantspacing1.10 pending correlation; full-die density unresolved. README compiler scope refreshed; no commits.

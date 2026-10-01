@@ -13,12 +13,14 @@ const STRNAME: u8 = 0x06;
 const ENDSTR: u8 = 0x07;
 const BOUNDARY: u8 = 0x08;
 const SREF: u8 = 0x0a;
+const AREF: u8 = 0x0b;
 const TEXT: u8 = 0x0c;
 const LAYER: u8 = 0x0d;
 const DATATYPE: u8 = 0x0e;
 const XY: u8 = 0x10;
 const ENDEL: u8 = 0x11;
 const SNAME: u8 = 0x12;
+const COLROW: u8 = 0x13;
 const TEXTTYPE: u8 = 0x16;
 const STRING: u8 = 0x19;
 
@@ -44,6 +46,10 @@ pub struct CanonicalLabel {
 pub struct CanonicalReference {
     pub cell_name: String,
     pub origin: (i32, i32),
+    pub columns: u16,
+    pub rows: u16,
+    pub column_step: (i32, i32),
+    pub row_step: (i32, i32),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -83,6 +89,7 @@ struct Element {
     points: Vec<(i32, i32)>,
     text: Option<String>,
     cell_name: Option<String>,
+    repeats: Option<(u16, u16)>,
 }
 
 pub fn import_canonical(bytes: &[u8]) -> Result<CanonicalGds, String> {
@@ -129,7 +136,7 @@ pub fn import_canonical(bytes: &[u8]) -> Result<CanonicalGds, String> {
             STRNAME if data_type == 6 && current_cell.is_some() => {
                 current_cell_name = Some(ascii(payload));
             }
-            BOUNDARY | TEXT | SREF => {
+            BOUNDARY | TEXT | SREF | AREF => {
                 if current_cell.is_none() {
                     return Err("GDSII element appears outside a structure".into());
                 }
@@ -144,6 +151,12 @@ pub fn import_canonical(bytes: &[u8]) -> Result<CanonicalGds, String> {
             LAYER if payload.len() == 2 => {
                 element_mut(&mut current_element, "LAYER")?.layer =
                     Some(u16::from_be_bytes([payload[0], payload[1]]));
+            }
+            COLROW if data_type == 2 && payload.len() == 4 => {
+                let columns = i16::from_be_bytes([payload[0], payload[1]]);
+                let rows = i16::from_be_bytes([payload[2], payload[3]]);
+                if columns <= 0 || rows <= 0 { return Err("AREF counts must be positive".into()); }
+                element_mut(&mut current_element, "COLROW")?.repeats = Some((columns as u16, rows as u16));
             }
             DATATYPE | TEXTTYPE if payload.len() == 2 => {
                 element_mut(&mut current_element, "DATATYPE/TEXTTYPE")?.datatype =
@@ -195,7 +208,7 @@ pub fn import_canonical(bytes: &[u8]) -> Result<CanonicalGds, String> {
             0x00 | 0x01 => {}
             // Explicitly reject geometry/instance forms not yet represented by
             // the MPV-4 canonical importer.
-            0x09 | 0x0b | 0x15 | 0x2d => {
+            0x09 | 0x15 | 0x2d => {
                 return Err(format!(
                     "unsupported GDSII element record 0x{record_type:02x}"
                 ));
@@ -251,12 +264,15 @@ impl CanonicalGds {
         layer_map: &GdsLayerMap,
     ) -> Result<ImportedPhysicalGeometry, String> {
         let mut flattened = Vec::new();
+        let inert_pairs = layer_map.dummy_layers.values().flatten()
+            .map(|purpose| (purpose.layer, purpose.datatype)).collect::<BTreeSet<_>>();
         flatten_cell(
             self,
             &self.top_cell,
             (0, 0),
             &mut BTreeSet::new(),
             &mut flattened,
+            &inert_pairs,
         )?;
         let reverse = reverse_layer_map(layer_map)?;
         let mut candidates = flattened
@@ -283,6 +299,14 @@ impl CanonicalGds {
         let mut shape_keys = BTreeSet::new();
         let scale = f64::from(self.database_units_per_micron);
         for (boundary, layers) in candidates.drain(..) {
+            // The canonical GDS retains passivation masks; conductor extraction
+            // must not reinterpret their openings as an electrical layer.
+            if layer_map.pad_opening.as_ref().is_some_and(|opening| {
+                opening.layer == boundary.layer && opening.datatype == boundary.datatype
+            }) {
+                continue;
+            }
+
             let (layer, purpose) = match layers.as_slice() {
                 [] => {
                     unmapped.insert(format!("{}:{}", boundary.layer, boundary.datatype));
@@ -365,6 +389,7 @@ fn flatten_cell(
     origin: (i32, i32),
     stack: &mut BTreeSet<String>,
     output: &mut Vec<CanonicalBoundary>,
+    inert_pairs: &BTreeSet<(u16,u16)>,
 ) -> Result<(), String> {
     if !stack.insert(name.to_string()) {
         return Err(format!("cyclic GDSII reference through {name}"));
@@ -373,7 +398,7 @@ fn flatten_cell(
         .cells
         .get(name)
         .ok_or_else(|| format!("missing referenced GDSII cell {name}"))?;
-    output.extend(cell.boundaries.iter().cloned().map(|mut boundary| {
+    output.extend(cell.boundaries.iter().filter(|b| !inert_pairs.contains(&(b.layer,b.datatype))).cloned().map(|mut boundary| {
         for point in &mut boundary.points {
             point.0 += origin.0;
             point.1 += origin.1;
@@ -381,13 +406,35 @@ fn flatten_cell(
         boundary
     }));
     for reference in &cell.references {
+        // Preserve arrays in canonical form, but do not expand inert fill into
+        // millions of electrical extraction rectangles.
+        if layout.cells.get(&reference.cell_name).is_some_and(|child| child.references.is_empty()
+            && child.boundaries.iter().all(|b| inert_pairs.contains(&(b.layer,b.datatype)))) {
+            continue;
+        }
+        for row in 0..reference.rows { for column in 0..reference.columns {
+        if output.len() > 1_000_000 { return Err("GDS electrical extraction exceeds one million boundaries".into()); }
+        let coordinate = |axis: usize| -> Result<i32, String> {
+            let value = if axis == 0 {
+                i64::from(origin.0) + i64::from(reference.origin.0)
+                    + i64::from(column)*i64::from(reference.column_step.0)
+                    + i64::from(row)*i64::from(reference.row_step.0)
+            } else {
+                i64::from(origin.1) + i64::from(reference.origin.1)
+                    + i64::from(column)*i64::from(reference.column_step.1)
+                    + i64::from(row)*i64::from(reference.row_step.1)
+            };
+            i32::try_from(value).map_err(|_| "GDS reference coordinate overflow".into())
+        };
         flatten_cell(
             layout,
             &reference.cell_name,
-            (origin.0 + reference.origin.0, origin.1 + reference.origin.1),
+            (coordinate(0)?, coordinate(1)?),
             stack,
             output,
+            inert_pairs,
         )?;
+        }}
     }
     stack.remove(name);
     Ok(())
@@ -612,15 +659,29 @@ fn finish_element(element: Element, cell: &mut CanonicalCell) -> Result<(), Stri
                     .ok_or_else(|| "TEXT is missing STRING".to_string())?,
             });
         }
-        SREF => {
-            if element.points.len() != 1 {
-                return Err("SREF must contain exactly one origin".into());
+        SREF | AREF => {
+            if element.points.len() != if element.kind == AREF { 3 } else { 1 } {
+                return Err("Reference has an invalid number of XY coordinates".into());
             }
+            let (columns, rows) = if element.kind == AREF {
+                element.repeats.ok_or("AREF is missing COLROW")?
+            } else { (1,1) };
+            let step = |point: usize, count: u16| -> Result<(i32,i32), String> {
+                if element.kind == SREF { return Ok((0,0)); }
+                let dx = i64::from(element.points[point].0)-i64::from(element.points[0].0);
+                let dy = i64::from(element.points[point].1)-i64::from(element.points[0].1);
+                let n = i64::from(count);
+                if dx % n != 0 || dy % n != 0 { return Err("AREF pitch falls between database units".into()); }
+                Ok((i32::try_from(dx/n).map_err(|_| "AREF pitch overflow")?, i32::try_from(dy/n).map_err(|_| "AREF pitch overflow")?))
+            };
+            let column_step = step(1,columns)?;
+            let row_step = step(2,rows)?;
             cell.references.push(CanonicalReference {
                 cell_name: element
                     .cell_name
                     .ok_or_else(|| "SREF is missing SNAME".to_string())?,
                 origin: element.points[0],
+                columns, rows, column_step, row_step,
             });
         }
         _ => return Err("unsupported GDSII element".into()),

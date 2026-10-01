@@ -45,6 +45,19 @@ pub struct GdsLayerMap {
     /// interpreted as devices or routed conductors on import.
     #[serde(default)]
     pub dummy_layers: BTreeMap<String, Vec<GdsLayerPurpose>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_opening: Option<GdsPadOpening>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct GdsPadOpening {
+    pub layer: u16,
+    pub datatype: u16,
+    pub inset_um: f64,
+    /// Minimum width of metal geometries underneath a bond-pad opening.
+    #[serde(default)]
+    pub underlying_metal_min_width_um: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -217,6 +230,9 @@ pub struct DensityFillRuleDeck {
     /// repeated arrays without materializing millions of rectangles.
     #[serde(default = "default_true")]
     pub cover_full_usable_area: bool,
+    /// Represent fill as compact lattices rather than individual rectangles.
+    #[serde(default)]
+    pub use_arrays: bool,
     #[serde(default)]
     pub layers: BTreeMap<String, DensityFillLayerRule>,
 }
@@ -234,6 +250,7 @@ impl Default for DensityFillRuleDeck {
             evaluation_window_step_x_um: None,
             evaluation_window_step_y_um: None,
             cover_full_usable_area: true,
+            use_arrays: false,
             layers: BTreeMap::new(),
         }
     }
@@ -422,6 +439,7 @@ impl GdsLayerMap {
             label_datatype: 10,
             layers,
             dummy_layers: BTreeMap::new(),
+            pad_opening: None,
         }
     }
 }
@@ -550,6 +568,20 @@ impl Technology {
         }
 
         let mut changed = false;
+        // The legacy scalar checked COMP spacing but omitted the two emitted
+        // 0.35um implant enclosures and NP.2/PP.2's 0.40um separation.
+        if (self.physical_rules.diffusion.min_spacing_um - 0.28).abs() < 1e-9
+            && ["ndiff", "pdiff"].iter().all(|layer| {
+                self.gds_layers.layers.get(*layer).is_some_and(|purposes| {
+                    purposes
+                        .iter()
+                        .any(|p| (p.enclosure_um - 0.35).abs() < 1e-9)
+                })
+            })
+        {
+            self.physical_rules.diffusion.min_spacing_um = 1.10;
+            changed = true;
+        }
         // Projects persist the selected technology snapshot. Older GF180
         // snapshots predate density rules and dummy-purpose mappings; keeping
         // those empty silently disables manufacturing fill after reopening a
@@ -559,6 +591,7 @@ impl Technology {
             || self.gds_layers.dummy_layers.is_empty()
             || self.tapeout_window.rings.is_empty()
             || self.tapeout_window.pads.is_empty()
+            || self.gds_layers.pad_opening.is_none()
         {
             let canonical = Technology::from_yaml(include_str!(
                 "../../docs/examples/process_gf180mcu_3v3_5m_dr.yaml"
@@ -570,6 +603,10 @@ impl Technology {
             }
             if self.gds_layers.dummy_layers.is_empty() {
                 self.gds_layers.dummy_layers = canonical.gds_layers.dummy_layers;
+                changed = true;
+            }
+            if self.gds_layers.pad_opening.is_none() {
+                self.gds_layers.pad_opening = canonical.gds_layers.pad_opening;
                 changed = true;
             }
             // Early full-area snapshots carried the Caravel-sized envelope but
@@ -730,6 +767,27 @@ impl Technology {
             &mut diagnostics,
         );
         validate_gds_layers(&self.gds_layers, self.max_metal_layers, &mut diagnostics);
+        if let Some(opening) = &self.gds_layers.pad_opening {
+            let grid = self.physical_rules.manufacturing_grid_um;
+            if grid > 0.0
+                && ((opening.inset_um / grid) - (opening.inset_um / grid).round()).abs() > 1e-7
+            {
+                diagnostics.push(TechnologyDiagnostic {
+                    code: "off_grid_pad_opening",
+                    field: "gds_layers.pad_opening.inset_um".into(),
+                    message: "Pad opening inset must lie on the manufacturing grid.".into(),
+                });
+            }
+            for pad in &self.tapeout_window.pads {
+                if pad.width_um <= opening.inset_um * 2.0
+                    || pad.height_um <= opening.inset_um * 2.0
+                    || pad.layer != self.max_metal_layers
+                {
+                    diagnostics.push(TechnologyDiagnostic { code: "invalid_pad_opening_geometry", field: format!("tapeout_window.pads.{}", pad.id), message: "A passivation opening requires a top-metal pad larger than twice the configured inset.".into() });
+                }
+            }
+        }
+
         validate_mos(
             "pmos",
             &self.pmos,
@@ -1484,6 +1542,17 @@ fn validate_gds_layers(
                         .into(),
                 });
             }
+        }
+    }
+    if let Some(opening) = &mapping.pad_opening {
+        if opening.layer > i16::MAX as u16
+            || opening.datatype > i16::MAX as u16
+            || !opening.inset_um.is_finite()
+            || opening.inset_um < 0.0
+            || !opening.underlying_metal_min_width_um.is_finite()
+            || opening.underlying_metal_min_width_um < 0.0
+        {
+            diagnostics.push(TechnologyDiagnostic { code: "invalid_pad_opening", field: "gds_layers.pad_opening".into(), message: "Pad opening must have valid GDS layer/datatype and a finite non-negative inset.".into() });
         }
     }
     for (name, purposes) in &mapping.dummy_layers {

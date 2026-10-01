@@ -83,6 +83,9 @@ export type Project = {
 };
 
 export type RtlModule = {
+  source?: string;
+  compiler?: string;
+  initialValues?: Record<string, boolean>;
   name: string;
   parameters: Array<{ name: string; defaultExpression: string; defaultValue: number }>;
   ports: Array<{ name: string; direction: "input" | "output"; range: RtlRange | null }>;
@@ -100,6 +103,7 @@ export type RtlModule = {
     referencedSignals: string[];
   }>;
   sequentialProcesses: Array<{
+    asynchronousReset?: { signal: string; activeHigh: boolean; value: boolean } | null;
     edge: "posedge" | "negedge";
     clock: string;
     target: string;
@@ -174,6 +178,7 @@ export type Technology = {
 };
 
 export type GdsLayerMap = {
+  pad_opening?: { layer: number; datatype: number; inset_um: number; underlying_metal_min_width_um: number };
   format_version: number;
   label_datatype: number;
   layers: Record<string, Array<{ purpose: string; layer: number; datatype: number }>>;
@@ -532,6 +537,18 @@ export type PhysicalLayoutIr = {
     shapesOutsideFloorplan: number;
     shapesOutsideTapeout: number;
   };
+  densityArrays?: Array<{
+    material: string;
+    layer: string;
+    x: number;
+    y: number;
+    tileWidth: number;
+    tileHeight: number;
+    stepX: number;
+    stepY: number;
+    columns: number;
+    rows: number;
+  }>;
   density: {
     layers: Array<{
       material: string;
@@ -576,6 +593,7 @@ export type PhysicalLayoutIr = {
       | "contact"
       | "device_landing"
       | "pin"
+      | "pad"
       | "power_rail"
       | "route"
       | "route_fill"

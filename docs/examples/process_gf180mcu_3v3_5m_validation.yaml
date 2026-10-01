@@ -4,12 +4,11 @@
 # rule deck named below. It is intentionally separate from the rule deck:
 # process requirements must not change when qualification evidence changes.
 #
-# Claims are deliberately conservative. This compatibility deck is not a
-# foundry signoff deck. The official GF180 deck has now been run against the
-# exact 4B_ADDER GDS: structural/round-trip checks pass, official geometry and
-# process DRC is clean apart from the known direct-float DBU comparison marker,
-# and native LVS closes 144 MOS devices and 82 nets. Tapeout, manufacturing,
-# and silicon evidence remain NOT_RUN.
+# The current compatibility deck is not a foundry signoff deck. QD-0001 and
+# its repository evidence describe the historical 144-device design/artifacts.
+# They do not qualify the revised pad/implant rules or the current 192-device
+# adder. Current-layout official DRC correlation is in progress; full-die
+# density remains incomplete. Tapeout/manufacturing/silicon evidence is NOT_RUN.
 
 process_validation:
   format_version: 1
@@ -18,24 +17,25 @@ process_validation:
     process_id: gf180mcu-3v3-5m-compat
     deck_revision: openchippy-compat-v1
     deck_file: process_gf180mcu_3v3_5m_dr.yaml
-    deck_fingerprint: "fnv1a64:954348f563ca895d"
+    deck_fingerprint: "fnv1a64:5afed6506c19e2c0"
     compatibility_profile: true
     foundry_signoff_deck: false
 
   record:
     record_id: gf180mcu-3v3-5m-compat-validation-v1
-    revision: 2
-    generated_on: "2026-08-11"
+    revision: 3
+    generated_on: "2026-09-29"
     overall_status: IMPLEMENTED
     highest_supported_claim: UNIT_TESTED
     notes:
+      - Current deck adds pad passivation openings and implant-aware diffusion spacing. Historical QD-0001 evidence below applies to its recorded older artifacts, not a qualification of this changed deck or current 192-device adder.
       - The deck loads through the current strict OpenChippy technology parser.
       - EDU and GF180 compatibility NAND regressions pass native DRC.
       - The compatibility template emits a full 2920 x 3520 um Caravel-sized perimeter with two rings and 42 pads (38 GPIO, two VDD, two GND), plus four full-height 20 um Metal5 supply trunks stitched to the rings and core nets; exact fine fill remains core-scoped pending repeated-array Physical IR.
       - QD-0001 passes native DRC/connectivity/LVS and its deterministic GDS has been checked with the official variant-C 5LM/9K deck.
       - KLayout opens and canonically round-trips the supported GDS record set.
-      - Official GF180 geometry/process DRC is clean; the remaining DBU marker comes from an exact floating-point comparison in the deck/tool combination and is retained as correlation evidence.
-      - Native LVS recognizes and matches 144 MOS devices and 82 nets; independent foundry LVS/reference-netlist qualification remains future work.
+      - Historical QD-0001 official GF180 geometry/process DRC was clean; the remaining DBU marker comes from an exact floating-point comparison in the deck/tool combination and is retained as correlation evidence.
+      - Historical QD-0001 native LVS recognized and matched 144 MOS devices and 82 nets; independent foundry LVS/reference-netlist qualification remains future work.
 
   capabilities:
     - id: CAP-PROCESS-DECK-LOAD

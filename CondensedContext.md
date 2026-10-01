@@ -3,11 +3,10 @@
 ## Context Freshness
 
 - Context ID: FRESH-001
-- Last Verified Commit: `968e661`
-- Current HEAD: `968e661` plus uncommitted packaged-standard-cell selection work.
-- Generated: 2026-08-19
-- Status: partial; repository was reset to the known commit before this new direction.
-- Files requiring verification: current standard-cell/technology changes; see `git status --short`.
+- Last Verified Commit: `4edc0a8`
+- Current HEAD: `4edc0a8` plus current layout/Verilog work.
+- Generated: 2026-09-29
+- Status: partial; baseline 201 Rust tests pass. Current changes under validation.
 - Full semantic memory: `CondensedContext.CCF1`
 
 ## Current Focus
@@ -38,9 +37,13 @@
 ## Handoff
 
 - Context ID: HANDOFF-001
-- Last known state: packaged identifiers `openchippy-edu` and `gf180mcu-3v3-5m` resolve explicitly; GF180/EDU example YAMLs select them; flattened INV/NAND2/NOR2 topology is inferred before planning. Designs with complete library coverage use canonical relative placement and skip alternate placement-routing evaluations; unmatched designs retain the transistor fallback.
-- Next useful step: cache one completed process-owned geometry template per recognized cell type and stamp translated instances, then route only the exposed cell interfaces. Current cutover canonicalizes placement and reduces candidate work but still materializes device geometry per instance.
-- Validation: 200/201 full Rust tests passed; the one assertion encoded the former report-only placement behavior and was updated for intentional production canonical placement. Both hierarchy-focused regressions pass after the update. Direct rustfmt succeeds; `cargo fmt` still cannot discover the installed component.
+- Active session: layout/DRC repair and compiler-backed Verilog/SystemVerilog import; user explicitly requested continuing after more tokens became available.
+- Current changes: IR v48 preserves snapped cut dimensions and original well stripe boundaries, protects shared componentless landings, uses raw-width A* edges with collinear coalescing, checks connected-metal union area, adds GF180 pad opening 37/0 and conservative implant-aware diffusion spacing 1.10 um.
+- Compiler: Yosys/slang JSON elaboration supports hierarchy/generate/functions/signed arithmetic/memories/register resets/enables/initial values. Original source is preserved. Import dialog has frontend/top/executable controls. Negative port indices and clock aliases have regressions. Native signed declarations now explicitly require compiler.
+- Evidence: baseline 201 Rust tests passed. Latest focused run passes 207 tests including four real compiler tests; full suite currently running in `/private/tmp/openchippy-all-final.log`. Frontend production build passes. Rustfmt component is unavailable. Working compiler: `/private/tmp/oss-cad-suite/bin/yosys` (OSS CAD Suite 2026-09-27).
+- Current Documents/4B_ADDER.chippy is 192 MOS, not historical 144-device fixture. v48 regenerated finalist has zero terminal connectivity errors; final perimeter routing remains expensive. Profile located repeated whole-chip exact-duplicate scans in repair; per-net lookup and score-before-legality optimizations added, release rebuild running. Latest generation log: `/private/tmp/openchippy-qualification-v48.log`.
+- Earlier official run had 79 markers (pad-slot, implant spacing, metal necks, density, DBU). Pad and implant changes await fresh correlation. Full-die density remains unresolved/core-scoped. Historical qualification must not be applied to changed deck; validation record fingerprint refreshed and scope note added.
+- Next: finish adder generation with optimized release binary; inspect native DRC/LVS then run `scripts/qualify_gf180.py` against official local GF180 deck. Close residual geometry and implement scalable full-die density if feasible. Save evidence in tmp, never overwrite original Documents projects.
 
 ## Recent Changes
 

@@ -1,3 +1,4 @@
+pub mod density_arrays;
 pub mod gds_import;
 pub mod gdsii;
 mod history;
@@ -15,6 +16,7 @@ mod physical_planning;
 #[allow(dead_code)]
 mod plugins;
 mod rtl;
+mod rtl_compiler;
 mod simulation;
 pub mod standard_cells;
 pub mod technology;
@@ -1132,8 +1134,23 @@ fn validate_project(state: tauri::State<AppState>) -> Result<ValidationReport, P
 }
 
 #[tauri::command]
-fn parse_verilog(source: String) -> Result<rtl::RtlModule, ProjectError> {
-    rtl::parse_structural_verilog(&source).map_err(ProjectError::InvalidAction)
+async fn parse_verilog(
+    source: String,
+    top: Option<String>,
+    frontend: Option<rtl_compiler::Frontend>,
+    compiler_path: Option<String>,
+) -> Result<rtl::RtlModule, ProjectError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        rtl_compiler::import(
+            &source,
+            top.as_deref(),
+            frontend.unwrap_or_default(),
+            compiler_path.as_deref(),
+        )
+        .map_err(ProjectError::InvalidAction)
+    })
+    .await
+    .map_err(|error| ProjectError::InvalidAction(format!("compiler task failed: {error}")))?
 }
 
 #[tauri::command]
@@ -1144,16 +1161,32 @@ async fn read_verilog_source(path: String) -> Result<String, ProjectError> {
 }
 
 #[tauri::command]
-fn import_verilog(
+async fn import_verilog(
     source: String,
-    state: tauri::State<AppState>,
+    top: Option<String>,
+    frontend: Option<rtl_compiler::Frontend>,
+    compiler_path: Option<String>,
+    state: tauri::State<'_, AppState>,
 ) -> Result<WorkspaceState, ProjectError> {
-    let module = rtl::parse_structural_verilog(&source).map_err(ProjectError::InvalidAction)?;
+    let expected_digest = project_digest(
+        &state
+            .workspace
+            .lock()
+            .map_err(|_| ProjectError::StateUnavailable)?
+            .history
+            .current(),
+    )?;
+    let module = parse_verilog(source, top, frontend, compiler_path).await?;
     let design = rtl::map_module(module);
     let mut workspace = state
         .workspace
         .lock()
         .map_err(|_| ProjectError::StateUnavailable)?;
+    if project_digest(&workspace.history.current())? != expected_digest {
+        return Err(ProjectError::InvalidAction(
+            "Project changed while Verilog was compiling; retry the import".into(),
+        ));
+    }
     workspace
         .history
         .update(|project| project.set_rtl_design(design));

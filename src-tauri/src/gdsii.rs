@@ -14,12 +14,14 @@ const STRNAME: u8 = 0x06;
 const ENDSTR: u8 = 0x07;
 const BOUNDARY: u8 = 0x08;
 const SREF: u8 = 0x0a;
+const AREF: u8 = 0x0b;
 const TEXT: u8 = 0x0c;
 const LAYER: u8 = 0x0d;
 const DATATYPE: u8 = 0x0e;
 const XY: u8 = 0x10;
 const ENDEL: u8 = 0x11;
 const SNAME: u8 = 0x12;
+const COLROW: u8 = 0x13;
 const TEXTTYPE: u8 = 0x16;
 const STRING: u8 = 0x19;
 
@@ -96,6 +98,28 @@ pub fn export(
         block_cells.push(cell_name);
     }
 
+    let mut fill_prefix = "__OC_FILL_".to_string();
+    while top_cell.starts_with(&fill_prefix) || block_cells.iter().any(|name| name.starts_with(&fill_prefix)) {
+        fill_prefix.push('F');
+    }
+    let mut fill_cells = Vec::new();
+    for (index, array) in ir.density_arrays.iter().enumerate() {
+        if array.columns == 0 || array.rows == 0 || array.columns > 32767 || array.rows > 32767
+            || array.step_x < array.tile_width || array.step_y < array.tile_height {
+            return Err("Invalid density array dimensions or pitch".into());
+        }
+        let name = format!("{fill_prefix}{index}");
+        record_i16(&mut output, BGNSTR, &[0; 12]);
+        record_ascii(&mut output, STRNAME, &name);
+        let mut tile = array.envelope();
+        tile.x = 0.0;
+        tile.y = 0.0;
+        tile.width = array.tile_width;
+        tile.height = array.tile_height;
+        emit_shape(&mut output, &tile, database_units_per_micron, layer_map, &mut layer_boundary_counts)?;
+        record_empty(&mut output, ENDSTR);
+        fill_cells.push(name);
+    }
     record_i16(&mut output, BGNSTR, &[0; 12]);
     record_ascii(&mut output, STRNAME, &top_cell);
     for (shape_index, shape) in ir.shapes.iter().enumerate() {
@@ -113,6 +137,18 @@ pub fn export(
         record_empty(&mut output, SREF);
         record_ascii(&mut output, SNAME, cell_name);
         record_i32(&mut output, XY, &[0, 0]);
+        record_empty(&mut output, ENDEL);
+    }
+    for (array, cell_name) in ir.density_arrays.iter().zip(&fill_cells) {
+        record_empty(&mut output, AREF);
+        record_ascii(&mut output, SNAME, cell_name);
+        record_i16(&mut output, COLROW, &[array.columns as i16, array.rows as i16]);
+        let dbu = |value| to_dbu(value, database_units_per_micron);
+        record_i32(&mut output, XY, &[
+            dbu(array.x)?, dbu(array.y)?,
+            dbu(array.x + f64::from(array.columns) * array.step_x)?, dbu(array.y)?,
+            dbu(array.x)?, dbu(array.y + f64::from(array.rows) * array.step_y)?,
+        ]);
         record_empty(&mut output, ENDEL);
     }
 
@@ -165,7 +201,7 @@ pub fn export(
         max_y: report.bounds.max_y / f64::from(database_units_per_micron),
     };
     report.byte_count = output.len();
-    if report.structure_count != ir.physical_blocks.len() + 1 {
+    if report.structure_count != ir.physical_blocks.len() + fill_cells.len() + 1 {
         report.structurally_valid = false;
         report.diagnostics.push(format!(
             "export contains {} structures; expected one top cell plus {} physical blocks",
@@ -173,7 +209,7 @@ pub fn export(
             ir.physical_blocks.len()
         ));
     }
-    if report.reference_count != ir.physical_blocks.len() {
+    if report.reference_count != ir.physical_blocks.len() + fill_cells.len() {
         report.structurally_valid = false;
         report.diagnostics.push(format!(
             "top cell contains {} references for {} physical blocks",
@@ -274,7 +310,7 @@ pub fn validate(bytes: &[u8]) -> Result<GdsExportReport, String> {
             }
             ENDSTR => saw_end_structure = true,
             ENDLIB => saw_end_library = true,
-            BOUNDARY | TEXT | SREF => {
+            BOUNDARY | TEXT | SREF | AREF => {
                 if current_element.is_some() {
                     diagnostics.push("nested GDSII elements are not valid".into());
                 }
@@ -283,7 +319,7 @@ pub fn validate(bytes: &[u8]) -> Result<GdsExportReport, String> {
                 current_datatype = None;
                 current_reference = None;
             }
-            SNAME if current_element == Some(SREF) && data_type == 6 => {
+            SNAME if matches!(current_element, Some(SREF | AREF)) && data_type == 6 => {
                 current_reference = Some(ascii_payload(payload));
             }
             LAYER if payload.len() == 2 => {
@@ -319,7 +355,7 @@ pub fn validate(bytes: &[u8]) -> Result<GdsExportReport, String> {
                     }
                 }
                 Some(TEXT) => label_count += 1,
-                Some(SREF) => {
+                Some(SREF | AREF) => {
                     reference_count += 1;
                     if let Some(name) = current_reference.take() {
                         referenced_structures.push(name);
@@ -452,7 +488,7 @@ fn emit_shape(
     layer_map: &GdsLayerMap,
     counts: &mut BTreeMap<String, usize>,
 ) -> Result<(), String> {
-    for purpose in mapped_purposes_for_shape(layer_map, shape)? {
+    for purpose in mapped_purposes_for_shape(layer_map, shape)?.iter() {
         let left = to_dbu(
             shape.x - shape.width / 2.0 - purpose.enclosure_um,
             database_units_per_micron,
@@ -516,9 +552,25 @@ fn mapped_purposes(
 fn mapped_purposes_for_shape<'a>(
     layer_map: &'a GdsLayerMap,
     shape: &crate::physical_layout::PhysicalShape,
-) -> Result<&'a [GdsLayerPurpose], String> {
+) -> Result<std::borrow::Cow<'a, [GdsLayerPurpose]>, String> {
     if shape.purpose != PhysicalShapePurpose::DummyFill {
-        return mapped_purposes(layer_map, shape.layer);
+        let purposes = mapped_purposes(layer_map, shape.layer)?;
+        if shape.purpose == PhysicalShapePurpose::Pad {
+            if let Some(opening) = &layer_map.pad_opening {
+                if shape.width <= 2.0 * opening.inset_um || shape.height <= 2.0 * opening.inset_um {
+                    return Err("Pad opening inset consumes the complete pad".into());
+                }
+                let mut expanded = purposes.to_vec();
+                expanded.push(GdsLayerPurpose {
+                    purpose: "pad_opening".into(),
+                    layer: opening.layer,
+                    datatype: opening.datatype,
+                    enclosure_um: -opening.inset_um,
+                });
+                return Ok(std::borrow::Cow::Owned(expanded));
+            }
+        }
+        return Ok(std::borrow::Cow::Borrowed(purposes));
     }
     let name = match shape.layer {
         PhysicalLayer::Ndiff | PhysicalLayer::Pdiff => "active".into(),
@@ -540,7 +592,7 @@ fn mapped_purposes_for_shape<'a>(
     layer_map
         .dummy_layers
         .get(&name)
-        .map(Vec::as_slice)
+        .map(|purposes| std::borrow::Cow::Borrowed(purposes.as_slice()))
         .ok_or_else(|| format!("active process deck does not map dummy material {name}"))
 }
 
@@ -822,6 +874,7 @@ mod tests {
         assert!(report.layer_boundary_counts.contains_key("22:0"));
         assert!(report.layer_boundary_counts.contains_key("31:0"));
         assert!(report.layer_boundary_counts.contains_key("32:0"));
+        assert_eq!(report.layer_boundary_counts.get("37:0"), Some(&42));
         assert_eq!(technology.gds_layers.layers["metal5"][0].layer, 81);
         assert_eq!(technology.gds_layers.layers["ndiff"][1].enclosure_um, 0.35);
         assert_eq!(technology.gds_layers.layers["pdiff"][1].enclosure_um, 0.35);

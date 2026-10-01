@@ -1066,6 +1066,11 @@ fn rtl_expression(
     while outer_parens(source) {
         source = &source[1..source.len() - 1];
     }
+    // Exact scalar names may contain escaped punctuation or negative indices.
+    // Resolve them before interpreting '-' as an arithmetic operator.
+    if states.contains_key(source) {
+        return rtl_signal_value(module, states, source);
+    }
     if source.starts_with('{') && source.ends_with('}') {
         let content = &source[1..source.len() - 1];
         let mut brace_depth = 0i32;
@@ -1185,6 +1190,13 @@ fn rtl_expression(
                     rtl_expression(module, states, &source[question.unwrap() + 1..index]);
                 let when_false = rtl_expression(module, states, &source[index + 1..]);
                 if !condition.known {
+                    if when_true.known
+                        && when_false.known
+                        && when_true.bits == when_false.bits
+                        && when_true.width == when_false.width
+                    {
+                        return when_true;
+                    }
                     return RtlValue {
                         bits: 0,
                         width: when_true.width.max(when_false.width),
@@ -1352,7 +1364,7 @@ fn simulate_rtl_point(
     inputs: &HashMap<String, LogicState>,
 ) -> HashMap<String, LogicState> {
     let mut states = inputs.clone();
-    for _ in 0..64 {
+    for _ in 0..(module.instances.len() + module.assignments.len() + 1).max(64) {
         let mut changed = false;
         for instance in &module.instances {
             let Some(primitive) = instance.primitive else {
@@ -1372,14 +1384,18 @@ fn simulate_rtl_point(
                 PrimitiveGate::Buf => {
                     known.then(|| values.first().is_some_and(|value| value.bits & 1 != 0))
                 }
-                PrimitiveGate::And | PrimitiveGate::Nand => known.then(|| {
-                    values.iter().all(|value| value.bits & 1 != 0)
-                        ^ matches!(primitive, PrimitiveGate::Nand)
-                }),
-                PrimitiveGate::Or | PrimitiveGate::Nor => known.then(|| {
-                    values.iter().any(|value| value.bits & 1 != 0)
-                        ^ matches!(primitive, PrimitiveGate::Nor)
-                }),
+                PrimitiveGate::And | PrimitiveGate::Nand => {
+                    (known || values.iter().any(|v| v.known && v.bits & 1 == 0)).then(|| {
+                        values.iter().all(|value| value.bits & 1 != 0)
+                            ^ matches!(primitive, PrimitiveGate::Nand)
+                    })
+                }
+                PrimitiveGate::Or | PrimitiveGate::Nor => {
+                    (known || values.iter().any(|v| v.known && v.bits & 1 != 0)).then(|| {
+                        values.iter().any(|value| value.bits & 1 != 0)
+                            ^ matches!(primitive, PrimitiveGate::Nor)
+                    })
+                }
                 PrimitiveGate::Xor | PrimitiveGate::Xnor => known.then(|| {
                     (values.iter().filter(|value| value.bits & 1 != 0).count() % 2 == 1)
                         ^ matches!(primitive, PrimitiveGate::Xnor)
@@ -1495,9 +1511,41 @@ pub fn rtl_waveform(module: &RtlModule, config: WaveformConfig) -> Result<Wavefo
         .filter(|port| port.direction == RtlPortDirection::Output)
         .flat_map(|port| rtl_bits(&port.name, &port.range))
         .collect::<Vec<_>>();
+    // Compilers rename clock nets. Follow only direct aliases back to ports;
+    // combinational clock expressions must retain their actual logic.
+    let mut clock_signals = module
+        .sequential_processes
+        .iter()
+        .map(|process| process.clock.clone())
+        .collect::<BTreeSet<_>>();
+    loop {
+        let before = clock_signals.len();
+        for instance in &module.instances {
+            if instance.primitive == Some(PrimitiveGate::Buf)
+                && instance.connections.len() == 2
+                && clock_signals.contains(&instance.connections[0])
+            {
+                clock_signals.insert(instance.connections[1].clone());
+            }
+        }
+        for assignment in &module.assignments {
+            if clock_signals.contains(&assignment.target)
+                && assignment.referenced_signals.len() == 1
+                && assignment.expression.trim() == assignment.referenced_signals[0]
+            {
+                clock_signals.insert(assignment.referenced_signals[0].clone());
+            }
+        }
+        if clock_signals.len() == before {
+            break;
+        }
+    }
     let is_clock = |name: &str| {
-        let name = name.to_ascii_uppercase();
-        name == "CLK" || name.starts_with("CLK[") || name.contains("CLOCK")
+        let uppercase = name.to_ascii_uppercase();
+        clock_signals.contains(name)
+            || uppercase == "CLK"
+            || uppercase.starts_with("CLK[")
+            || uppercase.contains("CLOCK")
     };
     let ordinary = input_names
         .iter()
@@ -1542,7 +1590,17 @@ pub fn rtl_waveform(module: &RtlModule, config: WaveformConfig) -> Result<Wavefo
             },
         );
     }
-    let mut previous_inputs = HashMap::new();
+    for (name, value) in &module.initial_values {
+        registers.insert(
+            name.clone(),
+            if *value {
+                LogicState::High
+            } else {
+                LogicState::Low
+            },
+        );
+    }
+    let mut previous_states = HashMap::new();
     for time in times {
         let step = time / config.input_change_ns;
         let inputs = input_names
@@ -1575,16 +1633,18 @@ pub fn rtl_waveform(module: &RtlModule, config: WaveformConfig) -> Result<Wavefo
             .collect::<HashMap<_, _>>();
         let mut environment = registers.clone();
         environment.extend(inputs.clone());
-        let before_edge = simulate_rtl_point(module, &environment);
-        let updates = module
-            .sequential_processes
-            .iter()
-            .filter_map(|process| {
-                let previous = previous_inputs
+        let mut result = simulate_rtl_point(module, &environment);
+        // Delta cycles preserve simultaneous nonblocking updates while allowing
+        // a register output or combinational expression to clock another stage.
+        let mut settled = false;
+        for _ in 0..(module.sequential_processes.len() + 2).max(8) {
+            let mut updates = Vec::new();
+            for process in &module.sequential_processes {
+                let previous = previous_states
                     .get(&process.clock)
                     .copied()
                     .unwrap_or(LogicState::Unknown);
-                let current = inputs
+                let current = result
                     .get(&process.clock)
                     .copied()
                     .unwrap_or(LogicState::Unknown);
@@ -1592,21 +1652,42 @@ pub fn rtl_waveform(module: &RtlModule, config: WaveformConfig) -> Result<Wavefo
                     RtlEdge::Posedge => previous == LogicState::Low && current == LogicState::High,
                     RtlEdge::Negedge => previous == LogicState::High && current == LogicState::Low,
                 };
-                triggered.then(|| {
-                    (
+                let reset = process.asynchronous_reset.as_ref().and_then(|reset| {
+                    let state = rtl_signal_value(module, &result, &reset.signal);
+                    (state.known && (state.bits != 0) == reset.active_high).then_some(reset.value)
+                });
+                if let Some(value) = reset {
+                    updates.push((
                         process.target.clone(),
-                        rtl_expression(module, &before_edge, &process.expression),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        for (target, value) in updates {
-            assign_rtl_value(module, &mut registers, &target, value);
+                        RtlValue {
+                            bits: u128::from(value),
+                            width: 1,
+                            known: true,
+                        },
+                    ));
+                } else if triggered {
+                    updates.push((
+                        process.target.clone(),
+                        rtl_expression(module, &result, &process.expression),
+                    ));
+                }
+            }
+            previous_states = result.clone();
+            let mut changed = false;
+            for (target, value) in updates {
+                changed |= assign_rtl_value(module, &mut registers, &target, value);
+            }
+            if !changed {
+                settled = true;
+                break;
+            }
+            let mut environment = registers.clone();
+            environment.extend(inputs.clone());
+            result = simulate_rtl_point(module, &environment);
         }
-        let mut environment = registers.clone();
-        environment.extend(inputs.clone());
-        let result = simulate_rtl_point(module, &environment);
-        previous_inputs = inputs;
+        if !settled {
+            return Err("RTL register events did not settle at the current time".into());
+        }
         for name in &output_names {
             let state = result.get(name).copied().unwrap_or(LogicState::Unknown);
             let lane = samples.get_mut(name).unwrap();
@@ -1733,7 +1814,7 @@ mod tests {
     #[test]
     fn nonblocking_register_updates_on_clock_edges_in_waveforms() {
         let module = parse_structural_verilog(
-            "module dff(input logic CLK, input logic D, output logic Q); always_ff @(posedge CLK) Q <= D; endmodule",
+            "module dff(input logic tick, input logic D, output logic Q); wire clock_alias; assign clock_alias = tick; always_ff @(posedge clock_alias) Q <= D; endmodule",
         ).unwrap();
         assert!(rtl_truth_table(&module).unwrap_err().contains("Waveforms"));
         let result = rtl_waveform(
@@ -1751,10 +1832,13 @@ mod tests {
             .find(|signal| signal.name == "Q")
             .unwrap();
         assert_eq!(output.samples[0].state, LogicState::Unknown);
-        assert!(output
-            .samples
-            .iter()
-            .any(|sample| sample.time_ns == 5.0 && sample.state == LogicState::Low));
+        assert!(
+            output
+                .samples
+                .iter()
+                .any(|sample| sample.time_ns == 5.0 && sample.state == LogicState::Low),
+            "{module:?} {result:?}"
+        );
         assert!(output
             .samples
             .iter()

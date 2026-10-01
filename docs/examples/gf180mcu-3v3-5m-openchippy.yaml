@@ -71,6 +71,7 @@ physical_parasitics:
 # Diffusion emits both COMP and the polarity-specific implant. The synthetic
 # OpenChippy substrate canvas is intentionally omitted from manufacturing GDS.
 gds_layers:
+  pad_opening: { layer: 37, datatype: 0, inset_um: 5.0, underlying_metal_min_width_um: 1.0 }
   format_version: 1
   label_datatype: 10
   layers:
@@ -104,11 +105,13 @@ physical_rules:
 
   # COMP/active, 3.3 V rules:
   #   DF.1a width = 0.22 um
-  #   DF.3a spacing = 0.28 um
+  #   DF.3a COMP spacing = 0.28 um
+  # Separate active islands also emit 0.35 um implant enclosures.
+  # NP.2/PP.2 require 0.40 um between those implants: 2*0.35+0.40 = 1.10 um.
   #   DF.9 area = 0.2025 um^2
   diffusion:
     min_width_um: 0.22
-    min_spacing_um: 0.28
+    min_spacing_um: 1.10
     min_area_um2: 0.2025
 
   # Poly2, 3.3 V rules:

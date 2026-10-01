@@ -16,10 +16,9 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use uuid::Uuid;
 
-// Version 46 persists process density coverage measured globally and over
-// sliding windows. Version 45's terminal-preserving manufacturing baseline
-// remains otherwise unchanged.
-pub const CURRENT_PHYSICAL_IR_VERSION: u32 = 47;
+// Version 48 preserves snapped dimensions and well boundaries, repairs narrow
+// pin escapes, and distinguishes external pads for process-owned mask openings.
+pub const CURRENT_PHYSICAL_IR_VERSION: u32 = 49;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +39,8 @@ pub struct PhysicalLayoutIr {
     pub tapeout: PhysicalTapeoutReport,
     #[serde(default)]
     pub density: PhysicalDensityReport,
+    #[serde(default)]
+    pub density_arrays: Vec<crate::density_arrays::DensityArray>,
     pub bounds: PhysicalBounds,
     pub shapes: Vec<PhysicalShape>,
     #[serde(default)]
@@ -738,6 +739,8 @@ pub enum PhysicalShapePurpose {
     Contact,
     DeviceLanding,
     Pin,
+    /// Bond-pad metal; exports a process-defined passivation opening.
+    Pad,
     /// A process-wide VDD/GND distribution conductor. This is an external
     /// electrical obligation and must survive terminal-tree pruning.
     PowerRail,
@@ -752,6 +755,9 @@ pub enum PhysicalShapePurpose {
 }
 
 impl PhysicalShapePurpose {
+    pub fn is_pin(self) -> bool {
+        matches!(self, Self::Pin | Self::Pad)
+    }
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
@@ -762,6 +768,7 @@ impl PhysicalShapePurpose {
             Self::Contact => "contact",
             Self::DeviceLanding => "device_landing",
             Self::Pin => "pin",
+            Self::Pad => "pad",
             Self::PowerRail => "power_rail",
             Self::Route => "route",
             Self::RouteFill => "route_fill",
@@ -959,6 +966,32 @@ fn line_shape(
         height: if horizontal { width } else { routed_length },
         component_id: None,
         net,
+        purpose: PhysicalShapePurpose::Route,
+    }
+}
+
+// Track-search edges are pieces of a continuous conductor. Enforcing the
+// standalone minimum area on every short edge makes legal narrow escapes
+// disappear from the search graph. DRC checks the connected metal union.
+fn track_line_shape(
+    start: (f64, f64),
+    end: (f64, f64),
+    layer: PhysicalLayer,
+    net: usize,
+    rules: &PhysicalRuleDeck,
+) -> PhysicalShape {
+    let PhysicalLayer::Metal(index) = layer else {
+        unreachable!()
+    };
+    let width = metal_rule(rules, index).min_width_um;
+    PhysicalShape {
+        layer,
+        x: (start.0 + end.0) / 2.0,
+        y: (start.1 + end.1) / 2.0,
+        width: (start.0 - end.0).abs() + width,
+        height: (start.1 - end.1).abs() + width,
+        component_id: None,
+        net: Some(net),
         purpose: PhysicalShapePurpose::Route,
     }
 }
@@ -3625,10 +3658,25 @@ fn snap_to_grid(value: f64, grid: f64) -> f64 {
 }
 
 fn snap_shape_to_grid(shape: &mut PhysicalShape, grid: f64) {
-    let left = snap_to_grid(shape.x - shape.width / 2.0, grid);
-    let top = snap_to_grid(shape.y - shape.height / 2.0, grid);
-    let right = snap_to_grid(shape.x + shape.width / 2.0, grid);
-    let bottom = snap_to_grid(shape.y + shape.height / 2.0, grid);
+    // Resolve half-grid ties consistently toward +infinity. Floating-point
+    // cancellation otherwise sends a cut and its co-centered landing to
+    // opposite grid points, consuming one quantum of enclosure.
+    let edge = |value: f64| {
+        let units = value / grid;
+        ((units * 1e8).round() / 1e8 + 0.5).floor() * grid
+    };
+    let left = edge(shape.x - shape.width / 2.0);
+    let top = edge(shape.y - shape.height / 2.0);
+    // Quantize the size once. Independently rounding opposite half-grid edges
+    // can shrink a legal cut by one grid unit due to floating-point cancellation.
+    let (right, bottom) = if matches!(shape.layer, PhysicalLayer::Nwell | PhysicalLayer::Pwell) {
+        // Adjacent well stripes share a boundary, rather than a cut size.
+        // Snap that same boundary identically from either side.
+        (edge(shape.x + shape.width / 2.0), edge(shape.y + shape.height / 2.0))
+    } else {
+        (left + (shape.width / grid).round().max(1.0) * grid,
+         top + (shape.height / grid).round().max(1.0) * grid)
+    };
     shape.x = (left + right) / 2.0;
     shape.y = (top + bottom) / 2.0;
     shape.width = (right - left).max(grid);
@@ -3714,7 +3762,9 @@ fn terminal_routing_islands(shapes: &[PhysicalShape], net: usize) -> Vec<Vec<usi
         let reaches_terminal = island.iter().any(|index| {
             matches!(
                 shapes[*index].purpose,
-                PhysicalShapePurpose::Pin | PhysicalShapePurpose::PowerRail
+                PhysicalShapePurpose::Pin
+                    | PhysicalShapePurpose::Pad
+                    | PhysicalShapePurpose::PowerRail
             ) || (shapes[*index].layer == PhysicalLayer::Metal(1)
                 && access
                     .iter()
@@ -3760,7 +3810,7 @@ fn routing_candidate_is_legal(
         .is_ok()
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct TrackSearchNode {
     x: usize,
     y: usize,
@@ -3824,6 +3874,27 @@ fn multilayer_track_search(
 ) -> Option<Vec<PhysicalShape>> {
     let trace = std::env::var_os("OPENCHIPPY_ROUTER_TRACE").is_some();
     let grid = rules.manufacturing_grid_um;
+    // Exact duplicate lookups are local to this net, never a scan of the chip
+    // for each graph edge. Keep exact geometry checks after quantized lookup.
+    let key = |shape: &PhysicalShape| {
+        (
+            shape.layer,
+            (shape.x / (grid / 2.0)).round() as i64,
+            (shape.y / (grid / 2.0)).round() as i64,
+            (shape.width / grid).round() as i64,
+            (shape.height / grid).round() as i64,
+        )
+    };
+    let mut existing = HashMap::<_, Vec<PhysicalShape>>::new();
+    for shape in shapes.iter().filter(|shape| shape.net == Some(net)) {
+        existing.entry(key(shape)).or_default().push(shape.clone());
+    }
+    let exists = |shape: &PhysicalShape| {
+        existing
+            .get(&key(shape))
+            .is_some_and(|bucket| exact_shape_exists(bucket, shape))
+    };
+    let mut edge_legality = HashMap::new();
     let pitch = (1..=max_layer)
         .map(|layer| {
             let rule = metal_rule(rules, layer);
@@ -4109,34 +4180,44 @@ fn multilayer_track_search(
         for neighbor in neighbors {
             let start = (xs[entry.node.x], ys[entry.node.y]);
             let end = (xs[neighbor.x], ys[neighbor.y]);
-            let mut edge = Vec::new();
+            let edge_key = if entry.node < neighbor {
+                (entry.node, neighbor)
+            } else {
+                (neighbor, entry.node)
+            };
             let edge_cost = if neighbor.layer == entry.node.layer {
-                edge.push(line_shape(
-                    start,
-                    end,
-                    PhysicalLayer::Metal(entry.node.layer),
-                    Some(net),
-                    rules,
-                ));
                 (((start.0 - end.0).abs() + (start.1 - end.1).abs()) * dbu).round() as i64
             } else {
-                add_via_stack(
-                    &mut edge,
-                    start,
-                    entry.node.layer,
-                    neighbor.layer,
-                    net,
-                    rules,
-                );
                 via_penalty
             };
-            for shape in &mut edge {
-                snap_shape_to_grid(shape, grid);
-            }
-            edge.retain(|shape| !exact_shape_exists(shapes, shape));
-            if !edge.is_empty()
-                && !routing_candidate_is_legal(canvas, &edge, rules, "open-track-edge")
-            {
+            let legal = *edge_legality.entry(edge_key).or_insert_with(|| {
+                let mut edge = Vec::new();
+                if neighbor.layer == entry.node.layer {
+                    edge.push(track_line_shape(
+                        start,
+                        end,
+                        PhysicalLayer::Metal(entry.node.layer),
+                        net,
+                        rules,
+                    ));
+                } else {
+                    add_via_stack(
+                        &mut edge,
+                        start,
+                        entry.node.layer,
+                        neighbor.layer,
+                        net,
+                        rules,
+                    );
+                }
+                for shape in &mut edge {
+                    snap_shape_to_grid(shape, grid);
+                }
+                edge.retain(|shape| !exists(shape));
+                edge.is_empty()
+                    || routing_candidate_is_legal(canvas, &edge, rules, "open-track-edge")
+            });
+            if !legal {
                 continue;
             }
             let next_cost = entry.cost.saturating_add(edge_cost.max(1));
@@ -4168,16 +4249,31 @@ fn multilayer_track_search(
         current = parent;
     }
     path.reverse();
+    let mut simplified: Vec<TrackSearchNode> = Vec::new();
+    for node in path {
+        if simplified.len() >= 2 {
+            let a = simplified[simplified.len() - 2];
+            let b = simplified[simplified.len() - 1];
+            if a.layer == b.layer
+                && b.layer == node.layer
+                && ((a.x == b.x && b.x == node.x) || (a.y == b.y && b.y == node.y))
+            {
+                simplified.pop();
+            }
+        }
+        simplified.push(node);
+    }
+    let path = simplified;
     let mut candidate = Vec::new();
     for pair in path.windows(2) {
         let start = (xs[pair[0].x], ys[pair[0].y]);
         let end = (xs[pair[1].x], ys[pair[1].y]);
         if pair[0].layer == pair[1].layer {
-            candidate.push(line_shape(
+            candidate.push(track_line_shape(
                 start,
                 end,
                 PhysicalLayer::Metal(pair[0].layer),
-                Some(net),
+                net,
                 rules,
             ));
         } else {
@@ -4194,7 +4290,7 @@ fn multilayer_track_search(
     for shape in &mut candidate {
         snap_shape_to_grid(shape, grid);
     }
-    candidate.retain(|shape| !exact_shape_exists(shapes, shape));
+    candidate.retain(|shape| !exists(shape));
     routing_candidate_is_legal(canvas, &candidate, rules, "open-track-route").then_some(candidate)
 }
 
@@ -4306,6 +4402,28 @@ fn repair_disconnected_routing(
             if islands.len() <= 1 {
                 break;
             }
+            // Candidate families repeatedly test identical vias and landings.
+            // Index this net once per island merge instead of scanning the chip
+            // for every segment of every trial path.
+            let grid = rules.manufacturing_grid_um;
+            let key = |shape: &PhysicalShape| {
+                (
+                    shape.layer,
+                    (shape.x / (grid / 2.0)).round() as i64,
+                    (shape.y / (grid / 2.0)).round() as i64,
+                    (shape.width / grid).round() as i64,
+                    (shape.height / grid).round() as i64,
+                )
+            };
+            let mut existing = HashMap::<_, Vec<PhysicalShape>>::new();
+            for shape in shapes.iter().filter(|shape| shape.net == Some(net.id)) {
+                existing.entry(key(shape)).or_default().push(shape.clone());
+            }
+            let exists = |shape: &PhysicalShape| {
+                existing
+                    .get(&key(shape))
+                    .is_some_and(|bucket| exact_shape_exists(bucket, shape))
+            };
             let left = &islands[0];
             let mut committed = false;
             'islands: for right in islands.iter().skip(1).take(1) {
@@ -4694,7 +4812,7 @@ fn repair_disconnected_routing(
                             for shape in &mut candidate {
                                 snap_shape_to_grid(shape, rules.manufacturing_grid_um);
                             }
-                            candidate.retain(|shape| !exact_shape_exists(shapes, shape));
+                            candidate.retain(|shape| !exists(shape));
                             if candidate.is_empty() {
                                 continue;
                             }
@@ -4769,6 +4887,7 @@ fn repair_disconnected_routing(
                                 | PhysicalShapePurpose::Contact
                                 | PhysicalShapePurpose::DeviceLanding
                                 | PhysicalShapePurpose::Pin
+                                | PhysicalShapePurpose::Pad
                                 | PhysicalShapePurpose::Tap
                         )
                     })
@@ -4785,6 +4904,7 @@ fn repair_disconnected_routing(
                                 | PhysicalShapePurpose::Contact
                                 | PhysicalShapePurpose::DeviceLanding
                                 | PhysicalShapePurpose::Pin
+                                | PhysicalShapePurpose::Pad
                                 | PhysicalShapePurpose::Tap
                         )
                     })
@@ -4801,6 +4921,7 @@ fn repair_disconnected_routing(
                                 | PhysicalShapePurpose::Contact
                                 | PhysicalShapePurpose::DeviceLanding
                                 | PhysicalShapePurpose::Pin
+                                | PhysicalShapePurpose::Pad
                                 | PhysicalShapePurpose::Tap
                         )
                     })
@@ -4817,6 +4938,7 @@ fn repair_disconnected_routing(
                                 | PhysicalShapePurpose::Contact
                                 | PhysicalShapePurpose::DeviceLanding
                                 | PhysicalShapePurpose::Pin
+                                | PhysicalShapePurpose::Pad
                                 | PhysicalShapePurpose::Tap
                         )
                     })
@@ -4881,15 +5003,8 @@ fn repair_disconnected_routing(
                             for shape in &mut candidate {
                                 snap_shape_to_grid(shape, rules.manufacturing_grid_um);
                             }
-                            candidate.retain(|shape| !exact_shape_exists(shapes, shape));
-                            if candidate.is_empty()
-                                || !routing_candidate_is_legal(
-                                    &canvas,
-                                    &candidate,
-                                    rules,
-                                    "open-launch-repair",
-                                )
-                            {
+                            candidate.retain(|shape| !exists(shape));
+                            if candidate.is_empty() {
                                 continue;
                             }
                             let route_length = candidate
@@ -4915,7 +5030,17 @@ fn repair_disconnected_routing(
                                                 < (*best_shapes, *best_layer))
                                 },
                             );
-                            if better {
+                            // Score is independent of legality. A candidate
+                            // that cannot improve the current legal winner
+                            // needs no expensive spatial collision queries.
+                            if better
+                                && routing_candidate_is_legal(
+                                    &canvas,
+                                    &candidate,
+                                    rules,
+                                    "open-launch-repair",
+                                )
+                            {
                                 best_launch_repair =
                                     Some((score, candidate.len(), *route_layer, candidate));
                             }
@@ -5121,7 +5246,9 @@ fn prune_orphan_routing(shapes: &mut Vec<PhysicalShape>, rules: &PhysicalRuleDec
             // rejected/dangling branch alive during final cleanup.
             let is_pin = matches!(
                 shape.purpose,
-                PhysicalShapePurpose::Pin | PhysicalShapePurpose::PowerRail
+                PhysicalShapePurpose::Pin
+                    | PhysicalShapePurpose::Pad
+                    | PhysicalShapePurpose::PowerRail
             ) || (shape.purpose == PhysicalShapePurpose::Unknown
                 && shape.component_id.is_some()
                 && !is_internal_route_shape(shape));
@@ -5147,13 +5274,13 @@ fn prune_orphan_routing(shapes: &mut Vec<PhysicalShape>, rules: &PhysicalRuleDec
                     let shape = &shapes[**index];
                     shape.layer == PhysicalLayer::Metal(1)
                         && shape.net == contact.net
-                        && shapes_touch(shape, contact, grid / 2.0)
+                        && contains_shape(shape, contact, rules.contact.enclosure_um)
                 })
                 .min_by(|left, right| {
                     let rank = |shape: &PhysicalShape| match shape.purpose {
                         PhysicalShapePurpose::DeviceLanding => 0,
                         PhysicalShapePurpose::ViaLanding => 1,
-                        PhysicalShapePurpose::Pin => 2,
+                        PhysicalShapePurpose::Pin | PhysicalShapePurpose::Pad => 2,
                         _ => 3,
                     };
                     rank(&shapes[**left])
@@ -5286,7 +5413,17 @@ fn trim_metal_overhangs(shapes: &mut Vec<PhysicalShape>, rules: &PhysicalRuleDec
         // Device landings and external pins are immutable terminals. Internal
         // route markers, however, are provenance rather than terminals and
         // must not exempt M1 access branches from final overhang cleanup.
-        if shape.net.is_none() || (shape.component_id.is_some() && !is_generated_route_shape(shape))
+        if shape.net.is_none()
+            || matches!(
+                shape.purpose,
+                PhysicalShapePurpose::DeviceLanding
+                    | PhysicalShapePurpose::ViaLanding
+                    | PhysicalShapePurpose::Pin
+                    | PhysicalShapePurpose::Pad
+                    | PhysicalShapePurpose::PowerRail
+                    | PhysicalShapePurpose::Tap
+            )
+            || (shape.component_id.is_some() && !is_generated_route_shape(shape))
         {
             continue;
         }
@@ -5822,17 +5959,17 @@ fn route_endpoint_is_justified(
         // An exact duplicate cannot justify either copy's endpoint. Counting
         // it as a continuation hid coincident rejected-route remnants.
         if shape.layer == other.layer
-            && (shape.x - other.x).abs() <= epsilon
-            && (shape.y - other.y).abs() <= epsilon
-            && (shape.width - other.width).abs() <= epsilon
-            && (shape.height - other.height).abs() <= epsilon
+            && (shape.x - other.x).abs() <= 1e-9
+            && (shape.y - other.y).abs() <= 1e-9
+            && (shape.width - other.width).abs() <= 1e-9
+            && (shape.height - other.height).abs() <= 1e-9
         {
             return false;
         }
-        endpoint_x + probe_half_width >= other.x - other.width / 2.0
-            && endpoint_x - probe_half_width <= other.x + other.width / 2.0
-            && endpoint_y + probe_half_height >= other.y - other.height / 2.0
-            && endpoint_y - probe_half_height <= other.y + other.height / 2.0
+        endpoint_x + probe_half_width + 1e-9 >= other.x - other.width / 2.0
+            && endpoint_x - probe_half_width - 1e-9 <= other.x + other.width / 2.0
+            && endpoint_y + probe_half_height + 1e-9 >= other.y - other.height / 2.0
+            && endpoint_y - probe_half_height - 1e-9 <= other.y + other.height / 2.0
     })
 }
 
@@ -5846,6 +5983,7 @@ fn unjustified_route_endpoints(shapes: &[PhysicalShape], grid: f64) -> Vec<Physi
             || matches!(
                 shape.purpose,
                 PhysicalShapePurpose::Pin
+                    | PhysicalShapePurpose::Pad
                     | PhysicalShapePurpose::PowerRail
                     | PhysicalShapePurpose::DeviceLanding
                     | PhysicalShapePurpose::Tap
@@ -5959,6 +6097,7 @@ fn route_quality(shapes: &[PhysicalShape], grid: f64) -> PhysicalRouteQualityRep
                 shape.purpose,
                 PhysicalShapePurpose::DeviceLanding
                     | PhysicalShapePurpose::Pin
+                    | PhysicalShapePurpose::Pad
                     | PhysicalShapePurpose::Tap
             )
         })
@@ -6055,6 +6194,7 @@ fn route_quality(shapes: &[PhysicalShape], grid: f64) -> PhysicalRouteQualityRep
                     route.purpose,
                     PhysicalShapePurpose::DeviceLanding
                         | PhysicalShapePurpose::Pin
+                        | PhysicalShapePurpose::Pad
                         | PhysicalShapePurpose::PowerRail
                         | PhysicalShapePurpose::Tap
                 ) || shapes.iter().any(|terminal| {
@@ -6175,7 +6315,7 @@ fn route_quality(shapes: &[PhysicalShape], grid: f64) -> PhysicalRouteQualityRep
     }
 }
 
-fn density_fill_layer(name: &str, technology: &Technology) -> Option<PhysicalLayer> {
+pub(crate) fn density_fill_layer(name: &str, technology: &Technology) -> Option<PhysicalLayer> {
     match name {
         "active" => Some(PhysicalLayer::Ndiff),
         "poly" => Some(PhysicalLayer::Poly),
@@ -6312,7 +6452,7 @@ fn add_tapeout_perimeter_geometry(
             height: pad.height_um,
             component_id: bound_pin.map(|pin| pin.component_id),
             net,
-            purpose: PhysicalShapePurpose::Pin,
+            purpose: PhysicalShapePurpose::Pad,
         });
         if stitch_supplies
             && matches!(
@@ -6347,6 +6487,7 @@ fn add_tapeout_perimeter_geometry(
         });
         for ring in tapeout.rings.iter().filter(|ring| ring.net == *role) {
             for y in [-height / 2.0 + ring.inset_um, height / 2.0 - ring.inset_um] {
+                let first = shapes.len();
                 add_via_stack(
                     shapes,
                     (*x, y),
@@ -6355,12 +6496,27 @@ fn add_tapeout_perimeter_geometry(
                     net,
                     &technology.physical_rules,
                 );
+                if let Some(opening) = &technology.gds_layers.pad_opening {
+                    let under_pad = shapes[..first].iter().any(|pad| {
+                        pad.purpose == PhysicalShapePurpose::Pad
+                            && (*x - pad.x).abs() < pad.width / 2.0 - opening.inset_um
+                            && (y - pad.y).abs() < pad.height / 2.0 - opening.inset_um
+                    });
+                    if under_pad {
+                        for landing in &mut shapes[first..] {
+                            if matches!(landing.layer, PhysicalLayer::Metal(_)) {
+                                landing.width = landing.width.max(opening.underlying_metal_min_width_um);
+                                landing.height = landing.height.max(opening.underlying_metal_min_width_um);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-fn density_fill_obstacle(
+pub(crate) fn density_fill_obstacle(
     material: &str,
     candidate: &PhysicalShape,
     shape: &PhysicalShape,
@@ -6457,7 +6613,7 @@ fn density_material_shape(material: &str, layer: PhysicalLayer, shape: &Physical
     }
 }
 
-fn rectangle_union_area(
+pub(crate) fn rectangle_union_area(
     shapes: &[PhysicalShape],
     material: &str,
     layer: PhysicalLayer,
@@ -6514,7 +6670,7 @@ fn rectangle_union_area(
         .sum()
 }
 
-fn sliding_density_windows(
+pub(crate) fn sliding_density_windows(
     bounds: &PhysicalBounds,
     requested_width: Option<f64>,
     requested_height: Option<f64>,
@@ -7004,49 +7160,17 @@ fn expand_well_fabric_to_floorplan(
         snap_shape_to_grid(substrate, grid);
     }
 
-    let mut wells = shapes
-        .iter()
+    // Preserve the placed bank's actual, snapped stripe boundaries. Repeating
+    // the first stripe height accumulates grid rounding across unequal rows
+    // and creates a thin extra opposite-polarity stripe at the bank edge.
+    let _ = bank_vertical_bounds;
+    for well in shapes
+        .iter_mut()
         .filter(|shape| matches!(shape.layer, PhysicalLayer::Nwell | PhysicalLayer::Pwell))
-        .cloned()
-        .collect::<Vec<_>>();
-    if wells.is_empty() {
-        return;
-    }
-    wells.sort_by(|left, right| left.y.total_cmp(&right.y));
-    let stripe_height = wells[0].height;
-    let original_top = wells[0].y - stripe_height / 2.0;
-    let first_layer = wells[0].layer;
-    shapes.retain(|shape| !matches!(shape.layer, PhysicalLayer::Nwell | PhysicalLayer::Pwell));
-
-    let (bank_top, bank_bottom) = bank_vertical_bounds.unwrap_or((bounds.min_y, bounds.max_y));
-    let first_index = ((bank_top - original_top) / stripe_height).floor() as i64;
-    let last_index = ((bank_bottom - original_top) / stripe_height).ceil() as i64 - 1;
-    for index in first_index..=last_index {
-        let stripe_top = (original_top + index as f64 * stripe_height).max(bank_top);
-        let stripe_bottom = (original_top + (index + 1) as f64 * stripe_height).min(bank_bottom);
-        if stripe_bottom - stripe_top < grid {
-            continue;
-        }
-        let even = index.rem_euclid(2) == 0;
-        let layer = if even {
-            first_layer
-        } else if first_layer == PhysicalLayer::Nwell {
-            PhysicalLayer::Pwell
-        } else {
-            PhysicalLayer::Nwell
-        };
-        let mut stripe = PhysicalShape {
-            layer,
-            x: center_x,
-            y: (stripe_top + stripe_bottom) / 2.0,
-            width,
-            height: stripe_bottom - stripe_top,
-            component_id: None,
-            net: None,
-            purpose: PhysicalShapePurpose::Fabric,
-        };
-        snap_shape_to_grid(&mut stripe, grid);
-        shapes.push(stripe);
+    {
+        well.x = center_x;
+        well.width = width;
+        snap_shape_to_grid(well, grid);
     }
 }
 
@@ -8013,6 +8137,9 @@ fn normalize_with_progress(
         );
         deduplicate_exact_vias(&mut shapes, grid);
     }
+    // Perimeter supply repair can create new bends and short same-net gaps.
+    // Refine those unions before admitting density fill around them.
+    fill_same_net_metal_notches(&mut shapes, &project.technology.physical_rules);
     let density_bounds = if perimeter_before_density
         && !project
             .technology
@@ -8024,7 +8151,11 @@ fn normalize_with_progress(
     } else {
         &bounds
     };
-    let density = add_process_density_fill(&mut shapes, density_bounds, &project.technology);
+    let (density_arrays, density) = if project.technology.physical_rules.density_fill.use_arrays {
+        crate::density_arrays::generate(&shapes, density_bounds, &project.technology)?
+    } else {
+        (Vec::new(), add_process_density_fill(&mut shapes, density_bounds, &project.technology))
+    };
     if !perimeter_before_density {
         add_tapeout_perimeter_geometry(&mut shapes, &mut bounds, &pins, &project.technology);
         deduplicate_exact_vias(&mut shapes, grid);
@@ -8071,6 +8202,7 @@ fn normalize_with_progress(
         timing,
         tapeout,
         density,
+        density_arrays,
         bounds,
         shapes,
         row_topology,
@@ -8154,6 +8286,112 @@ mod tests {
     };
     use std::collections::{HashMap, HashSet};
     use uuid::Uuid;
+
+    #[test]
+    #[ignore = "requires OPENCHIPPY_LAYOUT_FIXTURE and OPENCHIPPY_LAYOUT_OUTPUT paths"]
+    fn saved_layout_route_closure() {
+        let input = std::env::var("OPENCHIPPY_LAYOUT_FIXTURE").unwrap();
+        let output = std::env::var("OPENCHIPPY_LAYOUT_OUTPUT").unwrap();
+        let mut ir: super::PhysicalLayoutIr =
+            serde_json::from_str(&std::fs::read_to_string(input).unwrap()).unwrap();
+        let technology = Technology::from_yaml(include_str!(
+            "../../docs/examples/gf180mcu-3v3-5m-openchippy.yaml"
+        ))
+        .unwrap();
+        ir.shapes
+            .retain(|s| s.purpose != PhysicalShapePurpose::DummyFill);
+        let start = std::time::Instant::now();
+        super::repair_disconnected_routing(
+            &mut ir.shapes,
+            &ir.nets,
+            &technology.physical_rules,
+            true,
+        );
+        super::trim_metal_overhangs(&mut ir.shapes, &technology.physical_rules);
+        super::prune_orphan_routing(&mut ir.shapes, &technology.physical_rules);
+        let report = physical_drc::validate(&ir, &technology);
+        eprintln!("closure {:?}: {:?}", start.elapsed(), report.diagnostics);
+        std::fs::write(output, serde_json::to_vec(&ir).unwrap()).unwrap();
+        assert_eq!(report.error_count, 0);
+    }
+
+    #[test]
+    fn grid_snapping_preserves_cut_sizes_and_is_idempotent() {
+        let technology = Technology::from_yaml(include_str!(
+            "../../docs/examples/gf180mcu-3v3-5m-openchippy.yaml"
+        )).unwrap();
+        for i in -2000..2000 {
+            for width in [0.23, 0.26, 0.44] {
+                let mut shape = PhysicalShape {
+                    layer: PhysicalLayer::Via(4),
+                    x: i as f64 * 0.0025,
+                    y: -i as f64 * 0.0025,
+                    width,
+                    height: width,
+                    component_id: None,
+                    net: Some(1),
+                    purpose: PhysicalShapePurpose::Route,
+                };
+                super::snap_shape_to_grid(&mut shape, 0.005);
+                assert!((shape.width - width).abs() < 1e-9);
+                assert!((shape.height - width).abs() < 1e-9);
+                let snapped = shape.clone();
+                super::snap_shape_to_grid(&mut shape, 0.005);
+                assert!((shape.x - snapped.x).abs() < 1e-9);
+                assert!((shape.y - snapped.y).abs() < 1e-9);
+            }
+            let point = (i as f64 * 0.0025, -i as f64 * 0.0025);
+            let mut stack = Vec::new();
+            super::add_via_stack(&mut stack, point, 2, 3, 1, &technology.physical_rules);
+            for shape in &mut stack {
+                super::snap_shape_to_grid(shape, 0.005);
+            }
+            let cut = stack.iter().find(|s| matches!(s.layer, PhysicalLayer::Via(_))).unwrap();
+            for landing in stack.iter().filter(|s| matches!(s.layer, PhysicalLayer::Metal(_))) {
+                assert!(super::contains_shape(landing, cut, 0.06), "{landing:?} {cut:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn well_expansion_preserves_unequal_snapped_stripes_without_slivers() {
+        let mut top = 0.0;
+        let mut shapes = Vec::new();
+        for (i, height) in [1.0, 1.005, 1.0, 1.005].into_iter().enumerate() {
+            shapes.push(PhysicalShape {
+                layer: if i % 2 == 0 {
+                    PhysicalLayer::Nwell
+                } else {
+                    PhysicalLayer::Pwell
+                },
+                x: 0.0,
+                y: top + height / 2.0,
+                width: 1.0,
+                height,
+                component_id: None,
+                net: None,
+                purpose: PhysicalShapePurpose::Fabric,
+            });
+            top += height;
+        }
+        let old = shapes.clone();
+        let bounds = PhysicalBounds {
+            min_x: -5.0,
+            max_x: 5.0,
+            min_y: 0.0,
+            max_y: top,
+        };
+        let mut rules = Technology::default().physical_rules;
+        rules.manufacturing_grid_um = 0.005;
+        super::expand_well_fabric_to_floorplan(&mut shapes, &bounds, Some((0.0, top)), &rules);
+        assert_eq!(shapes.len(), 4);
+        for (before, after) in old.iter().zip(&shapes) {
+            assert_eq!(before.layer, after.layer);
+            assert!((before.y - after.y).abs() < 1e-9);
+            assert!((before.height - after.height).abs() < 1e-9);
+            assert!((after.width - 10.0).abs() < 1e-9);
+        }
+    }
 
     #[test]
     fn process_density_fill_is_deterministic_and_electrically_inert() {
@@ -10007,6 +10245,11 @@ mod tests {
         assert!(shapes[0].width < 2.5);
         assert_eq!(shapes[3].width, 0.30);
         assert_eq!(shapes[3].height, 0.30);
+        shapes[0].width = 10.0;
+        shapes[0].component_id = None;
+        shapes[0].purpose = PhysicalShapePurpose::DeviceLanding;
+        assert_eq!(trim_metal_overhangs(&mut shapes, &rules), 0);
+        assert_eq!(shapes[0].width, 10.0);
     }
 
     #[test]
@@ -10165,7 +10408,7 @@ mod tests {
         assert_eq!(ir.bounds.max_y, 1_760.0);
         assert!(ir.shapes.iter().any(|shape| {
             shape.component_id == Some(input)
-                && shape.purpose == PhysicalShapePurpose::Pin
+                && shape.purpose.is_pin()
                 && shape.layer == PhysicalLayer::Metal(5)
                 && (shape.x + 1_430.0).abs() < 1e-9
                 && (shape.y + 1_320.0).abs() < 1e-9
@@ -10208,7 +10451,7 @@ mod tests {
             ir.shapes
                 .iter()
                 .filter(|shape| {
-                    shape.purpose == PhysicalShapePurpose::Pin
+                    shape.purpose.is_pin()
                         && shape.component_id.is_none()
                         && matches!(shape.width, 60.0 | 80.0)
                         && matches!(shape.height, 60.0 | 80.0)
@@ -10972,8 +11215,8 @@ mod tests {
         assert_eq!(super::fill_same_net_metal_notches(&mut shapes, &rules), 1);
         let fill = &shapes[2];
         assert_eq!(fill.purpose, PhysicalShapePurpose::RouteFill);
-        assert!((fill.x - 2.115).abs() < 1e-9);
-        assert!((fill.y - 5.17).abs() < 1e-9);
+        assert!((fill.x - 2.115).abs() <= rules.manufacturing_grid_um / 2.0 + 1e-9);
+        assert!((fill.y - 5.17).abs() <= rules.manufacturing_grid_um / 2.0 + 1e-9);
         assert!(fill.width >= 0.23 - 1e-9);
         assert!(fill.height >= 0.23 - 1e-9);
         assert!(fill.width <= 0.23 + 2.0 * rules.manufacturing_grid_um + 1e-9);

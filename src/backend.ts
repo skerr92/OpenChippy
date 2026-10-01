@@ -226,16 +226,16 @@ export async function validateProject(): Promise<ValidationReport> {
   return invoke("validate_project");
 }
 
-export async function parseVerilog(source: string): Promise<RtlModule> {
-  return invoke("parse_verilog", { source });
+export async function parseVerilog(source: string, top = "", frontend = "auto", compilerPath = ""): Promise<RtlModule> {
+  return invoke("parse_verilog", { source, top, frontend, compilerPath });
 }
 
 export async function readVerilogSource(path: string): Promise<string> {
   return invoke("read_verilog_source", { path });
 }
 
-export async function importVerilog(source: string): Promise<WorkspaceState> {
-  return invoke("import_verilog", { source });
+export async function importVerilog(source: string, top = "", frontend = "auto", compilerPath = ""): Promise<WorkspaceState> {
+  return invoke("import_verilog", { source, top, frontend, compilerPath });
 }
 
 export async function exportVerilog(): Promise<string> {

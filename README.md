@@ -33,7 +33,7 @@ simulator, or production place-and-route software.
   decoders. GF180 output still requires official foundry DRC/LVS.
 - Generate a compact physical layout, inspect process layers in 3D, run physical design
   checks, isolate violations, and export a report.
-- Import a useful, deliberately limited subset of Verilog, inspect its logical structure,
+- Import synthesizable Verilog/SystemVerilog through Yosys or slang, inspect its logical structure,
   simulate supported designs, and export the preserved RTL again.
 
 ## Project files
@@ -91,37 +91,39 @@ physical pin labels. Broader tool qualification remains in progress.
 
 ## RTL support and limitations
 
-OpenChippy's RTL importer is intentionally smaller than a full Verilog or SystemVerilog
-compiler. It is designed to preserve supported source clearly and reject unsupported code
-instead of silently changing its meaning.
+OpenChippy can elaborate synthesizable Verilog with Yosys and broader SystemVerilog
+with the Yosys slang plugin. In **Import Verilog**, select the compiler, optionally
+enter the top module, and set the Yosys executable path. The path is remembered on
+this computer. `OPENCHIPPY_YOSYS` or a `yosys` executable on `PATH` also works.
+Auto uses Yosys when available and otherwise uses the built-in subset parser.
+Compilers are installed separately; an OSS CAD Suite installation with slang is
+suitable for the SystemVerilog option.
 
-Currently supported:
+Compiler-backed import supports linked modules in one source, parameters,
+preprocessor macros, generate loops, functions, signed arithmetic, variable
+selection, and synthesizable memories. Registers include enables, synchronous
+and asynchronous resets, simultaneous nonblocking updates, and synthesized
+initial values. Slang additionally handles synthesizable packages, packed
+structs, and `always_comb`. Imported logic can be inspected and simulated;
+export preserves the original source exactly.
 
-- One module per imported source.
-- ANSI and classic module ports, scalar signals, and fixed packed vectors.
-- Built-in gates such as `and`, `or`, `xor`, `nand`, `nor`, `xnor`, `not`, and `buf`.
-- Continuous assignments with a bounded set of arithmetic and bitwise expressions.
-- Integer parameters, parameter-based vector widths, and parameter overrides on referenced
-  cells.
-- Constant bit selection, concatenation, and constant or parameter-counted replication.
-- Simple `always_comb` and `always @*` logic with bounded blocking assignments,
-  `if`/`else`, and `case` statements.
-- Simple edge-triggered `always` and `always_ff` registers with one nonblocking assignment.
-- Waveform simulation for the supported combinational and sequential forms.
+The built-in parser remains available for small designs without an external
+compiler. It supports one module, fixed vectors, primitive gates, assignments,
+and simple combinational or single-assignment clocked processes.
 
-Not yet supported:
+Limits remain explicit: this is a hardware elaboration flow, not an unrestricted
+Verilog testbench simulator. Delays, classes, force/release, arbitrary file I/O,
+tri-state/inout ports, latches, and cells without simulator models are unsupported.
+Source bundles currently use one text file; there is no project file-list or
+include-directory UI. Compiler support does not yet convert RTL into transistor
+schematics or manufacture-ready layout. Imports are bounded to 16 MiB source,
+100,000 cells, and a 120-second compiler run.
 
-- Multi-module source bundles or descending into linked child-module definitions.
-- General SystemVerilog syntax, interfaces, packages, classes, or advanced types.
-- `generate`, `defparam`, arbitrary constant functions, or full parameter elaboration.
-- General part selects, signed arithmetic rules, shifts, unpacked arrays, and memories.
-- Clocked blocks with reset/enable branches, multiple statements, or mixed assignment
-  styles.
-- `initial` blocks, delays, tasks, `force`, or unrestricted testbench code.
-- Converting imported RTL directly into transistor schematics or final physical layout.
+Compiler integration regressions can be run with:
 
-These items are tracked in Milestone 7 alongside Yosys and ABC synthesis integration. See
-the [roadmap](docs/roadmap.md) for the planned order.
+```sh
+OPENCHIPPY_YOSYS=/path/to/yosys cargo test --manifest-path src-tauri/Cargo.toml rtl_compiler -- --include-ignored
+```
 
 ## Build from source
 

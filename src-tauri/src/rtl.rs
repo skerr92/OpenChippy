@@ -11,8 +11,8 @@ pub enum RtlPortDirection {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RtlRange {
-    pub msb: usize,
-    pub lsb: usize,
+    pub msb: i64,
+    pub lsb: i64,
     #[serde(default)]
     pub msb_expression: Option<String>,
     #[serde(default)]
@@ -21,14 +21,14 @@ pub struct RtlRange {
 
 impl RtlRange {
     pub fn width(&self) -> usize {
-        self.msb.abs_diff(self.lsb) + 1
+        self.msb.abs_diff(self.lsb).saturating_add(1) as usize
     }
 
-    fn contains(&self, index: usize) -> bool {
+    fn contains(&self, index: i64) -> bool {
         index >= self.msb.min(self.lsb) && index <= self.msb.max(self.lsb)
     }
 
-    fn indices(&self) -> Box<dyn Iterator<Item = usize>> {
+    fn indices(&self) -> Box<dyn Iterator<Item = i64>> {
         if self.msb >= self.lsb {
             Box::new((self.lsb..=self.msb).rev())
         } else {
@@ -116,6 +116,13 @@ pub struct RtlParameterOverride {
 #[serde(rename_all = "camelCase")]
 pub struct RtlModule {
     pub name: String,
+    /// Original compilation unit, retained for lossless export after elaboration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiler: Option<String>,
+    #[serde(default)]
+    pub initial_values: std::collections::BTreeMap<String, bool>,
     #[serde(default)]
     pub parameters: Vec<RtlParameter>,
     pub ports: Vec<RtlPort>,
@@ -150,6 +157,16 @@ pub struct RtlSequentialProcess {
     pub target: String,
     pub expression: String,
     pub referenced_signals: Vec<String>,
+    #[serde(default)]
+    pub asynchronous_reset: Option<RtlAsyncReset>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RtlAsyncReset {
+    pub signal: String,
+    pub active_high: bool,
+    pub value: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -177,43 +194,48 @@ pub fn map_module(module: RtlModule) -> RtlDesign {
             instance.connections.first().map(|net| (net.clone(), index))
         })
         .collect::<HashMap<_, _>>();
+    // Elaborated netlists may contain long chains in arbitrary cell order.
+    // A dependency queue avoids rescanning every unresolved cell per level.
     let mut levels = vec![None; module.instances.len()];
-    let mut unresolved = (0..module.instances.len()).collect::<Vec<_>>();
-    while !unresolved.is_empty() {
-        let before = unresolved.len();
-        unresolved.retain(|index| {
-            let dependencies = module.instances[*index]
-                .connections
-                .iter()
-                .skip(1)
-                .filter_map(|net| output_driver.get(net).copied())
-                .collect::<Vec<_>>();
-            if dependencies
-                .iter()
-                .all(|dependency| levels[*dependency].is_some())
-            {
-                levels[*index] = Some(
-                    dependencies
-                        .iter()
-                        .filter_map(|dependency| levels[*dependency])
-                        .max()
-                        .map_or(0, |level| level + 1),
-                );
-                false
-            } else {
-                true
+    let mut pending = vec![0usize; module.instances.len()];
+    let mut users = vec![Vec::new(); module.instances.len()];
+    let mut next_levels = vec![0usize; module.instances.len()];
+    for (index, instance) in module.instances.iter().enumerate() {
+        for dependency in instance
+            .connections
+            .iter()
+            .skip(1)
+            .filter_map(|net| output_driver.get(net))
+        {
+            pending[index] += 1;
+            users[*dependency].push(index);
+        }
+    }
+    let mut ready = pending
+        .iter()
+        .enumerate()
+        .filter_map(|(index, count)| (*count == 0).then_some(index))
+        .collect::<std::collections::VecDeque<_>>();
+    while let Some(index) = ready.pop_front() {
+        let level = next_levels[index];
+        levels[index] = Some(level);
+        for user in &users[index] {
+            next_levels[*user] = next_levels[*user].max(level + 1);
+            pending[*user] -= 1;
+            if pending[*user] == 0 {
+                ready.push_back(*user);
             }
-        });
-        if unresolved.len() == before {
-            let fallback = levels
-                .iter()
-                .flatten()
-                .copied()
-                .max()
-                .map_or(0, |level| level + 1);
-            for index in unresolved.drain(..) {
-                levels[index] = Some(fallback);
-            }
+        }
+    }
+    let fallback = levels
+        .iter()
+        .flatten()
+        .copied()
+        .max()
+        .map_or(0, |level| level + 1);
+    for level in &mut levels {
+        if level.is_none() {
+            *level = Some(fallback);
         }
     }
     let mut rows = HashMap::<usize, usize>::new();
@@ -359,7 +381,9 @@ fn tokenize(source: &str) -> Result<Vec<Token>, String> {
             while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
                 number.push(chars.next().unwrap());
             }
-            tokens.push(Token::Number(number.parse().unwrap()));
+            tokens.push(Token::Number(number.parse().map_err(|_| {
+                "integer literal exceeds the built-in parser range; use Yosys".to_string()
+            })?));
             continue;
         }
         if "(),;=~[]:'#.+-*/&|^@?<{}".contains(character) {
@@ -433,9 +457,12 @@ impl Parser {
         if msb < 0 || lsb < 0 {
             return Err("packed range bounds must elaborate to non-negative integers".into());
         }
+        if msb.abs_diff(lsb) >= 65536 {
+            return Err("packed ranges are limited to 65,536 bits".into());
+        }
         Ok(Some(RtlRange {
-            msb: msb as usize,
-            lsb: lsb as usize,
+            msb,
+            lsb,
             msb_expression: Some(msb_expression),
             lsb_expression: Some(lsb_expression),
         }))
@@ -481,7 +508,9 @@ impl Parser {
                 if divisor == 0 {
                     return Err("parameter expression divides by zero".into());
                 }
-                value /= divisor;
+                value = value
+                    .checked_div(divisor)
+                    .ok_or("parameter expression overflowed")?;
             } else {
                 return Ok(value);
             }
@@ -505,7 +534,8 @@ impl Parser {
         match self.tokens.get(self.cursor).cloned() {
             Some(Token::Number(value)) => {
                 self.cursor += 1;
-                Ok(value as i64)
+                i64::try_from(value)
+                    .map_err(|_| "parameter value exceeds the signed 64-bit range".into())
             }
             Some(Token::Ident(name)) => {
                 self.cursor += 1;
@@ -875,6 +905,7 @@ impl Parser {
             target,
             expression,
             referenced_signals,
+            asynchronous_reset: None,
         })
     }
 }
@@ -950,7 +981,12 @@ pub fn parse_structural_verilog(source: &str) -> Result<RtlModule, String> {
             if parser.peek_ident("wire") || parser.peek_ident("logic") || parser.peek_ident("reg") {
                 parser.cursor += 1;
             }
-            if parser.peek_ident("signed") || parser.peek_ident("unsigned") {
+            if parser.peek_ident("signed") {
+                return Err(
+                    "Signed declarations require the Yosys or slang compiler frontend".into(),
+                );
+            }
+            if parser.peek_ident("unsigned") {
                 parser.cursor += 1;
             }
             current_range = parser.optional_range(&parameter_values)?;
@@ -990,7 +1026,12 @@ pub fn parse_structural_verilog(source: &str) -> Result<RtlModule, String> {
             if parser.peek_ident("wire") || parser.peek_ident("logic") || parser.peek_ident("reg") {
                 parser.cursor += 1;
             }
-            if parser.peek_ident("signed") || parser.peek_ident("unsigned") {
+            if parser.peek_ident("signed") {
+                return Err(
+                    "Signed declarations require the Yosys or slang compiler frontend".into(),
+                );
+            }
+            if parser.peek_ident("unsigned") {
                 parser.cursor += 1;
             }
             let range = parser.optional_range(&parameter_values)?;
@@ -1349,6 +1390,9 @@ pub fn parse_structural_verilog(source: &str) -> Result<RtlModule, String> {
     }
     Ok(RtlModule {
         name,
+        source: None,
+        compiler: None,
+        initial_values: Default::default(),
         parameters,
         ports,
         nets,
@@ -1358,12 +1402,15 @@ pub fn parse_structural_verilog(source: &str) -> Result<RtlModule, String> {
     })
 }
 
-fn parse_bit_name(value: &str) -> Option<(&str, usize)> {
+fn parse_bit_name(value: &str) -> Option<(&str, i64)> {
     let (base, suffix) = value.split_once('[')?;
     Some((base, suffix.strip_suffix(']')?.parse().ok()?))
 }
 
 pub fn export_structural_verilog(module: &RtlModule) -> String {
+    if let Some(source) = &module.source {
+        return source.clone();
+    }
     fn identifier(value: &str) -> String {
         let mut characters = value.chars();
         let legal = characters
@@ -1653,6 +1700,13 @@ mod tests {
 
     #[test]
     fn parameter_elaboration_rejects_duplicates_cycles_and_invalid_widths() {
+        for source in [
+            "module signed_port(input signed [3:0] A); endmodule",
+            "module huge #(parameter W=999999999999999999999999999999999)(input A); endmodule",
+            "module huge_range(input [1000000000:0] A); endmodule",
+        ] {
+            assert!(parse_structural_verilog(source).is_err());
+        }
         assert!(parse_structural_verilog(
             "module duplicate #(parameter W = 2, parameter W = 3)(input A); endmodule"
         )
@@ -1687,6 +1741,28 @@ mod tests {
         assert_eq!(first.placements[0].level, 0);
         assert_eq!(first.placements[1].level, 1);
         assert!(first.placements[1].x > first.placements[0].x);
+    }
+
+    #[test]
+    fn logical_mapping_handles_reverse_order_and_feedback() {
+        let mut module =
+            parse_structural_verilog("module chain(input A, output Y); buf gate(Y,A); endmodule")
+                .unwrap();
+        module.instances = (0..10_000)
+            .rev()
+            .map(|index| super::RtlInstance {
+                name: format!("gate{index}"),
+                cell: "buf".into(),
+                primitive: Some(PrimitiveGate::Buf),
+                parameter_overrides: Vec::new(),
+                connections: vec![format!("n{}", index + 1), format!("n{index}")],
+            })
+            .collect();
+        let mapped = map_module(module.clone());
+        assert_eq!(mapped.placements[0].level, 9_999);
+        assert_eq!(mapped.placements[9_999].level, 0);
+        module.instances[9_999].connections[1] = "n10000".into();
+        assert!(map_module(module).placements.iter().all(|p| p.level == 0));
     }
 
     #[test]
