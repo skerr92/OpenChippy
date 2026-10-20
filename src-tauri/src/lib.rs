@@ -38,7 +38,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 use tauri::Emitter;
@@ -694,7 +694,7 @@ impl Workspace {
 }
 
 struct AppState {
-    workspace: Mutex<Workspace>,
+    workspace: Arc<Mutex<Workspace>>,
     simulation_memory: Mutex<Option<(String, simulation::SimulationMemory)>>,
 }
 
@@ -1733,107 +1733,123 @@ async fn save_project(
     path: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<WorkspaceState, ProjectError> {
-    let (destination, source_project, project, cached_layout) = {
-        let workspace = state
-            .workspace
-            .lock()
-            .map_err(|_| ProjectError::StateUnavailable)?;
+    let shared = Arc::clone(&state.workspace);
+    tauri::async_runtime::spawn_blocking(move || save_project_sync(path, &shared))
+        .await
+        .map_err(|error| ProjectError::InvalidAction(format!("file task failed: {error}")))?
+}
+
+// Called only on a blocking worker; native UI and async runtime threads never
+// perform project serialization, library migration, or disk I/O.
+fn save_project_sync(
+    path: Option<String>,
+    shared: &Mutex<Workspace>,
+) -> Result<WorkspaceState, ProjectError> {
+    let (destination, source_project, source_path, cache) = {
+        let workspace = shared.lock().map_err(|_| ProjectError::StateUnavailable)?;
         let destination = path
             .or_else(|| workspace.path.clone())
             .ok_or(ProjectError::MissingPath)?;
         let source_project = workspace.history.current();
-        let mut project = source_project.clone();
-        let forks_existing_project = workspace
-            .path
-            .as_deref()
-            .is_some_and(|current| Path::new(current) != Path::new(&destination));
-        if forks_existing_project {
-            project.fork_for_save_as();
-        }
-        project
-            .refresh_linked_blocks()
-            .map_err(ProjectError::InvalidAction)?;
-        let cached_layout = matching_cached_layout(&workspace.physical_cache, &project);
-        (destination, source_project, project, cached_layout)
+        (
+            destination,
+            source_project,
+            workspace.path.clone(),
+            workspace.physical_cache.clone(),
+        )
     };
+    // Refreshing definitions and digesting large cached layouts are CPU work,
+    // just like JSON serialization. Keep them outside the workspace lock.
+    let mut project = source_project.clone();
+    if source_path
+        .as_deref()
+        .is_some_and(|current| Path::new(current) != Path::new(&destination))
+    {
+        project.fork_for_save_as();
+    }
+    project
+        .refresh_linked_blocks()
+        .map_err(ProjectError::InvalidAction)?;
+    let cached_layout = matching_cached_layout(&cache, &project);
     let destination_for_task = destination.clone();
     let project_for_task = project.clone();
-    let artifact = tauri::async_runtime::spawn_blocking(
-        move || -> Result<Option<PhysicalArtifact>, ProjectError> {
-            let destination_path = Path::new(&destination_for_task);
-            if destination_path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                == Some("ochippy")
-            {
-                let root = destination_path.parent().unwrap_or_else(|| Path::new("."));
-                let stem = destination_path
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or("project");
-                let circuit_name = format!("{stem}.chippy");
-                let physical_name = format!("{stem}.chippy_gds");
-                let circuit_path = root.join(&circuit_name);
-                let physical_path = root.join(&physical_name);
-                let artifact = cached_layout
-                    .map(|physical_ir| -> Result<PhysicalArtifact, ProjectError> {
-                        Ok(PhysicalArtifact {
-                            format_version: PHYSICAL_ARTIFACT_FORMAT_VERSION,
-                            source_project_digest: project_digest(&project_for_task)?,
-                            physical_ir,
-                        })
+    let artifact = (move || -> Result<Option<PhysicalArtifact>, ProjectError> {
+        let destination_path = Path::new(&destination_for_task);
+        if destination_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("ochippy")
+        {
+            let root = destination_path.parent().unwrap_or_else(|| Path::new("."));
+            let stem = destination_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("project");
+            let circuit_name = format!("{stem}.chippy");
+            let physical_name = format!("{stem}.chippy_gds");
+            let circuit_path = root.join(&circuit_name);
+            let physical_path = root.join(&physical_name);
+            let artifact = cached_layout
+                .map(|physical_ir| -> Result<PhysicalArtifact, ProjectError> {
+                    Ok(PhysicalArtifact {
+                        format_version: PHYSICAL_ARTIFACT_FORMAT_VERSION,
+                        source_project_digest: project_digest(&project_for_task)?,
+                        physical_ir,
                     })
-                    .transpose()?;
-                fs::write(
-                    &circuit_path,
-                    serde_json::to_string_pretty(&project_for_task)?,
-                )?;
-                if let Some(artifact) = &artifact {
-                    fs::write(&physical_path, serde_json::to_string_pretty(artifact)?)?;
-                }
-                let mut included_files = vec![OchippyIncludedFile {
-                    role: "circuit".into(),
-                    path: circuit_name,
-                }];
-                if artifact.is_some() {
-                    included_files.push(OchippyIncludedFile {
-                        role: "physical".into(),
-                        path: physical_name,
-                    });
-                }
-                let manifest = OchippyManifest {
-                    format_version: OCHIPPY_FORMAT_VERSION,
-                    project_name: project_for_task.name.clone(),
-                    included_files,
-                };
-                fs::write(destination_path, serde_json::to_string_pretty(&manifest)?)?;
-                save_block_library(
-                    &circuit_path,
-                    project_for_task.project_id,
-                    &project_for_task.block_definitions,
-                )?;
-                Ok(artifact)
-            } else {
-                fs::write(
-                    destination_path,
-                    serde_json::to_string_pretty(&project_for_task)?,
-                )?;
-                save_block_library(
-                    destination_path,
-                    project_for_task.project_id,
-                    &project_for_task.block_definitions,
-                )?;
-                Ok(None)
+                })
+                .transpose()?;
+            fs::write(
+                &circuit_path,
+                serde_json::to_string_pretty(&project_for_task)?,
+            )?;
+            if let Some(artifact) = &artifact {
+                fs::write(&physical_path, serde_json::to_string_pretty(artifact)?)?;
             }
-        },
-    )
-    .await
-    .map_err(|error| ProjectError::InvalidAction(format!("file task failed: {error}")))??;
-    let mut workspace = state
-        .workspace
-        .lock()
-        .map_err(|_| ProjectError::StateUnavailable)?;
+            let mut included_files = vec![OchippyIncludedFile {
+                role: "circuit".into(),
+                path: circuit_name,
+            }];
+            if artifact.is_some() {
+                included_files.push(OchippyIncludedFile {
+                    role: "physical".into(),
+                    path: physical_name,
+                });
+            }
+            let manifest = OchippyManifest {
+                format_version: OCHIPPY_FORMAT_VERSION,
+                project_name: project_for_task.name.clone(),
+                included_files,
+            };
+            fs::write(destination_path, serde_json::to_string_pretty(&manifest)?)?;
+            save_block_library(
+                &circuit_path,
+                project_for_task.project_id,
+                &project_for_task.block_definitions,
+            )?;
+            Ok(artifact)
+        } else {
+            fs::write(
+                destination_path,
+                serde_json::to_string_pretty(&project_for_task)?,
+            )?;
+            save_block_library(
+                destination_path,
+                project_for_task.project_id,
+                &project_for_task.block_definitions,
+            )?;
+            Ok(None)
+        }
+    })()?;
+    let mut workspace = shared.lock().map_err(|_| ProjectError::StateUnavailable)?;
+    if workspace.path != source_path
+        || workspace.history.current().project_id != source_project.project_id
+    {
+        return Err(ProjectError::InvalidAction(
+            "Project changed while saving; saved snapshot was not applied to the current workspace"
+                .into(),
+        ));
+    }
     if workspace.history.current() == source_project {
         if source_project != project {
             let refreshed = project.clone();
@@ -1853,15 +1869,27 @@ async fn load_project(
     path: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<WorkspaceState, ProjectError> {
-    let task_path = path.clone();
-    let (project, physical_cache) =
-        tauri::async_runtime::spawn_blocking(move || load_project_files(Path::new(&task_path)))
-            .await
-            .map_err(|error| ProjectError::InvalidAction(format!("file task failed: {error}")))??;
-    let mut workspace = state
-        .workspace
-        .lock()
-        .map_err(|_| ProjectError::StateUnavailable)?;
+    let shared = Arc::clone(&state.workspace);
+    tauri::async_runtime::spawn_blocking(move || load_project_sync(path, &shared))
+        .await
+        .map_err(|error| ProjectError::InvalidAction(format!("file task failed: {error}")))?
+}
+
+fn load_project_sync(
+    path: String,
+    shared: &Mutex<Workspace>,
+) -> Result<WorkspaceState, ProjectError> {
+    let (source_project, source_path) = {
+        let workspace = shared.lock().map_err(|_| ProjectError::StateUnavailable)?;
+        (workspace.history.current(), workspace.path.clone())
+    };
+    let (project, physical_cache) = load_project_files(Path::new(&path))?;
+    let mut workspace = shared.lock().map_err(|_| ProjectError::StateUnavailable)?;
+    if workspace.path != source_path || workspace.history.current() != source_project {
+        return Err(ProjectError::InvalidAction(
+            "Project changed while loading; retry opening the project".into(),
+        ));
+    }
     workspace.reset_with_cache(project, Some(path), physical_cache);
     Ok(workspace.state())
 }
@@ -1876,7 +1904,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
-            workspace: Mutex::new(Workspace::default()),
+            workspace: Arc::new(Mutex::new(Workspace::default())),
             simulation_memory: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
@@ -1936,6 +1964,54 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worker_project_io_preserves_save_as_isolation_and_failed_load_state() {
+        let root = std::env::temp_dir().join(format!("openchippy-worker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let shared = std::sync::Mutex::new(super::Workspace::default());
+        {
+            let mut workspace = shared.lock().unwrap();
+            workspace.history.update(|project| {
+                project.add_component("input", 0.0, 0.0).unwrap();
+            });
+        }
+        // Incomplete circuits must save without triggering physical synthesis.
+        let original = root.join("original.ochippy").to_string_lossy().into_owned();
+        let first = super::save_project_sync(Some(original.clone()), &shared).unwrap();
+        assert!(!first.dirty);
+        let original_bytes = std::fs::read(root.join("original.chippy")).unwrap();
+        let copy = root.join("copy.ochippy").to_string_lossy().into_owned();
+        let copied = super::save_project_sync(Some(copy.clone()), &shared).unwrap();
+        assert_ne!(copied.project.project_id, first.project.project_id);
+        shared
+            .lock()
+            .unwrap()
+            .history
+            .update(|project| project.name = "Edited copy".into());
+        super::save_project_sync(None, &shared).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("original.chippy")).unwrap(),
+            original_bytes
+        );
+        let loaded = super::load_project_sync(original.clone(), &shared).unwrap();
+        assert_eq!(loaded.project, first.project);
+        assert!(!loaded.dirty);
+        assert!(super::load_project_sync(
+            root.join("missing.ochippy").to_string_lossy().into_owned(),
+            &shared
+        )
+        .is_err());
+        assert_eq!(shared.lock().unwrap().state().path, Some(original));
+        assert_eq!(
+            super::load_project_sync(copy, &shared)
+                .unwrap()
+                .project
+                .name,
+            "Edited copy"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::{
         build_physical_artifact, load_block_library, load_project_files, matching_cached_layout,
         save_block_library, save_physical_drc_report_sync, validate_physical_artifact,

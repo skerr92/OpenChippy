@@ -6,8 +6,8 @@ use openchippy_lib::{
 use std::{env, fs, path::Path, process::ExitCode};
 fn run() -> Result<(), String> {
     let args = env::args().skip(1).collect::<Vec<_>>();
-    if args.len() != 3 && !(args.len() == 4 && args[3] == "--refill") {
-        return Err("usage: qualify_physical <project.chippy|layout.json> <technology.yaml> <output-directory> [--refill]".into());
+    if args.len() < 3 || args[3..].iter().any(|arg| arg != "--refill" && arg != "--strict") {
+        return Err("usage: qualify_physical <project.chippy|layout.json> <technology.yaml> <output-directory> [--refill] [--strict]".into());
     }
     let source = fs::read_to_string(&args[0]).map_err(|e| e.to_string())?;
     let yaml = fs::read_to_string(&args[1]).map_err(|e| e.to_string())?;
@@ -18,7 +18,7 @@ fn run() -> Result<(), String> {
     } else {
         generate_physical_ir_sources(&source, &yaml)?
     };
-    if args.len() == 4 {
+    if args[3..].iter().any(|arg| arg == "--refill") {
         if !tech.physical_rules.density_fill.use_arrays || !tech.physical_rules.density_fill.cover_full_usable_area {
             return Err("--refill requires full-die density arrays in the process YAML".into());
         }
@@ -43,7 +43,16 @@ fn run() -> Result<(), String> {
         &tech.gds_layers,
     )?;
     fs::write(out.join("layout.gds"), gds).map_err(|e| e.to_string())?;
-    let evidence = serde_json::json!({"drc": drc, "lvs": lvs, "gds": report});
+    let fingerprint = tech.fingerprint()?;
+    let passed = drc.error_count == 0 && lvs.matched && !ir.devices.is_empty()
+        && report.structurally_valid && ir.technology_fingerprint == fingerprint;
+    let evidence = serde_json::json!({
+        "drc": drc, "lvs": lvs, "gds": report,
+        "nativeChecksPassed": passed,
+        "physicalIrVersion": ir.format_version,
+        "technologyFingerprint": fingerprint,
+        "layoutTechnologyFingerprint": ir.technology_fingerprint,
+    });
     fs::write(
         out.join("native-report.json"),
         serde_json::to_vec_pretty(&evidence).map_err(|e| e.to_string())?,
@@ -55,6 +64,9 @@ fn run() -> Result<(), String> {
         drc.error_count,
         out.display()
     );
+    if args[3..].iter().any(|arg| arg == "--strict") && !passed {
+        return Err(format!("Native qualification failed; inspect {}/native-report.json", out.display()));
+    }
     Ok(())
 }
 fn main() -> ExitCode {

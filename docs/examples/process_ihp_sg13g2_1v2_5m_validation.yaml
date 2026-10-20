@@ -15,17 +15,18 @@ process_validation:
     process_id: ihp-sg13g2-1v2-5m-compat
     deck_revision: openchippy-compat-v1
     deck_file: process_ihp_sg13g2_1v2_5m_dr.yaml
-    deck_fingerprint: "fnv1a64:d5926a20ab8e2b81"
+    deck_fingerprint: "fnv1a64:cdd0c066679d9528"
     compatibility_profile: true
     foundry_signoff_deck: false
 
   record:
     record_id: ihp-sg13g2-1v2-5m-compat-validation-v1
-    revision: 1
-    generated_on: "2026-07-27"
+    revision: 2
+    generated_on: "2026-10-19"
     overall_status: DOCUMENTED
     highest_supported_claim: DOCUMENTED
     notes:
+      - Fingerprint refreshed after the density-array schema added use_arrays (default false); previous normalized fingerprint was fnv1a64:d5926a20ab8e2b81. Historical qualification claims are unchanged.
       - The rule deck is derived from the public SG13G2 layer table and minimal precheck/rejection rules.
       - Filler layer mappings use the published filler datatype 22.
       - Metal fill is temporarily configured with the packaged GF180 compatibility values (2 x 2 um tiles, 1.2 um spacing, 200 x 200 um windows stepped 100 um); this is implementation scaffolding, not IHP qualification evidence.

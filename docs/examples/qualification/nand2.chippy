@@ -1,0 +1,229 @@
+{
+  "formatVersion": 1,
+  "projectId": "95921882-15e2-526b-ac2a-74b443ae912d",
+  "name": "Alpha nand2",
+  "components": [
+    {
+      "id": "1ad57dee-c086-52e9-a3e4-81b516ba7946",
+      "kind": "vdd",
+      "name": "VDD1",
+      "position": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": 0
+    },
+    {
+      "id": "3e76b029-b6d0-5c06-b7a7-14b5ec88cd6f",
+      "kind": "gnd",
+      "name": "GND1",
+      "position": {
+        "x": 10,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": 0
+    },
+    {
+      "id": "cb5c1b29-999e-5512-94cf-ece9bce21b18",
+      "kind": "input",
+      "name": "IN1",
+      "position": {
+        "x": 20,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": 0
+    },
+    {
+      "id": "36b85f59-5734-5e3e-ab46-290d7068915f",
+      "kind": "input",
+      "name": "IN2",
+      "position": {
+        "x": 30,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": 0
+    },
+    {
+      "id": "e60280b2-f9fb-58d4-9436-e20e01eca116",
+      "kind": "output",
+      "name": "OUT1",
+      "position": {
+        "x": 40,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": 0
+    },
+    {
+      "id": "c16c0470-125c-5702-acec-8c35557589f2",
+      "kind": "pmos",
+      "name": "MP1",
+      "position": {
+        "x": 50,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": 0
+    },
+    {
+      "id": "0e16b6f7-7c82-5c54-b101-1e78fb389306",
+      "kind": "pmos",
+      "name": "MP2",
+      "position": {
+        "x": 60,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": 0
+    },
+    {
+      "id": "ab9a07ed-3fd0-5e2c-9d34-92c3d7b7986c",
+      "kind": "nmos",
+      "name": "MN1",
+      "position": {
+        "x": 70,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": 0
+    },
+    {
+      "id": "4c36a612-d393-50de-94af-69d00582ced8",
+      "kind": "nmos",
+      "name": "MN2",
+      "position": {
+        "x": 80,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": 0
+    }
+  ],
+  "wires": [
+    {
+      "id": "5e757310-e9ba-5454-9247-b40c9e908897",
+      "from": {
+        "componentId": "1ad57dee-c086-52e9-a3e4-81b516ba7946",
+        "terminal": "out"
+      },
+      "to": {
+        "componentId": "c16c0470-125c-5702-acec-8c35557589f2",
+        "terminal": "source"
+      }
+    },
+    {
+      "id": "21ebab34-bde1-54ff-8d9a-3884f3fd3739",
+      "from": {
+        "componentId": "1ad57dee-c086-52e9-a3e4-81b516ba7946",
+        "terminal": "out"
+      },
+      "to": {
+        "componentId": "0e16b6f7-7c82-5c54-b101-1e78fb389306",
+        "terminal": "source"
+      }
+    },
+    {
+      "id": "d67f376a-5228-50fc-981f-7b88f0266957",
+      "from": {
+        "componentId": "3e76b029-b6d0-5c06-b7a7-14b5ec88cd6f",
+        "terminal": "out"
+      },
+      "to": {
+        "componentId": "4c36a612-d393-50de-94af-69d00582ced8",
+        "terminal": "source"
+      }
+    },
+    {
+      "id": "4ef0f78c-c1e0-5bb4-94f0-3559dc168b34",
+      "from": {
+        "componentId": "cb5c1b29-999e-5512-94cf-ece9bce21b18",
+        "terminal": "out"
+      },
+      "to": {
+        "componentId": "c16c0470-125c-5702-acec-8c35557589f2",
+        "terminal": "gate"
+      }
+    },
+    {
+      "id": "e59a3152-2a24-5a53-be3f-2e7fb32f7654",
+      "from": {
+        "componentId": "cb5c1b29-999e-5512-94cf-ece9bce21b18",
+        "terminal": "out"
+      },
+      "to": {
+        "componentId": "ab9a07ed-3fd0-5e2c-9d34-92c3d7b7986c",
+        "terminal": "gate"
+      }
+    },
+    {
+      "id": "bcc344ae-d6d4-585f-a556-86dcc454535e",
+      "from": {
+        "componentId": "36b85f59-5734-5e3e-ab46-290d7068915f",
+        "terminal": "out"
+      },
+      "to": {
+        "componentId": "0e16b6f7-7c82-5c54-b101-1e78fb389306",
+        "terminal": "gate"
+      }
+    },
+    {
+      "id": "cecf9cf4-2242-5c34-adc9-2243768e1818",
+      "from": {
+        "componentId": "36b85f59-5734-5e3e-ab46-290d7068915f",
+        "terminal": "out"
+      },
+      "to": {
+        "componentId": "4c36a612-d393-50de-94af-69d00582ced8",
+        "terminal": "gate"
+      }
+    },
+    {
+      "id": "a4bba52a-e791-598f-a5d4-8b98b140c6af",
+      "from": {
+        "componentId": "c16c0470-125c-5702-acec-8c35557589f2",
+        "terminal": "drain"
+      },
+      "to": {
+        "componentId": "0e16b6f7-7c82-5c54-b101-1e78fb389306",
+        "terminal": "drain"
+      }
+    },
+    {
+      "id": "0e6e6edf-e771-5476-84b3-c405118f7b94",
+      "from": {
+        "componentId": "c16c0470-125c-5702-acec-8c35557589f2",
+        "terminal": "drain"
+      },
+      "to": {
+        "componentId": "ab9a07ed-3fd0-5e2c-9d34-92c3d7b7986c",
+        "terminal": "drain"
+      }
+    },
+    {
+      "id": "aa4ed511-5c32-5178-9486-901248dc4740",
+      "from": {
+        "componentId": "ab9a07ed-3fd0-5e2c-9d34-92c3d7b7986c",
+        "terminal": "source"
+      },
+      "to": {
+        "componentId": "4c36a612-d393-50de-94af-69d00582ced8",
+        "terminal": "drain"
+      }
+    },
+    {
+      "id": "b361450b-6160-5540-9eb6-472f316c4d4b",
+      "from": {
+        "componentId": "c16c0470-125c-5702-acec-8c35557589f2",
+        "terminal": "drain"
+      },
+      "to": {
+        "componentId": "e60280b2-f9fb-58d4-9436-e20e01eca116",
+        "terminal": "in"
+      }
+    }
+  ]
+}

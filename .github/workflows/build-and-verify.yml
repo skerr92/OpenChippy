@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - master
+      - alpha-v1
     tags:
       - 'v*'
   pull_request:
@@ -59,6 +60,20 @@ jobs:
 
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --release
+
+      - name: Build native physical qualification runner
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --example qualify_physical
+
+      - name: Check alpha physical fixtures
+        run: python3 scripts/check_alpha_physical.py --qualifier src-tauri/target/release/examples/qualify_physical --output artifacts/physical
+
+      - name: Upload native physical evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpha-native-physical-evidence
+          path: artifacts/physical
+          if-no-files-found: warn
 
       - name: Package an unsigned build artifact
         run: |

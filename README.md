@@ -58,19 +58,21 @@ polarity-specific implant and excludes the synthetic substrate preview. The
 exporter remains an early interoperability path rather than a signoff replacement.
 Physical blocks are emitted as referenced GDS structures, although shared canonical cells
 and non-zero transforms are still under development. The exact GF180 four-bit-adder
-qualification design has deterministic GDS output, clean native DRC/connectivity/LVS, and
+qualification design at Physical IR v45 has recorded deterministic GDS output, clean native DRC/connectivity/LVS, and
 no geometry or process findings under the official variant-C 5LM/9K KLayout deck; the deck's
 direct floating-point DBU comparison still produces a known tool-version-specific marker.
+That historical result does not qualify the current v49 generator, revised process deck,
+or a changed input design; fresh current-design correlation remains pending.
 Broader process coverage, extraction correlation, reusable hierarchy qualification, and
 fabricated-silicon evidence remain manufacturing-roadmap work.
 Physical power routing is distributed across occupied placement rows instead
 of being forced through a single VDD/GND pair; devices use the nearest matching
 rail, leaving upper routing capacity available for signal closure.
 For designs built from reusable blocks, the physical planner is gaining a
-standard-cell path. Its staging implementation gives identical blocks
-canonical device-relative placement, typed rectangular keepouts, and
-next-hop-aware ordering. It is not yet enabled in production generation while
-pre-routed local geometry and explicit boundary-pin templates are completed.
+standard-cell path. Fully recognized INV/NAND2/NOR2 designs use canonical
+device-relative placement and skip redundant placement challengers. Partial or
+unrecognized designs retain transistor placement. Pre-routed local geometry and
+explicit boundary-pin templates remain under development.
 Nested blocks are resolved from the bottom up: a full adder built from reusable
 NANDs identifies each NAND as the physical cell, while the full-adder boundary
 remains available for higher-level floorplanning.
@@ -192,15 +194,37 @@ with an Apple Developer ID certificate and notarized before distribution.
 
 ### Validation
 
+See the [alpha-v1 checklist](docs/alpha-v1-checklist.md) for release priorities and
+the [physical regression instructions](docs/physical-qualification.md) for reproducible
+native layout checks using repository-owned circuits.
+
+
 ```sh
 npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
 npm run tauri -- build
 ```
 
-The current baseline is 193 passing Rust tests plus successful frontend and Tauri release
-builds. Some physical-layout regressions are intentionally heavyweight and may take more
-than a minute on a development machine.
+As of October 19, 2026, the Rust baseline is 210 passing tests with six integration
+tests ignored unless external compiler tools or a saved-layout fixture are supplied.
+The TypeScript/Vite production build and macOS arm64 Tauri release build also pass.
+Interactive desktop acceptance remains pending; see [the desktop checklist](docs/desktop-acceptance.md). Some physical-layout regressions are intentionally heavyweight.
+
+### Prepare alpha-v1 packages
+
+The alpha version is `0.1.0-alpha.1`. To build the local unsigned Apple Silicon
+app with examples, license, and release notes included:
+
+```sh
+npm run tauri -- build --config src-tauri/tauri.alpha.conf.json --no-sign
+python3 scripts/package_alpha_macos.py --output /tmp/openchippy-alpha-v1-release
+```
+
+Use a new output directory. The packager creates the app ZIP, a matching
+working-tree source archive, release notes, manifest, and SHA-256 checksums.
+See [alpha release notes](docs/releases/alpha-v1.md) for installation and known
+limitations. Packaging does not publish a release or create a git tag.
+
 
 ## Contributing
 

@@ -398,7 +398,7 @@ fn flatten_cell(
         .cells
         .get(name)
         .ok_or_else(|| format!("missing referenced GDSII cell {name}"))?;
-    output.extend(cell.boundaries.iter().filter(|b| !inert_pairs.contains(&(b.layer,b.datatype))).cloned().map(|mut boundary| {
+    output.extend(cell.boundaries.iter().cloned().map(|mut boundary| {
         for point in &mut boundary.points {
             point.0 += origin.0;
             point.1 += origin.1;
@@ -848,6 +848,35 @@ mod tests {
             .shapes
             .iter()
             .any(|shape| shape.layer == physical_layout::PhysicalLayer::Pdiff));
+
+        // Keep ordinary dummy rectangles while retaining repeated inert fill
+        // in canonical GDS without expanding it for electrical extraction.
+        ir.density_arrays.push(crate::density_arrays::DensityArray {
+            material: "top_metal".into(),
+            layer: PhysicalLayer::Metal(6),
+            x: 100.0,
+            y: 100.0,
+            tile_width: 2.0,
+            tile_height: 2.0,
+            step_x: 4.0,
+            step_y: 4.0,
+            columns: 2000,
+            rows: 2000,
+        });
+        let (bytes, _) = gdsii::export(
+            &ir,
+            technology.physical_rules.database_units_per_micron,
+            &technology.gds_layers,
+        )
+        .unwrap();
+        let with_array = import_canonical(&bytes).unwrap();
+        let reference = &with_array.cells[&with_array.top_cell].references[0];
+        assert_eq!((reference.columns, reference.rows), (2000, 2000));
+        assert_eq!(with_array.cells[&reference.cell_name].boundaries.len(), 1);
+        assert_eq!(
+            with_array.to_physical_geometry(&technology.gds_layers).unwrap(),
+            physical
+        );
     }
 
     #[test]
