@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "category": "Education",
+    "shortDescription": "Educational silicon design studio — alpha",
+    "icon": ["icons/icon.icns", "icons/icon.ico"],
+    "resources": {
+      "../LICENSE": "LICENSE",
+      "../docs/examples/qualification/": "examples/qualification/",
+      "../docs/examples/rtl/alpha-inverter.v": "examples/rtl/alpha-inverter.v",
+      "../docs/releases/alpha-v1.md": "ALPHA-RELEASE-NOTES.md"
+    }
+  }
+}

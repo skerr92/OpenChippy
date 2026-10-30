@@ -4,6 +4,8 @@ import type { DeviceCharacteristics, LogicState, NativeLvsReport, PhysicalDrcRep
 const browserFallback = (): WorkspaceState => ({
   project: {
     formatVersion: 1,
+    projectId: crypto.randomUUID(),
+    forkedFromProjectId: null,
     name: "Untitled chip",
     components: [],
     wires: [],
@@ -12,12 +14,14 @@ const browserFallback = (): WorkspaceState => ({
     timingTargetNs: null,
     highFanoutWarningThreshold: 8,
     rtlDesign: null,
+    tapeoutPinBindings: {},
     technology: {
       format_version: 1,
       name: "OpenChippy EDU CMOS",
       process_id: "openchippy-edu-cmos",
       deck_revision: "builtin-v1",
       source: "OpenChippy built-in educational technology",
+      standard_cell_library: "openchippy-edu",
       supply_voltage: 1.8,
       max_metal_layers: 5,
       nmos: {
@@ -49,6 +53,9 @@ const browserFallback = (): WorkspaceState => ({
         width_um: 2920,
         height_um: 3520,
         edge_margin_um: 0,
+        layout_mode: "full_usable_area",
+        rings: [],
+        pads: [],
       },
       physical_rules: {
         format_version: 1,
@@ -191,6 +198,10 @@ export async function renameComponent(id: string, name: string): Promise<Workspa
   return invoke("rename_component", { id, name });
 }
 
+export async function setTapeoutPinBinding(id: string, padId: string | null): Promise<WorkspaceState> {
+  return invoke("set_tapeout_pin_binding", { id, padId });
+}
+
 export async function setDeviceGeometry(id: string, widthUm: number, lengthUm: number): Promise<WorkspaceState> {
   return invoke("set_device_geometry", { id, widthUm, lengthUm });
 }
@@ -215,16 +226,16 @@ export async function validateProject(): Promise<ValidationReport> {
   return invoke("validate_project");
 }
 
-export async function parseVerilog(source: string): Promise<RtlModule> {
-  return invoke("parse_verilog", { source });
+export async function parseVerilog(source: string, top = "", frontend = "auto", compilerPath = ""): Promise<RtlModule> {
+  return invoke("parse_verilog", { source, top, frontend, compilerPath });
 }
 
 export async function readVerilogSource(path: string): Promise<string> {
   return invoke("read_verilog_source", { path });
 }
 
-export async function importVerilog(source: string): Promise<WorkspaceState> {
-  return invoke("import_verilog", { source });
+export async function importVerilog(source: string, top = "", frontend = "auto", compilerPath = ""): Promise<WorkspaceState> {
+  return invoke("import_verilog", { source, top, frontend, compilerPath });
 }
 
 export async function exportVerilog(): Promise<string> {
@@ -309,6 +320,10 @@ export async function redo(): Promise<WorkspaceState> {
 
 export async function saveProject(path: string | null): Promise<WorkspaceState> {
   return invoke("save_project", { path });
+}
+
+export async function duplicateComponents(ids: string[]): Promise<WorkspaceState> {
+  return invoke("duplicate_components", { ids });
 }
 
 export async function loadProject(path: string): Promise<WorkspaceState> {

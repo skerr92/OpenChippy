@@ -1,0 +1,141 @@
+{
+  "formatVersion": 1,
+  "projectId": "3217cbc1-b2db-5690-a0de-e144986a1a6a",
+  "name": "Alpha inverter",
+  "components": [
+    {
+      "id": "07f74fbd-7806-52a1-acf8-18223254e218",
+      "kind": "vdd",
+      "name": "VDD1",
+      "position": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": 0
+    },
+    {
+      "id": "32027b67-62b4-50c5-abdd-c85c2486795b",
+      "kind": "gnd",
+      "name": "GND1",
+      "position": {
+        "x": 10,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": 0
+    },
+    {
+      "id": "d619c6aa-4892-52dd-9464-d89999fcb033",
+      "kind": "input",
+      "name": "IN1",
+      "position": {
+        "x": 20,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": 0
+    },
+    {
+      "id": "1f449c84-368f-5f9f-a9ee-d3b89ddb0962",
+      "kind": "output",
+      "name": "OUT1",
+      "position": {
+        "x": 30,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": 0
+    },
+    {
+      "id": "fc44abdd-567a-5d16-a2a6-bdd513f787e0",
+      "kind": "pmos",
+      "name": "MP1",
+      "position": {
+        "x": 40,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": 0
+    },
+    {
+      "id": "004cf15d-a886-5cc9-a48a-dbd91f413685",
+      "kind": "nmos",
+      "name": "MN1",
+      "position": {
+        "x": 50,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": 0
+    }
+  ],
+  "wires": [
+    {
+      "id": "1e8e4417-bcec-57e2-993e-c05a87c5be21",
+      "from": {
+        "componentId": "07f74fbd-7806-52a1-acf8-18223254e218",
+        "terminal": "out"
+      },
+      "to": {
+        "componentId": "fc44abdd-567a-5d16-a2a6-bdd513f787e0",
+        "terminal": "source"
+      }
+    },
+    {
+      "id": "7a17f101-88da-5c0c-9f34-2a134ab36a16",
+      "from": {
+        "componentId": "32027b67-62b4-50c5-abdd-c85c2486795b",
+        "terminal": "out"
+      },
+      "to": {
+        "componentId": "004cf15d-a886-5cc9-a48a-dbd91f413685",
+        "terminal": "source"
+      }
+    },
+    {
+      "id": "b3278695-3d14-599e-b681-348c171dddf5",
+      "from": {
+        "componentId": "d619c6aa-4892-52dd-9464-d89999fcb033",
+        "terminal": "out"
+      },
+      "to": {
+        "componentId": "fc44abdd-567a-5d16-a2a6-bdd513f787e0",
+        "terminal": "gate"
+      }
+    },
+    {
+      "id": "9de2de0d-059a-5325-95ee-b2b63c90297e",
+      "from": {
+        "componentId": "d619c6aa-4892-52dd-9464-d89999fcb033",
+        "terminal": "out"
+      },
+      "to": {
+        "componentId": "004cf15d-a886-5cc9-a48a-dbd91f413685",
+        "terminal": "gate"
+      }
+    },
+    {
+      "id": "13064a65-0095-50f4-be6b-5825b530263d",
+      "from": {
+        "componentId": "fc44abdd-567a-5d16-a2a6-bdd513f787e0",
+        "terminal": "drain"
+      },
+      "to": {
+        "componentId": "004cf15d-a886-5cc9-a48a-dbd91f413685",
+        "terminal": "drain"
+      }
+    },
+    {
+      "id": "3766842a-7ccf-5a33-baa6-7f9ce46b3d35",
+      "from": {
+        "componentId": "fc44abdd-567a-5d16-a2a6-bdd513f787e0",
+        "terminal": "drain"
+      },
+      "to": {
+        "componentId": "1f449c84-368f-5f9f-a9ee-d3b89ddb0962",
+        "terminal": "in"
+      }
+    }
+  ]
+}

@@ -97,6 +97,21 @@ pub struct BlockDefinition {
     pub components: Vec<Component>,
     pub wires: Vec<Wire>,
     pub pins: Vec<BlockPin>,
+    #[serde(default)]
+    pub source_project_id: Option<Uuid>,
+    #[serde(default)]
+    pub source_digest: Option<String>,
+    #[serde(default)]
+    pub revision: u64,
+}
+
+fn block_interface_is_additive(existing: &BlockDefinition, replacement: &BlockDefinition) -> bool {
+    existing.pins.iter().all(|old_pin| {
+        replacement
+            .pins
+            .iter()
+            .any(|new_pin| new_pin.name == old_pin.name && new_pin.role == old_pin.role)
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -120,6 +135,10 @@ pub struct WaveformGroup {
 #[serde(rename_all = "camelCase")]
 pub struct Project {
     pub format_version: u32,
+    #[serde(default = "Uuid::new_v4")]
+    pub project_id: Uuid,
+    #[serde(default)]
+    pub forked_from_project_id: Option<Uuid>,
     pub name: String,
     pub components: Vec<Component>,
     #[serde(default)]
@@ -136,6 +155,8 @@ pub struct Project {
     pub high_fanout_warning_threshold: usize,
     #[serde(default)]
     pub rtl_design: Option<RtlDesign>,
+    #[serde(default)]
+    pub tapeout_pin_bindings: HashMap<Uuid, String>,
 }
 
 fn terminal_offset(kind: &str, terminal: &str) -> (f64, f64) {
@@ -184,6 +205,8 @@ impl Default for Project {
     fn default() -> Self {
         Self {
             format_version: CURRENT_FORMAT_VERSION,
+            project_id: Uuid::new_v4(),
+            forked_from_project_id: None,
             name: "Untitled chip".into(),
             components: Vec::new(),
             wires: Vec::new(),
@@ -193,11 +216,49 @@ impl Default for Project {
             timing_target_ns: None,
             high_fanout_warning_threshold: DEFAULT_HIGH_FANOUT_WARNING_THRESHOLD,
             rtl_design: None,
+            tapeout_pin_bindings: HashMap::new(),
         }
     }
 }
 
 impl Project {
+    fn block_source_digest(&self) -> Result<String, String> {
+        let bytes = serde_json::to_vec(&(&self.components, &self.wires))
+            .map_err(|error| format!("block source could not be fingerprinted: {error}"))?;
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        Ok(format!("fnv1a64:{hash:016x}"))
+    }
+
+    /// Give a Save-As copy an independent project identity. Definitions
+    /// authored by the original project intentionally retain that source ID
+    /// and become imports in the copy; editing the copied top-level circuit
+    /// must not update or overwrite the original project's block library.
+    pub(crate) fn fork_for_save_as(&mut self) {
+        let original_project_id = self.project_id;
+        let current_component_ids = self
+            .components
+            .iter()
+            .map(|component| component.id)
+            .collect::<HashSet<_>>();
+        for definition in &mut self.block_definitions {
+            let legacy_authored_here = definition.source_project_id.is_none()
+                && !definition.pins.is_empty()
+                && definition
+                    .pins
+                    .iter()
+                    .all(|pin| current_component_ids.contains(&pin.component_id));
+            if legacy_authored_here {
+                definition.source_project_id = Some(original_project_id);
+            }
+        }
+        self.project_id = Uuid::new_v4();
+        self.forked_from_project_id = Some(original_project_id);
+    }
+
     pub fn set_rtl_design(&mut self, design: RtlDesign) {
         self.rtl_design = Some(design);
     }
@@ -541,6 +602,44 @@ impl Project {
         Ok(())
     }
 
+    pub fn set_tapeout_pin_binding(
+        &mut self,
+        id: Uuid,
+        pad_id: Option<String>,
+    ) -> Result<(), String> {
+        let component = self
+            .components
+            .iter()
+            .find(|component| component.id == id)
+            .ok_or_else(|| "component not found".to_string())?;
+        if !matches!(component.kind.as_str(), "input" | "output") {
+            return Err("only schematic digital inputs and outputs may bind GPIO pads".into());
+        }
+        let Some(pad_id) = pad_id.filter(|pad| !pad.is_empty()) else {
+            self.tapeout_pin_bindings.remove(&id);
+            return Ok(());
+        };
+        let pad = self
+            .technology
+            .tapeout_window
+            .pads
+            .iter()
+            .find(|pad| pad.id == pad_id)
+            .ok_or_else(|| format!("tapeout pad does not exist: {pad_id}"))?;
+        if pad.role != crate::technology::TapeoutPadRole::Gpio {
+            return Err(format!("tapeout pad is not GPIO-capable: {pad_id}"));
+        }
+        if self
+            .tapeout_pin_bindings
+            .iter()
+            .any(|(component_id, assigned)| *component_id != id && assigned == &pad_id)
+        {
+            return Err(format!("tapeout pad is already assigned: {pad_id}"));
+        }
+        self.tapeout_pin_bindings.insert(id, pad_id);
+        Ok(())
+    }
+
     pub fn set_device_geometry(
         &mut self,
         id: Uuid,
@@ -617,6 +716,8 @@ impl Project {
             .collect::<HashSet<_>>();
         self.components
             .retain(|component| !ids.contains(&component.id));
+        self.tapeout_pin_bindings
+            .retain(|component_id, _| !ids.contains(component_id));
         self.wires.retain(|wire| {
             !ids.contains(&wire.from.component_id)
                 && wire
@@ -631,6 +732,73 @@ impl Project {
         }
         self.waveform_groups
             .retain(|group| group.signals.len() >= 2);
+        Ok(())
+    }
+
+    pub fn duplicate_components(&mut self, ids: &[Uuid]) -> Result<(), String> {
+        if ids.is_empty() {
+            return Err("select at least one component".into());
+        }
+        let selected = ids.iter().copied().collect::<HashSet<_>>();
+        if selected
+            .iter()
+            .any(|id| !self.components.iter().any(|component| component.id == *id))
+        {
+            return Err("component not found".into());
+        }
+        let mut id_map = HashMap::new();
+        let mut copies = Vec::new();
+        for component in self
+            .components
+            .iter()
+            .filter(|component| selected.contains(&component.id))
+        {
+            let mut copy = component.clone();
+            let new_id = Uuid::new_v4();
+            id_map.insert(component.id, new_id);
+            copy.id = new_id;
+            copy.position.x += 20.0;
+            copy.position.y += 20.0;
+            let base = format!("{}_copy", component.name);
+            let mut name = base.clone();
+            let mut suffix = 2;
+            while self
+                .components
+                .iter()
+                .chain(&copies)
+                .any(|existing| existing.name == name)
+            {
+                name = format!("{base}{suffix}");
+                suffix += 1;
+            }
+            copy.name = name;
+            copies.push(copy);
+        }
+        let copied_wires = self
+            .wires
+            .iter()
+            .filter_map(|wire| {
+                let to = wire.to.as_ref()?;
+                let from_id = id_map.get(&wire.from.component_id)?;
+                let to_id = id_map.get(&to.component_id)?;
+                let mut copy = wire.clone();
+                copy.id = Uuid::new_v4();
+                copy.from.component_id = *from_id;
+                copy.to.as_mut().unwrap().component_id = *to_id;
+                for waypoint in &mut copy.waypoints {
+                    waypoint.x += 20.0;
+                    waypoint.y += 20.0;
+                }
+                if let Some(end) = &mut copy.end {
+                    end.x += 20.0;
+                    end.y += 20.0;
+                }
+                copy.route_x = copy.route_x.map(|x| x + 20.0);
+                Some(copy)
+            })
+            .collect::<Vec<_>>();
+        self.components.extend(copies);
+        self.wires.extend(copied_wires);
         Ok(())
     }
 
@@ -801,6 +969,9 @@ impl Project {
             components: self.components.clone(),
             wires: self.wires.clone(),
             pins,
+            source_project_id: Some(self.project_id),
+            source_digest: Some(self.block_source_digest()?),
+            revision: 1,
         };
         let mut candidate = self.clone();
         candidate.block_definitions.push(definition.clone());
@@ -827,19 +998,16 @@ impl Project {
             .into_iter()
             .find(|definition| definition.id == replacement_id)
             .expect("captured definition exists");
-        let interface = |definition: &BlockDefinition| {
-            definition
-                .pins
-                .iter()
-                .map(|pin| (pin.name.clone(), pin.role))
-                .collect::<Vec<_>>()
-        };
-        if interface(&existing) != interface(&replacement) {
+        if !block_interface_is_additive(&existing, &replacement) {
             return Err(
-                "block pin names and roles must remain compatible with existing instances".into(),
+                "existing block pin names and roles must be preserved; new pins may be added"
+                    .into(),
             );
         }
         replacement.id = definition_id;
+        replacement.source_project_id = Some(self.project_id);
+        replacement.source_digest = Some(self.block_source_digest()?);
+        replacement.revision = existing.revision.saturating_add(1).max(1);
         let index = self
             .block_definitions
             .iter()
@@ -850,6 +1018,90 @@ impl Project {
         candidate.validate_block_graph()?;
         self.block_definitions[index] = replacement;
         Ok(())
+    }
+
+    /// Refresh definitions authored by this project. Imported definitions keep
+    /// their source project identity and are never overwritten by saving a
+    /// parent design.
+    pub fn refresh_linked_blocks(&mut self) -> Result<usize, String> {
+        let digest = self.block_source_digest()?;
+        let current_component_ids = self
+            .components
+            .iter()
+            .map(|component| component.id)
+            .collect::<HashSet<_>>();
+        let linked = self
+            .block_definitions
+            .iter()
+            .filter(|definition| {
+                let authored_here = definition.source_project_id == Some(self.project_id);
+                // Pin UUIDs survive ordinary source edits and safely identify
+                // a definition captured from this top-level circuit. Accept
+                // that stronger evidence even when an older Save-As bug left
+                // a stale or missing source project ID.
+                let topology_authored_here = self.forked_from_project_id.is_none()
+                    && !definition.pins.is_empty()
+                    && definition
+                        .pins
+                        .iter()
+                        .all(|pin| current_component_ids.contains(&pin.component_id));
+                (authored_here || topology_authored_here)
+                    && definition.source_digest.as_deref() != Some(digest.as_str())
+            })
+            .map(|definition| definition.id)
+            .collect::<Vec<_>>();
+        for definition_id in &linked {
+            self.update_block_from_current(*definition_id)?;
+        }
+        Ok(linked.len())
+    }
+
+    #[allow(dead_code)]
+    pub fn merge_block_definition(&mut self, incoming: BlockDefinition) -> Result<bool, String> {
+        let mut candidate = self.clone();
+        let changed = candidate.merge_block_definition_unvalidated(incoming)?;
+        if !changed {
+            return Ok(false);
+        }
+        candidate.validate_block_graph()?;
+        *self = candidate;
+        Ok(true)
+    }
+
+    /// Merge one library record without validating the whole dependency graph.
+    /// File loaders use this only on a private staging Project, then validate
+    /// the complete library atomically after every adjacent definition exists.
+    pub(crate) fn merge_block_definition_unvalidated(
+        &mut self,
+        incoming: BlockDefinition,
+    ) -> Result<bool, String> {
+        let Some(index) = self
+            .block_definitions
+            .iter()
+            .position(|existing| existing.id == incoming.id)
+        else {
+            if self
+                .block_definitions
+                .iter()
+                .any(|existing| existing.name == incoming.name)
+            {
+                return Ok(false);
+            }
+            self.block_definitions.push(incoming);
+            return Ok(true);
+        };
+        let existing = &self.block_definitions[index];
+        if incoming.revision <= existing.revision || incoming.source_project_id.is_none() {
+            return Ok(false);
+        }
+        if !block_interface_is_additive(existing, &incoming) {
+            return Err(format!(
+                "newer block {} revision {} removes or changes an existing pin",
+                incoming.name, incoming.revision
+            ));
+        }
+        self.block_definitions[index] = incoming;
+        Ok(true)
     }
 
     pub fn place_block(&mut self, definition_id: Uuid, x: f64, y: f64) -> Result<Uuid, String> {
@@ -962,10 +1214,81 @@ impl Project {
         Ok(())
     }
 
+    pub(crate) fn validate_block_definition_integrity(
+        &self,
+        definition: &BlockDefinition,
+    ) -> Result<(), String> {
+        let components = definition
+            .components
+            .iter()
+            .map(|component| (component.id, component))
+            .collect::<HashMap<_, _>>();
+        let mut connections = HashMap::<(Uuid, String), usize>::new();
+        for wire in &definition.wires {
+            for terminal in std::iter::once(&wire.from).chain(wire.to.as_ref()) {
+                let component = components.get(&terminal.component_id).ok_or_else(|| {
+                    format!(
+                        "block {} wire references missing component {}",
+                        definition.name, terminal.component_id
+                    )
+                })?;
+                if !self
+                    .component_terminals(component)
+                    .iter()
+                    .any(|name| name == &terminal.terminal)
+                {
+                    return Err(format!(
+                        "block {} wire references missing terminal {}.{}",
+                        definition.name, component.name, terminal.terminal
+                    ));
+                }
+                *connections
+                    .entry((terminal.component_id, terminal.terminal.clone()))
+                    .or_default() += 1;
+            }
+        }
+        for component in &definition.components {
+            for terminal in self.component_terminals(component) {
+                let count = connections
+                    .get(&(component.id, terminal.clone()))
+                    .copied()
+                    .unwrap_or(0);
+                let required = usize::from(component.kind == "junction").saturating_add(1);
+                if count < required {
+                    return Err(format!(
+                        "block {} has floating internal terminal {}.{}",
+                        definition.name, component.name, terminal
+                    ));
+                }
+            }
+        }
+        for pin in &definition.pins {
+            let component = components.get(&pin.component_id).ok_or_else(|| {
+                format!(
+                    "block {} pin {} references a missing component",
+                    definition.name, pin.name
+                )
+            })?;
+            if !self
+                .component_terminals(component)
+                .iter()
+                .any(|terminal| terminal == &pin.terminal)
+            {
+                return Err(format!(
+                    "block {} pin {} references missing terminal {}.{}",
+                    definition.name, pin.name, component.name, pin.terminal
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn flattened(&self) -> Result<Project, String> {
         self.validate_block_graph()?;
         let mut flattened = Project {
             format_version: self.format_version,
+            project_id: self.project_id,
+            forked_from_project_id: self.forked_from_project_id,
             name: self.name.clone(),
             components: self
                 .components
@@ -980,6 +1303,7 @@ impl Project {
             timing_target_ns: self.timing_target_ns,
             high_fanout_warning_threshold: self.high_fanout_warning_threshold,
             rtl_design: self.rtl_design.clone(),
+            tapeout_pin_bindings: self.tapeout_pin_bindings.clone(),
         };
         let mut instance_terminals: HashMap<(Uuid, String), TerminalRef> = HashMap::new();
         for instance in self
@@ -1164,7 +1488,238 @@ mod tests {
     use super::{Component, Position, Project, TerminalRef, WaveformGroup, WaveformRadix};
     use crate::rtl::{map_module, parse_structural_verilog};
     use crate::technology::Technology;
+    use std::collections::HashSet;
     use uuid::Uuid;
+
+    #[test]
+    fn digital_io_bindings_require_unique_gpio_process_sites() {
+        let mut project = Project::default();
+        project.technology.tapeout_window.pads = vec![crate::technology::TapeoutPad {
+            id: "gpio_left_0".into(),
+            role: crate::technology::TapeoutPadRole::Gpio,
+            side: crate::technology::TapeoutSide::Left,
+            offset_um: 100.0,
+            width_um: 60.0,
+            height_um: 60.0,
+            layer: 3,
+        }];
+        let input = project.add_component("input", 0.0, 0.0).unwrap();
+        let output = project.add_component("output", 10.0, 0.0).unwrap();
+        let transistor = project.add_component("nmos", 5.0, 5.0).unwrap();
+
+        project
+            .set_tapeout_pin_binding(input, Some("gpio_left_0".into()))
+            .unwrap();
+        assert!(project
+            .set_tapeout_pin_binding(output, Some("gpio_left_0".into()))
+            .is_err());
+        assert!(project
+            .set_tapeout_pin_binding(transistor, Some("gpio_left_0".into()))
+            .is_err());
+        project.delete_components(&[input]).unwrap();
+        assert!(project.tapeout_pin_bindings.is_empty());
+        project
+            .set_tapeout_pin_binding(output, Some("gpio_left_0".into()))
+            .unwrap();
+    }
+
+    #[test]
+    fn linked_block_refreshes_only_from_its_source_project() {
+        let mut source = Project::default();
+        source.rename("REGISTER_CELL".into()).unwrap();
+        let input = source.add_component("input", -2.0, 0.0).unwrap();
+        let output = source.add_component("output", 2.0, 0.0).unwrap();
+        source
+            .connect(
+                TerminalRef {
+                    component_id: input,
+                    terminal: "out".into(),
+                },
+                TerminalRef {
+                    component_id: output,
+                    terminal: "in".into(),
+                },
+            )
+            .unwrap();
+        let definition_id = source.capture_block("REGISTER_CELL".into()).unwrap();
+        let original = source.block_definition(definition_id).unwrap().clone();
+        assert_eq!(original.source_project_id, Some(source.project_id));
+        assert_eq!(source.refresh_linked_blocks().unwrap(), 0);
+
+        source.add_resistor(0.0, 2.0);
+        assert_eq!(source.refresh_linked_blocks().unwrap(), 1);
+        let refreshed = source.block_definition(definition_id).unwrap().clone();
+        assert_eq!(refreshed.revision, original.revision + 1);
+        assert_ne!(refreshed.source_digest, original.source_digest);
+
+        let mut parent = Project::default();
+        parent.block_definitions.push(original);
+        assert!(parent.merge_block_definition(refreshed.clone()).unwrap());
+        assert_eq!(parent.block_definition(definition_id), Some(&refreshed));
+        assert_eq!(parent.refresh_linked_blocks().unwrap(), 0);
+
+        let mut legacy_source = Project::default();
+        let legacy_in = legacy_source.add_component("input", -1.0, 0.0).unwrap();
+        let legacy_out = legacy_source.add_component("output", 1.0, 0.0).unwrap();
+        legacy_source
+            .connect(
+                TerminalRef {
+                    component_id: legacy_in,
+                    terminal: "out".into(),
+                },
+                TerminalRef {
+                    component_id: legacy_out,
+                    terminal: "in".into(),
+                },
+            )
+            .unwrap();
+        let legacy_id = legacy_source.capture_block("LEGACY".into()).unwrap();
+        let legacy = legacy_source
+            .block_definitions
+            .iter_mut()
+            .find(|definition| definition.id == legacy_id)
+            .unwrap();
+        legacy.source_project_id = Some(Uuid::new_v4());
+        legacy.source_digest = None;
+        legacy.revision = 0;
+        assert_eq!(legacy_source.refresh_linked_blocks().unwrap(), 1);
+        let adopted = legacy_source.block_definition(legacy_id).unwrap();
+        assert_eq!(adopted.source_project_id, Some(legacy_source.project_id));
+        assert_eq!(adopted.revision, 1);
+    }
+
+    #[test]
+    fn linked_block_revisions_may_add_pins_without_breaking_existing_instances() {
+        let mut source = Project::default();
+        let input_a = source.add_component("input", -2.0, 0.0).unwrap();
+        source
+            .components
+            .iter_mut()
+            .find(|item| item.id == input_a)
+            .unwrap()
+            .name = "A".into();
+        let output = source.add_component("output", 2.0, 0.0).unwrap();
+        source
+            .components
+            .iter_mut()
+            .find(|item| item.id == output)
+            .unwrap()
+            .name = "Y".into();
+        let definition_id = source.capture_block("ADDITIVE_IO".into()).unwrap();
+        let original = source.block_definition(definition_id).unwrap().clone();
+
+        let mut parent = Project::default();
+        parent.block_definitions.push(original);
+        let instance = parent.place_block(definition_id, 0.0, 0.0).unwrap();
+        let parent_input = parent.add_component("input", -4.0, 0.0).unwrap();
+        parent
+            .connect(
+                TerminalRef {
+                    component_id: parent_input,
+                    terminal: "out".into(),
+                },
+                TerminalRef {
+                    component_id: instance,
+                    terminal: "A".into(),
+                },
+            )
+            .unwrap();
+
+        let input_b = source.add_component("input", -2.0, 2.0).unwrap();
+        source
+            .components
+            .iter_mut()
+            .find(|item| item.id == input_b)
+            .unwrap()
+            .name = "B".into();
+        assert_eq!(source.refresh_linked_blocks().unwrap(), 1);
+        let expanded = source.block_definition(definition_id).unwrap().clone();
+        assert_eq!(expanded.revision, 2);
+        assert!(expanded.pins.iter().any(|pin| pin.name == "B"));
+        assert!(parent.merge_block_definition(expanded).unwrap());
+        assert_eq!(parent.wires.len(), 1);
+        assert_eq!(
+            parent.component_terminals(
+                parent
+                    .components
+                    .iter()
+                    .find(|item| item.id == instance)
+                    .unwrap()
+            ),
+            vec!["A", "Y", "B"]
+        );
+
+        source.delete_components(&[input_a]).unwrap();
+        assert!(source.refresh_linked_blocks().is_err());
+        assert_eq!(source.block_definition(definition_id).unwrap().revision, 2);
+    }
+
+    #[test]
+    fn save_as_forks_project_identity_without_claiming_original_blocks() {
+        let mut original = Project::default();
+        original.add_component("input", -2.0, 0.0).unwrap();
+        original.add_component("output", 2.0, 0.0).unwrap();
+        let definition_id = original.capture_block("COPY_SOURCE".into()).unwrap();
+        let original_project_id = original.project_id;
+
+        let mut copy = original.clone();
+        copy.fork_for_save_as();
+        assert_ne!(copy.project_id, original_project_id);
+        assert_eq!(
+            copy.block_definition(definition_id)
+                .unwrap()
+                .source_project_id,
+            Some(original_project_id)
+        );
+        copy.add_resistor(0.0, 2.0);
+        assert_eq!(copy.refresh_linked_blocks().unwrap(), 0);
+        assert_eq!(copy.block_definition(definition_id).unwrap().revision, 1);
+
+        let mut legacy = original.clone();
+        legacy.block_definitions[0].source_project_id = None;
+        legacy.fork_for_save_as();
+        assert_eq!(
+            legacy
+                .block_definition(definition_id)
+                .unwrap()
+                .source_project_id,
+            Some(original_project_id)
+        );
+    }
+
+    #[test]
+    fn duplicating_components_offsets_them_and_preserves_internal_wires() {
+        let mut project = Project::default();
+        let left = project.add_component("input", 0.0, 0.0).unwrap();
+        let right = project.add_component("output", 40.0, 0.0).unwrap();
+        project
+            .connect(
+                TerminalRef {
+                    component_id: left,
+                    terminal: "out".into(),
+                },
+                TerminalRef {
+                    component_id: right,
+                    terminal: "in".into(),
+                },
+            )
+            .unwrap();
+        project.duplicate_components(&[left, right]).unwrap();
+
+        assert_eq!(project.components.len(), 4);
+        assert_eq!(project.wires.len(), 2);
+        let copied = project.components.iter().skip(2).collect::<Vec<_>>();
+        assert!(copied.iter().all(|component| component.position.y == 20.0));
+        assert!(copied.iter().any(|component| component.position.x == 20.0));
+        assert!(copied.iter().any(|component| component.position.x == 60.0));
+        let copied_ids = copied
+            .iter()
+            .map(|component| component.id)
+            .collect::<HashSet<_>>();
+        let copied_wire = &project.wires[1];
+        assert!(copied_ids.contains(&copied_wire.from.component_id));
+        assert!(copied_ids.contains(&copied_wire.to.as_ref().unwrap().component_id));
+    }
 
     #[test]
     fn circuit_name_is_validated_and_persisted_in_the_model() {

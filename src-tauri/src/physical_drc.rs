@@ -1,7 +1,8 @@
 use crate::{
     physical_canvas::{ObstructionType, PhysicalCanvas},
     physical_layout::{
-        PhysicalLayer, PhysicalLayoutIr, PhysicalRowTopology, PhysicalShape, PhysicalShapePurpose,
+        DensitySpatialIndex, PhysicalLayer, PhysicalLayoutIr, PhysicalRowTopology, PhysicalShape,
+        PhysicalShapePurpose,
     },
     technology::{CutRule, LayerRule, Technology},
 };
@@ -325,6 +326,11 @@ pub fn validate(ir: &PhysicalLayoutIr, technology: &Technology) -> PhysicalDrcRe
     validate_terminal_connectivity(&ir.shapes, &mut report);
     validate_logical_terminal_obligations(ir, &mut report);
     validate_route_endpoints(ir, &mut report);
+    if !ir.density_arrays.is_empty() || technology.physical_rules.density_fill.use_arrays {
+        for (layer, message) in crate::density_arrays::validate(&ir.density_arrays, &ir.shapes, &ir.bounds, technology) {
+            report.push("DENSITY.ARRAY", message, layer, Vec::new(), 0.0, 1.0);
+        }
+    }
     report
 }
 
@@ -698,7 +704,7 @@ fn validate_logical_terminal_obligations(ir: &PhysicalLayoutIr, report: &mut Phy
         .shapes
         .iter()
         .enumerate()
-        .filter(|(_, shape)| shape.net.is_some() && shape.purpose == PhysicalShapePurpose::Pin)
+        .filter(|(_, shape)| shape.net.is_some() && shape.purpose.is_pin())
     {
         obligations
             .entry(pin.net.expect("filtered physical pin"))
@@ -746,6 +752,13 @@ fn validate_logical_terminal_obligations(ir: &PhysicalLayoutIr, report: &mut Phy
                     + usize::from(device.source_net == net.id)
             })
             .sum::<usize>();
+        let internal_active_terminals = ir
+            .row_topology
+            .iter()
+            .flat_map(|row| &row.islands)
+            .flat_map(|island| &island.accesses)
+            .find(|access| topology_internal_access(ir, access) && access.net == net.id)
+            .map_or(0, |access| access.device_ids.len());
         // Only persisted pin geometry is an electrical obligation. VDD/GND
         // schematic source symbols currently become distributed power fabric,
         // not perimeter pin shapes; counting their logical symbols here would
@@ -753,13 +766,15 @@ fn validate_logical_terminal_obligations(ir: &PhysicalLayoutIr, report: &mut Phy
         let expected_pins = ir
             .shapes
             .iter()
-            .filter(|shape| shape.net == Some(net.id) && shape.purpose == PhysicalShapePurpose::Pin)
+            .filter(|shape| shape.net == Some(net.id) && shape.purpose.is_pin())
             .count();
         let expected_power_fabric = usize::from(matches!(
             net.role,
             crate::physical_layout::NetRole::Power | crate::physical_layout::NetRole::Ground
         ));
-        let expected = expected_device_terminals + expected_pins + expected_power_fabric;
+        let expected = expected_device_terminals.saturating_sub(internal_active_terminals)
+            + expected_pins
+            + expected_power_fabric;
         if expected == 0 {
             continue;
         }
@@ -914,34 +929,40 @@ pub(crate) fn missing_device_terminal_attachments(
             .collect::<Vec<_>>();
         for (terminal, expected_net) in [("drain", device.drain_net), ("source", device.source_net)]
         {
-            let contact = island
+            let access = island
                 .accesses
                 .iter()
                 .filter(|access| {
                     access.net == expected_net && access.device_ids.contains(&device.component_id)
                 })
-                .find_map(|access| {
-                    ir.shapes.iter().enumerate().find(|(_, shape)| {
-                        shape.layer == PhysicalLayer::Contact
-                            && shape.purpose == PhysicalShapePurpose::Contact
-                            && shape.net == Some(expected_net)
-                            && (if access.shared_contact {
-                                shape.component_id.is_none()
-                                    && (shape.x - access.x).abs() <= EPSILON
-                                    && (shape.y - access.y).abs() <= EPSILON
-                            } else {
-                                shape.component_id == Some(device.component_id)
-                            })
-                            && active
-                                .iter()
-                                .any(|(_, active_shape)| shapes_touch(shape, active_shape))
-                            && ir.shapes.iter().any(|landing| {
-                                landing.layer == PhysicalLayer::Metal(1)
-                                    && landing.net == shape.net
-                                    && shapes_touch(landing, shape)
-                            })
-                    })
+                .find(|access| {
+                    access.net == expected_net && access.device_ids.contains(&device.component_id)
                 });
+            if access.is_some_and(|access| topology_internal_access(ir, access)) {
+                continue;
+            }
+            let contact = access.and_then(|access| {
+                ir.shapes.iter().enumerate().find(|(_, shape)| {
+                    shape.layer == PhysicalLayer::Contact
+                        && shape.purpose == PhysicalShapePurpose::Contact
+                        && shape.net == Some(expected_net)
+                        && (if access.shared_contact {
+                            shape.component_id.is_none()
+                                && (shape.x - access.x).abs() <= EPSILON
+                                && (shape.y - access.y).abs() <= EPSILON
+                        } else {
+                            shape.component_id == Some(device.component_id)
+                        })
+                        && active
+                            .iter()
+                            .any(|(_, active_shape)| shapes_touch(shape, active_shape))
+                        && ir.shapes.iter().any(|landing| {
+                            landing.layer == PhysicalLayer::Metal(1)
+                                && landing.net == shape.net
+                                && shapes_touch(landing, shape)
+                        })
+                })
+            });
             if contact.is_none() {
                 missing.push(MissingDeviceTerminalAttachment {
                     component_id: device.component_id,
@@ -952,6 +973,40 @@ pub(crate) fn missing_device_terminal_attachments(
         }
     }
     missing
+}
+
+/// A repeated source/drain boundary wholly contained by one persisted active
+/// island is electrically closed in diffusion and must not be manufactured as
+/// a contact/M1 pin. This exemption is intentionally narrow: every logical
+/// terminal on the net must be one of the access members and no boundary pin
+/// may expose the net outside the island.
+fn topology_internal_access(
+    ir: &PhysicalLayoutIr,
+    access: &crate::physical_layout::PhysicalTerminalAccess,
+) -> bool {
+    if access.device_ids.len() < 2
+        || access.shared_contact
+        || ir
+            .shapes
+            .iter()
+            .any(|shape| shape.net == Some(access.net) && shape.purpose.is_pin())
+    {
+        return false;
+    }
+    let terminal_devices = ir
+        .devices
+        .iter()
+        .flat_map(|device| {
+            [device.gate_net, device.drain_net, device.source_net]
+                .into_iter()
+                .filter(move |net| *net == access.net)
+                .map(move |_| device.component_id)
+        })
+        .collect::<Vec<_>>();
+    terminal_devices.len() == access.device_ids.len()
+        && terminal_devices
+            .iter()
+            .all(|device_id| access.device_ids.contains(device_id))
 }
 
 fn validate_device_terminal_attachments(ir: &PhysicalLayoutIr, report: &mut PhysicalDrcReport) {
@@ -979,6 +1034,71 @@ fn validate_device_terminal_attachments(ir: &PhysicalLayoutIr, report: &mut Phys
     }
 }
 
+// Minimum metal area applies to each physically connected polygon, not to
+// its arbitrary rectangle decomposition. Vias and same-net disconnected
+// islands cannot contribute area to this component.
+fn connected_metal_area(
+    start: usize,
+    shapes: &[PhysicalShape],
+    spatial: &PhysicalCanvas,
+    indices: &HashMap<u64, usize>,
+    cache: &mut HashMap<usize, f64>,
+    required: f64,
+) -> f64 {
+    if let Some(area) = cache.get(&start) {
+        return *area;
+    }
+    let seed = &shapes[start];
+    let mut pending = vec![start];
+    let mut visited = HashSet::new();
+    let mut proven_area: f64 = 0.0;
+    while let Some(index) = pending.pop() {
+        if !visited.insert(index) {
+            continue;
+        }
+        let shape = &shapes[index];
+        proven_area = proven_area.max(
+            cache
+                .get(&index)
+                .copied()
+                .unwrap_or(shape.width * shape.height),
+        );
+        if proven_area + EPSILON >= required {
+            break;
+        }
+        for neighbor in spatial.query_neighbors(shape) {
+            let next = indices[&neighbor.id];
+            let other = &shapes[next];
+            if other.layer == seed.layer
+                && other.net == seed.net
+                && other.purpose != PhysicalShapePurpose::DummyFill
+                && shapes_touch(shape, other)
+                && !visited.contains(&next)
+            {
+                pending.push(next);
+            }
+        }
+    }
+    if proven_area + EPSILON < required {
+        let component = visited
+            .iter()
+            .map(|index| shapes[*index].clone())
+            .collect::<Vec<_>>();
+        let bounds = crate::physical_layout::PhysicalBounds {
+            min_x: f64::NEG_INFINITY,
+            min_y: f64::NEG_INFINITY,
+            max_x: f64::INFINITY,
+            max_y: f64::INFINITY,
+        };
+        proven_area =
+            crate::physical_layout::rectangle_union_area(&component, "metal", seed.layer, &bounds);
+    }
+    for index in visited {
+        cache.insert(index, proven_area);
+    }
+    proven_area
+}
+
 fn validate_shape_set(
     shapes: &[PhysicalShape],
     max_metal_layers: u16,
@@ -989,6 +1109,24 @@ fn validate_shape_set(
     let mut report = PhysicalDrcReport::default();
     let grid = technology.physical_rules.manufacturing_grid_um;
 
+    let mut spatial = PhysicalCanvas::new(&technology.physical_rules);
+    let mut shape_by_occupied_id = HashMap::with_capacity(shapes.len());
+    for (shape_index, shape) in shapes.iter().enumerate() {
+        // Density fill has its own process-aware spacing/coverage validation
+        // and is skipped by the pairwise checks below. Avoid rasterizing
+        // large, electrically inert preview tiles into the fine routing grid.
+        if shape.purpose == PhysicalShapePurpose::DummyFill {
+            continue;
+        }
+        let occupied_id = spatial.index_unchecked(
+            shape,
+            format!("drc-shape-{shape_index}"),
+            obstruction_type(shape.layer),
+        );
+        shape_by_occupied_id.insert(occupied_id, shape_index);
+    }
+
+    let mut metal_areas = HashMap::new();
     for (index, shape) in shapes.iter().enumerate() {
         let (left, top, right, bottom) = edges(shape);
         if ![left, top, right, bottom]
@@ -1100,7 +1238,20 @@ fn validate_shape_set(
                     rule.min_width_um,
                 );
             }
-            let area = shape.width * shape.height;
+            let mut area = shape.width * shape.height;
+            if area + EPSILON < rule.min_area_um2
+                && matches!(shape.layer, PhysicalLayer::Metal(_))
+                && shape.net.is_some()
+            {
+                area = connected_metal_area(
+                    index,
+                    shapes,
+                    &spatial,
+                    &shape_by_occupied_id,
+                    &mut metal_areas,
+                    rule.min_area_um2,
+                );
+            }
             if area + EPSILON < rule.min_area_um2 {
                 report.push(
                     "GEOMETRY.MIN_AREA",
@@ -1125,17 +1276,6 @@ fn validate_shape_set(
                 );
             }
         }
-    }
-
-    let mut spatial = PhysicalCanvas::new(&technology.physical_rules);
-    let mut shape_by_occupied_id = HashMap::with_capacity(shapes.len());
-    for (shape_index, shape) in shapes.iter().enumerate() {
-        let occupied_id = spatial.index_unchecked(
-            shape,
-            format!("drc-shape-{shape_index}"),
-            obstruction_type(shape.layer),
-        );
-        shape_by_occupied_id.insert(occupied_id, shape_index);
     }
 
     for left_index in 0..shapes.len() {
@@ -1163,6 +1303,29 @@ fn validate_shape_set(
             // diffusion polygon, so internal decomposition edges are not
             // diffusion-spacing boundaries.
             if same_active_island(left, right, row_topology) {
+                continue;
+            }
+            // Process-owned perimeter rings and their fixed, unassigned pads
+            // are decomposed into touching rectangles without pretending they
+            // belong to a routed schematic net. Their touching edges form the
+            // intended manufactured perimeter conductor.
+            if left.net.is_none()
+                && right.net.is_none()
+                && left.component_id.is_none()
+                && right.component_id.is_none()
+                && matches!(
+                    left.purpose,
+                    PhysicalShapePurpose::PowerRail
+                        | PhysicalShapePurpose::Pin
+                        | PhysicalShapePurpose::Pad
+                )
+                && matches!(
+                    right.purpose,
+                    PhysicalShapePurpose::PowerRail
+                        | PhysicalShapePurpose::Pin
+                        | PhysicalShapePurpose::Pad
+                )
+            {
                 continue;
             }
             // Continuous same-net layers may merge into one conductor. Cuts
@@ -1197,6 +1360,17 @@ fn validate_shape_set(
         }
     }
 
+    let maximum_density_clearance = technology
+        .physical_rules
+        .density_fill
+        .layers
+        .values()
+        .map(|rule| rule.fill_spacing_um.max(rule.circuit_spacing_um))
+        .fold(0.0, f64::max);
+    let mut density_spatial = DensitySpatialIndex::new(maximum_density_clearance.max(32.0));
+    for (index, shape) in shapes.iter().enumerate() {
+        density_spatial.insert(index, shape);
+    }
     for (fill_index, fill) in shapes
         .iter()
         .enumerate()
@@ -1213,7 +1387,9 @@ fn validate_shape_set(
             );
             continue;
         };
-        for (other_index, other) in shapes.iter().enumerate() {
+        let query_clearance = rule.fill_spacing_um.max(rule.circuit_spacing_um);
+        for other_index in density_spatial.query(fill, query_clearance) {
+            let other = &shapes[other_index];
             if other_index == fill_index {
                 continue;
             }
@@ -1533,7 +1709,7 @@ fn validate_terminal_connectivity(shapes: &[PhysicalShape], report: &mut Physica
     for (pin_index, pin) in shapes
         .iter()
         .enumerate()
-        .filter(|(_, shape)| shape.net.is_some() && shape.purpose == PhysicalShapePurpose::Pin)
+        .filter(|(_, shape)| shape.net.is_some() && shape.purpose.is_pin())
     {
         by_net
             .entry(pin.net.expect("filtered pin net"))
@@ -1707,6 +1883,8 @@ mod tests {
                 shapes_outside_floorplan: 0,
                 shapes_outside_tapeout: 0,
             },
+            density: Default::default(),
+            density_arrays: Vec::new(),
             bounds: PhysicalBounds {
                 min_x: -2.0,
                 min_y: -2.0,
@@ -1733,6 +1911,43 @@ mod tests {
             net,
             purpose: Default::default(),
         }
+    }
+
+    #[test]
+    fn metal_minimum_area_uses_connected_union_without_double_counting() {
+        let mut technology = Technology::default();
+        technology.physical_rules.layer_overrides.clear();
+        technology.physical_rules.metal.min_area_um2 = 0.14;
+        technology.physical_rules.metal.min_width_um = 0.23;
+        let piece = |x, net| {
+            let mut p = shape(PhysicalLayer::Metal(1), x, 0.3, Some(net));
+            p.height = 0.23;
+            p
+        };
+        let area_errors = |pieces| {
+            validate(&layout(pieces), &technology)
+                .diagnostics
+                .into_iter()
+                .filter(|d| d.rule_id == "GEOMETRY.MIN_AREA")
+                .count()
+        };
+        assert_eq!(
+            area_errors(vec![piece(0.0, 1), piece(0.2, 1), piece(0.4, 1)]),
+            0
+        );
+        assert_eq!(area_errors(vec![piece(0.0, 1), piece(0.2, 1)]), 2);
+        assert_eq!(
+            area_errors(vec![piece(0.0, 1), piece(0.0, 1), piece(0.0, 1)]),
+            3
+        );
+        assert_eq!(
+            area_errors(vec![piece(0.0, 1), piece(1.0, 1), piece(2.0, 1)]),
+            3
+        );
+        assert_eq!(
+            area_errors(vec![piece(0.0, 1), piece(0.2, 2), piece(0.4, 3)]),
+            3
+        );
     }
 
     #[test]
@@ -1966,6 +2181,63 @@ mod tests {
                     x: 0.0,
                     y: 0.0,
                     shared_contact: true,
+                }],
+                bounds: PhysicalBounds {
+                    min_x: -1.0,
+                    min_y: -0.5,
+                    max_x: 1.0,
+                    max_y: 0.5,
+                },
+                geometry: vec![],
+            }],
+            gate_straps: vec![],
+        });
+
+        let mut report = PhysicalDrcReport::default();
+        validate_logical_terminal_obligations(&ir, &mut report);
+        assert!(report.diagnostics.is_empty(), "{:#?}", report.diagnostics);
+    }
+
+    #[test]
+    fn topology_internal_diffusion_node_requires_no_contact_or_metal_pin() {
+        let left = uuid::Uuid::new_v4();
+        let right = uuid::Uuid::new_v4();
+        let mut ir = layout(vec![]);
+        ir.devices = [left, right]
+            .into_iter()
+            .map(|component_id| PhysicalDevice {
+                component_id,
+                name: format!("M{component_id}"),
+                physical_group: None,
+                standard_cell_group: Some("CELL".into()),
+                kind: DeviceKind::Nmos,
+                gate_net: 8,
+                drain_net: 7,
+                source_net: 9,
+                width_um: 1.0,
+                length_um: 0.18,
+            })
+            .collect();
+        ir.nets.push(PhysicalNet {
+            id: 7,
+            name: "internal_shared_active".into(),
+            role: NetRole::Internal,
+            terminals: vec![],
+        });
+        ir.row_topology.push(PhysicalRowTopology {
+            kind: DeviceKind::Nmos,
+            y: 0.0,
+            ordered_devices: vec![left, right],
+            islands: vec![PhysicalActiveIsland {
+                layer: PhysicalLayer::Ndiff,
+                device_ids: vec![left, right],
+                terminal_nets: vec![9, 7, 9],
+                accesses: vec![PhysicalTerminalAccess {
+                    net: 7,
+                    device_ids: vec![left, right],
+                    x: 0.0,
+                    y: 0.0,
+                    shared_contact: false,
                 }],
                 bounds: PhysicalBounds {
                     min_x: -1.0,

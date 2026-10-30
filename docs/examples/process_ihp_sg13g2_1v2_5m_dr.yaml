@@ -82,7 +82,9 @@ gds_layers:
   label_datatype: 25
   layers:
     substrate: []
-    pwell: []
+    # OpenChippy currently emits an explicit P-well boundary; map it to the
+    # published internal PWell drawing layer for compatibility exports.
+    pwell: [{ purpose: PWell, layer: 46, datatype: 0 }]
     nwell: [{ purpose: NWell, layer: 31, datatype: 0 }]
     ndiff:
       - { purpose: Activ, layer: 1, datatype: 0 }
@@ -183,15 +185,16 @@ physical_rules:
   well_enclosure_um: 0.43
   max_tap_distance_um: 20.0
 
-  # Deterministic non-electrical fill guidance based on the public IHP
-  # precheck/rejection rules. Global and 800 x 800 um window requirements are
-  # recorded separately because a small Tiny Tapeout macro may rely partly on
-  # top-level shuttle fill. Tile sizes below are OpenChippy implementation
-  # defaults, not foundry-mandated filler dimensions.
+  # PROVISIONAL: metal fill currently mirrors the packaged GF180 compatibility
+  # contract so OpenChippy can exercise one deterministic local-density flow
+  # across both processes. These dimensions are not claimed as SG13G2 rules;
+  # replace them with values from a qualified IHP density/fill deck before use.
   density_fill:
     format_version: 1
-    evaluation_window_width_um: 800.0
-    evaluation_window_height_um: 800.0
+    evaluation_window_width_um: 200.0
+    evaluation_window_height_um: 200.0
+    evaluation_window_step_x_um: 100.0
+    evaluation_window_step_y_um: 100.0
     layers:
       active:
         target_density: 0.35
@@ -211,60 +214,35 @@ physical_rules:
         fill_spacing_um: 1.10
         circuit_spacing_um: 1.10
       metal1:
-        target_density: 0.35
-        minimum_global_density: 0.35
-        maximum_global_density: 0.60
-        minimum_window_density: 0.25
-        maximum_window_density: 0.75
+        target_density: 0.31
         tile_width_um: 2.0
         tile_height_um: 2.0
-        fallback_tile_sizes_um: [1.0, 0.5]
-        fill_spacing_um: 0.42
-        circuit_spacing_um: 0.42
+        fill_spacing_um: 1.2
+        circuit_spacing_um: 2.0
       metal2:
-        target_density: 0.35
-        minimum_global_density: 0.35
-        maximum_global_density: 0.60
-        minimum_window_density: 0.25
-        maximum_window_density: 0.75
+        target_density: 0.31
         tile_width_um: 2.0
         tile_height_um: 2.0
-        fallback_tile_sizes_um: [1.0, 0.5]
-        fill_spacing_um: 0.42
-        circuit_spacing_um: 0.42
+        fill_spacing_um: 1.2
+        circuit_spacing_um: 2.0
       metal3:
-        target_density: 0.35
-        minimum_global_density: 0.35
-        maximum_global_density: 0.60
-        minimum_window_density: 0.25
-        maximum_window_density: 0.75
+        target_density: 0.31
         tile_width_um: 2.0
         tile_height_um: 2.0
-        fallback_tile_sizes_um: [1.0, 0.5]
-        fill_spacing_um: 0.42
-        circuit_spacing_um: 0.42
+        fill_spacing_um: 1.2
+        circuit_spacing_um: 2.0
       metal4:
-        target_density: 0.35
-        minimum_global_density: 0.35
-        maximum_global_density: 0.60
-        minimum_window_density: 0.25
-        maximum_window_density: 0.75
+        target_density: 0.31
         tile_width_um: 2.0
         tile_height_um: 2.0
-        fallback_tile_sizes_um: [1.0, 0.5]
-        fill_spacing_um: 0.42
-        circuit_spacing_um: 0.42
+        fill_spacing_um: 1.2
+        circuit_spacing_um: 2.0
       metal5:
-        target_density: 0.35
-        minimum_global_density: 0.35
-        maximum_global_density: 0.60
-        minimum_window_density: 0.25
-        maximum_window_density: 0.75
+        target_density: 0.31
         tile_width_um: 2.0
         tile_height_um: 2.0
-        fallback_tile_sizes_um: [1.0, 0.5]
-        fill_spacing_um: 0.42
-        circuit_spacing_um: 0.42
+        fill_spacing_um: 1.2
+        circuit_spacing_um: 2.0
 
   layer_overrides:
     metal1:

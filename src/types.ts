@@ -68,6 +68,8 @@ export type Wire = {
 
 export type Project = {
   formatVersion: number;
+  projectId: string;
+  forkedFromProjectId: string | null;
   name: string;
   components: Component[];
   wires: Wire[];
@@ -77,9 +79,13 @@ export type Project = {
   timingTargetNs: number | null;
   highFanoutWarningThreshold: number;
   rtlDesign: RtlDesign | null;
+  tapeoutPinBindings: Record<string, string>;
 };
 
 export type RtlModule = {
+  source?: string;
+  compiler?: string;
+  initialValues?: Record<string, boolean>;
   name: string;
   parameters: Array<{ name: string; defaultExpression: string; defaultValue: number }>;
   ports: Array<{ name: string; direction: "input" | "output"; range: RtlRange | null }>;
@@ -97,6 +103,7 @@ export type RtlModule = {
     referencedSignals: string[];
   }>;
   sequentialProcesses: Array<{
+    asynchronousReset?: { signal: string; activeHigh: boolean; value: boolean } | null;
     edge: "posedge" | "negedge";
     clock: string;
     target: string;
@@ -138,6 +145,9 @@ export type BlockDefinition = {
   components: Component[];
   wires: Wire[];
   pins: BlockPin[];
+  sourceProjectId?: string;
+  sourceDigest?: string;
+  revision: number;
 };
 
 export type MosTechnology = {
@@ -155,6 +165,7 @@ export type Technology = {
   process_id: string;
   deck_revision: string;
   source: string;
+  standard_cell_library: string | null;
   supply_voltage: number;
   max_metal_layers: number;
   nmos: MosTechnology;
@@ -167,6 +178,7 @@ export type Technology = {
 };
 
 export type GdsLayerMap = {
+  pad_opening?: { layer: number; datatype: number; inset_um: number; underlying_metal_min_width_um: number };
   format_version: number;
   label_datatype: number;
   layers: Record<string, Array<{ purpose: string; layer: number; datatype: number }>>;
@@ -178,6 +190,22 @@ export type TapeoutWindow = {
   width_um: number;
   height_um: number;
   edge_margin_um: number;
+  layout_mode: "full_usable_area" | "content_fit";
+  rings: Array<{
+    net: "power" | "ground" | "gpio";
+    layer: number;
+    width_um: number;
+    inset_um: number;
+  }>;
+  pads: Array<{
+    id: string;
+    role: "power" | "ground" | "gpio";
+    side: "top" | "right" | "bottom" | "left";
+    offset_um: number;
+    width_um: number;
+    height_um: number;
+    layer: number;
+  }>;
 };
 
 export type PhysicalParasiticRules = {
@@ -278,6 +306,12 @@ export type PhysicalLayoutIr = {
     name: string;
     role: "power" | "ground" | "input" | "output" | "internal";
     net: number;
+    padId: string | null;
+    x: number | null;
+    y: number | null;
+    widthUm: number | null;
+    heightUm: number | null;
+    layer: number | null;
   }>;
   planning: {
     placementSiteWidthUm: number;
@@ -503,6 +537,39 @@ export type PhysicalLayoutIr = {
     shapesOutsideFloorplan: number;
     shapesOutsideTapeout: number;
   };
+  densityArrays?: Array<{
+    material: string;
+    layer: string;
+    x: number;
+    y: number;
+    tileWidth: number;
+    tileHeight: number;
+    stepX: number;
+    stepY: number;
+    columns: number;
+    rows: number;
+  }>;
+  density: {
+    layers: Array<{
+      material: string;
+      preferredDensity: number;
+      minimumGlobalDensity: number;
+      maximumGlobalDensity: number | null;
+      achievedGlobalDensity: number;
+      minimumWindowDensity: number;
+      maximumWindowDensity: number | null;
+      achievedMinimumWindowDensity: number;
+      achievedMaximumWindowDensity: number;
+      windowWidthUm: number;
+      windowHeightUm: number;
+      windowStepXUm: number;
+      windowStepYUm: number;
+      windowCount: number;
+      underfilledWindowCount: number;
+      overfilledWindowCount: number;
+      dummyShapeCount: number;
+    }>;
+  };
   bounds: {
     minX: number;
     minY: number;
@@ -526,6 +593,7 @@ export type PhysicalLayoutIr = {
       | "contact"
       | "device_landing"
       | "pin"
+      | "pad"
       | "power_rail"
       | "route"
       | "route_fill"
@@ -622,6 +690,11 @@ export type PhysicalLayoutIr = {
     deckRevision: string;
     source: string;
     generated: boolean;
+    inferredInstances: Array<{
+      instance: string;
+      cell: string;
+      deviceIds: string[];
+    }>;
     cells: Array<{
       definition: {
         name: string;

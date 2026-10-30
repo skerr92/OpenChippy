@@ -43,12 +43,12 @@ const BASE_LAYERS: Record<string, LayerStyle> = {
 
 const METAL_COLORS = ["#5fa8e7", "#b66ee8", "#ee6fa7", "#79c968", "#e4aa54", "#67c9ce"];
 
-function createLayers(maxMetalLayers: number): Record<string, LayerStyle> {
+function createLayers(maxMetalLayers: number, renderedMetalLayers = maxMetalLayers): Record<string, LayerStyle> {
   const layers = { ...BASE_LAYERS };
-  for (let index = 1; index <= maxMetalLayers; index += 1) {
+  for (let index = 1; index <= renderedMetalLayers; index += 1) {
     const elevation = .48 + (index - 1) * .24;
     layers[`metal${index}`] = {
-      label: `Metal ${index}`,
+      label: index > maxMetalLayers ? "Top-metal fill" : `Metal ${index}`,
       color: METAL_COLORS[(index - 1) % METAL_COLORS.length],
       elevation,
       thickness: .13,
@@ -97,7 +97,17 @@ export default function PhysicalViewport({
   const cameraSnapshot = useRef<CameraSnapshot | null>(null);
   const cameraLayout = useRef<PhysicalLayoutIr | null>(null);
   const selectRef = useRef(onSelect);
-  const layers = useMemo(() => createLayers(layout?.maxMetalLayers ?? 5), [layout?.maxMetalLayers]);
+  const renderedMetalLayers = useMemo(() => {
+    const routable = layout?.maxMetalLayers ?? 5;
+    return [...(layout?.shapes ?? []), ...(layout?.densityArrays ?? [])].reduce((maximum, shape) => {
+      const match = /^metal(\d+)$/.exec(shape.layer);
+      return match ? Math.max(maximum, Number(match[1])) : maximum;
+    }, routable);
+  }, [layout]);
+  const layers = useMemo(
+    () => createLayers(layout?.maxMetalLayers ?? 5, renderedMetalLayers),
+    [layout?.maxMetalLayers, renderedMetalLayers],
+  );
   const [visibleLayers, setVisibleLayers] = useState<Set<LayerName>>(
     () => new Set(Object.keys(createLayers(5))),
   );
@@ -114,6 +124,34 @@ export default function PhysicalViewport({
   const [drcSeverity, setDrcSeverity] = useState("all");
   const [drcNet, setDrcNet] = useState("all");
   const [showBlockRegions, setShowBlockRegions] = useState(true);
+  const [showDummyFill, setShowDummyFill] = useState(true);
+  const [soloDummyFill, setSoloDummyFill] = useState(false);
+  const perimeterGeometry = useMemo(() => {
+    if (!layout) return { rings: 0, pads: 0 };
+    return layout.shapes.reduce(
+      (counts, shape) => {
+        if (shape.componentId === null && shape.net === null && shape.purpose === "power_rail") {
+          counts.rings += 1;
+        }
+        if (shape.purpose === "pad") {
+          counts.pads += 1;
+        }
+        return counts;
+      },
+      { rings: 0, pads: 0 },
+    );
+  }, [layout]);
+  const dummyFillByLayer = useMemo(() => {
+    const counts: Record<string, number> = {};
+    layout?.shapes.forEach((shape) => {
+      if (shape.purpose === "dummy_fill") counts[shape.layer] = (counts[shape.layer] ?? 0) + 1;
+    });
+    layout?.densityArrays?.forEach((array) => {
+      counts[array.layer] = (counts[array.layer] ?? 0) + array.columns * array.rows;
+    });
+    return counts;
+  }, [layout]);
+  const dummyFillCount = Object.values(dummyFillByLayer).reduce((sum, count) => sum + count, 0);
   selectRef.current = onSelect;
 
   useEffect(() => {
@@ -163,6 +201,8 @@ export default function PhysicalViewport({
     const highlightedBox = new THREE.Box3();
     layout.shapes.forEach((shape, shapeIndex) => {
         if (!visibleLayers.has(shape.layer)) return;
+        const dummyFill = shape.purpose === "dummy_fill";
+        if (dummyFill ? !showDummyFill : soloDummyFill) return;
         const layer = layers[shape.layer];
         if (!layer) return;
         const geometry = new THREE.BoxGeometry(
@@ -172,10 +212,13 @@ export default function PhysicalViewport({
         );
         const selected = shape.componentId ? selectedIds.includes(shape.componentId) : false;
         const violation = highlightedIndices.has(shapeIndex);
+        const baseColor = dummyFill
+          ? new THREE.Color(layer.color).lerp(new THREE.Color("#fff2a8"), .3)
+          : new THREE.Color(layer.color);
         const material = new THREE.MeshStandardMaterial({
-          color: violation ? "#ff5252" : selected ? "#ffd277" : layer.color,
-          emissive: violation ? "#7a0909" : "#000000",
-          emissiveIntensity: violation ? 1.8 : 0,
+          color: violation ? "#ff5252" : selected ? "#ffd277" : baseColor,
+          emissive: violation ? "#7a0909" : dummyFill ? baseColor : "#000000",
+          emissiveIntensity: violation ? 1.8 : dummyFill ? .18 : 0,
           transparent: shape.layer === "nwell" || shape.layer === "substrate",
           opacity: shape.layer === "nwell" ? .48 : shape.layer === "substrate" ? .9 : 1,
           roughness: .5,
@@ -193,6 +236,37 @@ export default function PhysicalViewport({
         scene.add(mesh);
       });
 
+    // Render exact repeated tiles with one patterned plane per array. The
+    // lattice remains inspectable when zoomed in without millions of meshes.
+    if (showDummyFill) layout.densityArrays?.forEach((array) => {
+      if (!visibleLayers.has(array.layer)) return;
+      const layer = layers[array.layer];
+      if (!layer) return;
+      const width = array.tileWidth + (array.columns - 1) * array.stepX;
+      const height = array.tileHeight + (array.rows - 1) * array.stepY;
+      const geometry = new THREE.PlaneGeometry(width, height);
+      const material = new THREE.ShaderMaterial({
+        uniforms: {
+          extent: { value: new THREE.Vector2(width, height) },
+          tile: { value: new THREE.Vector2(array.tileWidth, array.tileHeight) },
+          pitch: { value: new THREE.Vector2(array.stepX, array.stepY) },
+          fillColor: { value: new THREE.Color(layer.color).lerp(new THREE.Color("#fff2a8"), .3) },
+        },
+        vertexShader: "varying vec2 tileUv; void main(){ tileUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }",
+        fragmentShader: `varying vec2 tileUv; uniform vec2 extent, tile, pitch; uniform vec3 fillColor;
+          void main(){ vec2 at=vec2(tileUv.x,1.0-tileUv.y)*extent;
+            vec2 local=mod(at,pitch);
+            if(local.x>tile.x || local.y>tile.y) discard;
+            gl_FragColor=vec4(fillColor,1.0); }`,
+        side: THREE.DoubleSide,
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.rotation.x = -Math.PI / 2;
+      mesh.position.set(array.x + (width - array.tileWidth) / 2, layer.elevation, array.y + (height - array.tileHeight) / 2);
+      scene.add(mesh);
+      geometries.push(geometry);
+      materials.push(material);
+    });
     const boundary = new THREE.Box3(
       new THREE.Vector3(layout.bounds.minX, -.24, layout.bounds.minY),
       new THREE.Vector3(
@@ -335,7 +409,7 @@ export default function PhysicalViewport({
       renderer.dispose();
       renderer.domElement.remove();
     };
-  }, [layout, selectedIds, visibleLayers, layers, selectedDrc, showBlockRegions]);
+  }, [layout, selectedIds, visibleLayers, layers, selectedDrc, showBlockRegions, showDummyFill, soloDummyFill]);
 
   const toggleLayer = (layer: LayerName) => {
     setVisibleLayers((current) => {
@@ -414,6 +488,25 @@ export default function PhysicalViewport({
           <span>{layout ? `${layout.devices.length} MOS` : "Generating…"}</span>
           <span>{layout ? `${layout.nets.length} nets · ${layout.pins.length} pins` : ""}</span>
           <span>{layout ? `${layout.maxMetalLayers} routing metals` : ""}</span>
+          {layout && perimeterGeometry.rings > 0 && (
+            <span>{perimeterGeometry.rings} ring segments · {perimeterGeometry.pads} free process pads</span>
+          )}
+          {layout && <span>{dummyFillCount} dummy-fill shapes</span>}
+          {layout && Object.entries(dummyFillByLayer).map(([layer, count]) => (
+            <span key={`fill-${layer}`}>{layer} fill · {count}</span>
+          ))}
+          {layout && dummyFillCount === 0 && <strong>No dummy fill in this Physical IR</strong>}
+          {layout?.density.layers.map((density) => (
+            <span key={`density-${density.material}`}>
+              {density.material} density · global {(density.achievedGlobalDensity * 100).toFixed(1)}%
+              {` · windows ${(density.achievedMinimumWindowDensity * 100).toFixed(1)}–${(density.achievedMaximumWindowDensity * 100).toFixed(1)}%`}
+              {density.underfilledWindowCount > 0 ? ` · ${density.underfilledWindowCount} under` : ""}
+              {density.overfilledWindowCount > 0 ? ` · ${density.overfilledWindowCount} over` : ""}
+              {density.windowWidthUm > 0
+                ? ` · ${density.windowWidthUm}×${density.windowHeightUm} µm @ ${density.windowStepXUm}×${density.windowStepYUm} µm step`
+                : ""}
+            </span>
+          ))}
           <span>{layout ? `deck ${layout.technologyFingerprint}` : ""}</span>
           {layout && (() => {
             const candidate = layout.planning.candidates[layout.planning.selectedCandidate];
@@ -454,7 +547,7 @@ export default function PhysicalViewport({
                   <span>{layout.physicalBlocks.filter((block) => block.verified).length}/{layout.physicalBlocks.length} frozen blocks locally DRC-clean · {layout.physicalBlocks.reduce((count, block) => count + block.interfacePins.length, 0)} interface pins</span>
                 )}
                 {layout.standardCellLibrary.generated && (
-                  <span>{layout.standardCellLibrary.cells.length} packaged cells · {layout.standardCellLibrary.libraryName}</span>
+                  <span>{layout.standardCellLibrary.inferredInstances.length} inferred instances · {layout.standardCellLibrary.cells.length} packaged cells · {layout.standardCellLibrary.libraryName}</span>
                 )}
                 <span>{layout.timing.estimatedWorstDelayNs.toFixed(4)} ns worst path · {layout.timing.paths.length} input/output paths</span>
                 <span>{layout.timing.candidates.length} routed candidates timing-scored</span>
@@ -527,6 +620,15 @@ export default function PhysicalViewport({
         <button className="physical-reset" disabled={!layout} onClick={onExportLef}>Export LEF macro…</button>
         <p className="physical-sidebar-section">Layers</p>
         <button className="physical-reset" onClick={showAllLayers}>Show all layers</button>
+        <button className="physical-reset" onClick={() => setShowDummyFill((current) => !current)}>
+          {showDummyFill ? "Hide" : "Show"} dummy fill
+        </button>
+        <button className="physical-reset" onClick={() => {
+          setSoloDummyFill((current) => !current);
+          setShowDummyFill(true);
+        }}>
+          {soloDummyFill ? "Show electrical geometry" : "Solo dummy fill"}
+        </button>
         <div className="physical-layers">
           {Object.entries(layers).map(([name, layer]) => (
             <label key={name}>
